@@ -19,8 +19,8 @@ Windows 上的快速启动器：**双击 Ctrl 唤出**，搜文件、搜应用�
 | — | 图形化设置，不用手改 JSON | 已实现 |
 | — | Listary 式自定义命令（`term`、`code` …） | 已实现 |
 | — | Pane 式界面：首页图标网格（已固定 / 最近使用）、底栏键帽提示、`Ctrl+K` 固定、`Ctrl+Enter` 开文件夹、`Ctrl+Shift+C` 复制目录 |
-| 5 | 读取第三方文件管理器当前目录 | 已实现资源管理器（`CabinetWClass` 地址栏面包屑，见 §8）；其它文件管理器未做 |
-| 6 | 打开 / 保存框跟随：资源管理器换目录后，切回那个框，路径自动变过去 | 已实现（照 Lertaro 的 `FileDialogNavigationTracker`），见 `docs/architecture.md` §8 |
+| 5 | 读取文件管理器当前目录 | 已实现资源管理器（`CabinetWClass` 地址栏面包屑 + 已知文件夹本地化名还原，见 §8）与 Total Commander（`WM_COPYDATA` 远程协议）；其它文件管理器未做 |
+| 6 | 打开 / 保存框跟随：文件管理器换目录后，切回那个框，路径自动变过去 | 已实现（照 Lertaro 的 `FileDialogNavigationTracker`），见 `docs/architecture.md` §8 |
 | — | 开机自动启动（登录后静默待在托盘，不弹面板） | 已实现，设置里可开关 |
 | — | 快速索引服务（直接读 NTFS USN Journal，174 万条 17 秒） | 已实现，设置里一键装/卸 |
 
@@ -264,7 +264,7 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 底栏右侧直接写着 `Enter 打开 / Ctrl+Enter 文件夹 / Ctrl+Shift+C 复制路径 / Ctrl+K 固定 / 右键 删除·固定`，
 左边一行说选中项会发生什么（`打开 抖音`、`已固定 · 记事本`）。「设置」「互传」是底栏的胶囊按钮，不用去托盘翻菜单。
 
-## 打开 / 保存框跟着资源管理器走（Lertaro、Listary 的那个功能）
+## 打开 / 保存框跟着文件管理器走（Lertaro、Listary 的那个功能）
 
 **不用经过 Baozi，也不用唤出面板。** 只要框开着：
 
@@ -272,15 +272,17 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 2. 打开资源管理器，把目录切到「下载」；
 3. 切回那个「另存为」框 —— **它的路径自己变成了「下载」**。
 
-规则照 [Lertaro](https://github.com/lertaro/lertaro) 的
-`Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs` 原样搬（`internal/win/follow.go`）：
+目录来源支持**资源管理器**和 **Total Commander**（`internal/win/follow.go` 的
+`isPathSource` / `folderOf` 两处分派）。规则照
+[Lertaro](https://github.com/lertaro/lertaro) 的
+`Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs` 原样搬：
 
-- 记「最近一次资源管理器待过的目录」，目录一变就把版本号 `+1`；
+- 记「最近一次文件管理器待过的目录」，目录一变就把版本号 `+1`；
 - 一个对话框**第一次**成为前台时**只登记**、不导航——程序刚弹出它时往往自己指定了目录，
   不该立刻覆盖；
 - 之后它再成为前台、而版本号变过 → 把记住的目录送过去；
-- 切回对话框的那一刻**现场重读**一次资源管理器的目录，不用轮询缓存的旧值 ——
-  否则你在资源管理器里换目录的瞬间没被采到，就会出现"第一次能跟、再换一个目录就不跟了"；
+- 切回对话框的那一刻**现场重读**一次文件管理器的目录，不用轮询缓存的旧值 ——
+  否则你在文件管理器里换目录的瞬间没被采到，就会出现"第一次能跟、再换一个目录就不跟了"；
 - 版本没变就不动（否则用户手动在框里换过目录，下次切回来会被拽回旧目录）。
   这条是 Lertaro 源码里明写的坑，一并照抄。
 
@@ -288,6 +290,20 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 的 window text 就是完整路径（实测 `"地址: D:\"`，剥掉 `地址: ` 前缀即可）——
 和文件对话框那套控件是同一个，所以走同一条读法，不碰 `ShellWindows` COM。
 `SendMessageTimeout` 带 500ms 超时，资源管理器在慢目录上卡住也拖不死 Baozi。
+
+**「下载 / 文档 / 音乐」这些已知文件夹要单独还原**：在它们的根上，地址栏给的不是路径
+而是本地化名字（实测 `地址: 音乐`、`地址: 文档`）。`internal/win/knownfolder.go` 对 12 个
+常用 FOLDERID 取路径，再从注册表 `FolderDescriptions\{GUID}\LocalizedName` 拿
+shell 自己的本地化字符串（`@…\windows.storage.dll,-21770`），用 `shlwapi.dll` 的
+`SHLoadIndirectString` 解析成"文档 / 下载 / 音乐"，建一张表缓存。用
+`SHGetFileInfoW(路径)` 拿不到这些名字——文档被重定向到 `D:\Backup\Documents` 时它只给 `Documents`。
+
+**Total Commander** 走它自己的远程控制协议（照 Lertaro `Plugins\TotalCommander\Win32\Win32Helper.cs`）：
+向 `TTOTAL_CMD` 发 `WM_COPYDATA`（`dwData = 'G'+256*'W'`，内容是 ASCII 的 `"SP\0"`），
+TC 以 `WM_COPYDATA`（`dwData = 'R'+256*'W'`，UTF-16）回当前活动面板的路径。
+两个实测硬约束：接收窗口必须和发送在**同一个 OS 线程**（回复靠嵌套投递送回来），
+且只能用 `SMTO_ABORTIFHUNG`、**不能带 `SMTO_BLOCK`**（带了回复直接被丢掉）。
+
 动别人的窗口这件事只有一条铁律：**不 `AttachThreadInput`**，不抢前台——它会把两个线程的
 输入队列绑死，Go 的线程还会被 runtime 换走，结果就是对方的窗口永久无响应
 （这就是"切回记事本卡死"的真正原因）。
@@ -305,6 +321,22 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 ④ 资源管理器切到 C:\Windows\System32 → ⑤ +500ms 地址: "地址: C:\Windows\System32" 卡死=false
 ```
 
+已知文件夹（就是"切到下载路径不变"那个 bug 的回归）：
+
+```
+① 另存为框 0xa135a 初始地址: "地址: 文档"
+② 资源管理器切到 D:\work\baozi    → ③ +500ms 地址: "地址: D:\work\baozi"
+④ 资源管理器切到 D:\Backup\Downloads（地址栏显示"地址: 下载"）
+                                   → ⑤ +500ms 地址: "地址: 下载"  卡死=false
+```
+
+Total Commander（`FOLLOW_TC=1`，TC 11.50 x64）：
+
+```
+② TC 切到 D:\work\baozi            → ③ +500ms 地址: "地址: D:\work\baozi"
+④ TC 切到 D:\work\baozi\internal   → ⑤ +500ms 地址: "地址: D:\work\baozi\internal"
+```
+
 Baozi 侧同一时刻的日志：
 
 ```
@@ -316,7 +348,8 @@ Baozi 侧同一时刻的日志：
 ```
 
 局限：只认标准 `#32770` + 面包屑地址栏的对话框。Electron / Qt 自绘的、AutoCAD 那类专有对话框不覆盖
-（Lertaro 是靠适配器注册表逐个适配的，这里先不做）。配置里 `"dialogFollow": false` 可整个关掉，
+（Lertaro 是靠适配器注册表逐个适配的，这里先不做）。目录来源目前只接了资源管理器和 Total Commander；
+Directory Opus / XYplorer / OneCommander / Files 还没接。配置里 `"dialogFollow": false` 可整个关掉，
 关掉后 Baozi 不再读任何别人的窗口。
 
 ## 界面（借鉴 Pane）

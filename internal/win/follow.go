@@ -1,17 +1,19 @@
-// 读资源管理器当前目录 + 文件对话框自动跟随。
+// 读文件管理器当前目录 + 文件对话框自动跟随。
 //
-// 对应 Lertaro 的 `IActivePathCollector`（ExplorerPathCollector）与
-// `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs`：
+// 对应 Lertaro 的 `IActivePathCollector`（ExplorerPathCollector / TotalCommanderPathCollector）
+// 与 `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs`：
 //
-//  1. 记住"最近一次资源管理器所在的目录"（lastDir），目录一变就把版本号 +1；
+//  1. 记住"最近一次文件管理器所在的目录"（lastDir），目录一变就把版本号 +1；
+//     文件管理器目前接了两个：资源管理器（CabinetWClass，读地址栏面包屑）和
+//     Total Commander（TTOTAL_CMD，走 WM_COPYDATA 远程控制协议，见 totalcmd.go）；
 //  2. 每当一个「打开 / 另存为」框成为前台：
 //     - 第一次见到它，只登记"它已经同步到当前版本"，不导航
 //     （程序刚弹出的对话框往往自己指定了目录，不该立刻覆盖）；
-//     - 之后它再次成为前台、而版本号变过（期间资源管理器换过目录）→ 把 lastDir 送过去。
+//     - 之后它再次成为前台、而版本号变过（期间文件管理器换过目录）→ 把 lastDir 送过去。
 //
 // 于是用户的实际感受就是：另存为框默认在我的文档 → 去资源管理器切到下载 → 切回另存为框，
 // 路径自己变成下载。Lertaro 注释里另有一条经验也照抄了：
-// 只有"上一次激活的确实是资源管理器"时才重读它的路径，否则用户手动在对话框里选的目录
+// 只有"上一次激活的确实是文件管理器"时才重读它的路径，否则用户手动在对话框里选的目录
 // 会在下一次激活时被打回旧目录。
 package win
 
@@ -53,9 +55,29 @@ func IsExplorer(root uintptr) bool {
 	return strings.EqualFold(cls, "CabinetWClass") || strings.EqualFold(cls, "ExploreWClass")
 }
 
+// isPathSource 判断这个窗口能不能提供"当前目录"。
+// 目前是资源管理器 + Total Commander（后者见 totalcmd.go；Lertaro 里 Directory Opus /
+// XYplorer / OneCommander / Xplorer2 / Files 各有一个 collector，这里陆续接）。
+func isPathSource(hwnd uintptr) bool {
+	return IsExplorer(hwnd) || IsTotalCommander(hwnd)
+}
+
+// folderOf 按窗口类型选对应的读法。
+func folderOf(hwnd uintptr) string {
+	switch {
+	case IsExplorer(hwnd):
+		return ExplorerFolder(hwnd)
+	case IsTotalCommander(hwnd):
+		return TotalCommanderFolder(hwnd)
+	}
+	return ""
+}
+
 // ExplorerFolder 读资源管理器当前目录。
 // 地址栏和文件对话框是同一套控件（Breadcrumb Parent → ToolbarWindow32），
 // 那个工具条的 window text 就是完整路径，形如 "地址: D:\work\baozi"。
+// 但在「下载 / 文档 / 音乐」这类已知文件夹的根上，地址栏给的是**本地化名字**
+// （实测 "地址: 音乐"），所以统一过一遍 resolveFolderText 还原成真实路径。
 func ExplorerFolder(root uintptr) string {
 	bread := findChildByClass(root, "Breadcrumb Parent")
 	if bread == 0 {
@@ -80,13 +102,7 @@ func ExplorerFolder(root uintptr) string {
 	if toolbar == 0 {
 		return ""
 	}
-	t := WindowTextTimeout(toolbar)
-	t = strings.TrimPrefix(t, "地址: ")
-	t = strings.TrimPrefix(t, "Address: ")
-	if !isDir(t) {
-		return ""
-	}
-	return t
+	return resolveFolderText(WindowTextTimeout(toolbar))
 }
 
 // WindowTextTimeout 带超时读文本：目标进程卡住时不把调用方一起拖死
@@ -117,10 +133,10 @@ type DialogFollow struct {
 	seen    map[uintptr]int
 	lastFg  uintptr
 
-	// lastActive 是上一次观察到的前台窗口根（用来判断"上一次活动的是不是资源管理器"）。
-	// lastExplorer 是最近一次活动的资源管理器窗口。
-	lastActive   uintptr
-	lastExplorer uintptr
+	// lastActive 是上一次观察到的前台窗口根（用来判断"上一次活动的是不是文件管理器"）。
+	// lastSource 是最近一次活动的那个文件管理器窗口（资源管理器 / Total Commander）。
+	lastActive uintptr
+	lastSource uintptr
 
 	onNavigate func(FollowEvent)
 	dbg        func(format string, args ...any)
@@ -178,26 +194,26 @@ func (f *DialogFollow) poll() {
 
 	root := RootOwner(raw)
 	switch {
-	case IsExplorer(root):
+	case isPathSource(root):
 		f.mu.Lock()
 		f.lastActive = root
-		f.lastExplorer = root
+		f.lastSource = root
 		f.mu.Unlock()
 		// 这里顺手读一次只是为了让"停在资源管理器里不动"也能被记住，
 		// 真正决定导航目标的还是 handleDialog 里那次现场重读。
-		f.rememberDir(ExplorerFolder(root))
+		f.rememberDir(folderOf(root))
 
 	case IsFileDialog(root):
 		f.mu.Lock()
 		prev := f.lastActive
-		lastExplorer := f.lastExplorer
+		src := f.lastSource
 		f.lastActive = root
 		f.mu.Unlock()
 
-		// 上一次活动的就是资源管理器 → 现读它此刻的目录（不是轮询时缓存的那个）。
+		// 上一次活动的就是那个文件管理器窗口 → 现读它此刻的目录（不是轮询时缓存的那个）。
 		// 上一次活动的是别的程序就不重读 —— 否则用户手动在框里换过的目录会被拽回去。
-		if prev != 0 && lastExplorer != 0 && prev == lastExplorer && IsExplorer(lastExplorer) {
-			f.rememberDir(ExplorerFolder(lastExplorer))
+		if prev != 0 && src != 0 && prev == src && isPathSource(src) {
+			f.rememberDir(folderOf(src))
 		}
 		f.handleDialog(root)
 

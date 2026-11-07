@@ -249,41 +249,45 @@ Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由�
 与 dashbeam 的差距（明确没做）：无 QUIC、无 NAT 打洞、无公网中继、无分块哈希与断点续传、无端到端加密
 （明文 HTTP + 一次性令牌，仅限可信局域网）。Windows 防火墙首次放行需用户点一次确认。
 
-## 7. 未实现：读取第三方文件管理器当前目录（对应 Lertaro `IActivePathCollector`）
+## 7. 读取文件管理器当前目录（对应 Lertaro `IActivePathCollector`）
 
-只读、不接管对方搜索。按目标进程分三条路：
+只读、不接管对方搜索。按目标进程分路：
 
-1. **资源管理器（Explorer）**
-   走 Shell COM：`IShellWindows` → 遍历 `IWebBrowser2` → `get_HWND` 与前台窗口比对 →
-   `IServiceProvider` → `IShellBrowser` → `IShellView` → `IFolderView2::GetCurrentFolder` → `GetDisplayName`。
-   Go 侧需要手写 vtable 调用（`syscall.SyscallN` + 接口结构体），或引入 `go-ole` 只借 IDispatch，其余自建。
-2. **Total Commander**
-   正则解析窗口标题（TC 标题就是当前路径）；或向 `TOTALCMD#BAR#DATA` 窗口发 `WM_COPYDATA` 查询。
-   注意用户可自定义标题模板，所以标题解析要留在"兜底"，优先用 TC 的 `CD` 命令接口做双向通信。
-3. **Directory Opus / OneCommander**
-   Opus 有官方 COM/命令接口（`dopusrt.exe /acmd`）；OneCommander 无公开接口，只能标题/UI Automation 兜底。
+1. **资源管理器（Explorer）** —— 已实现。读地址栏控件（见 8.1），
+   不照 Lertaro 那样走 `ShellWindows` COM。
+2. **Total Commander** —— 已实现。走 TC 的 `WM_COPYDATA` 远程控制协议
+   （`TTOTAL_CMD` + `'G'+256*'W'` 查询 / `'C'+256*'D'` 换目录，见 8.1.2），
+   不解析窗口标题 —— 用户自定义标题模板会让标题解析失效，只留作兜底。
+3. **未实现**：Directory Opus（有 `dopusrt.exe /acmd`）、XYplorer、OneCommander、
+   Xplorer2、Files、Double Commander。Lertaro 在 `Plugins\<Name>\` 下各有一个
+   `*PathCollector.cs`，要接新的就在 `internal/win/` 加一个同形文件，并在
+   `follow.go` 的 `isPathSource` / `folderOf` 两处分派。Opus 优先级最高。
 
-统一出口：`internal/activepath` 提供 `Current() (path string, source string, ok bool)`，
-供第 6 条和托盘"在此处搜索"使用。实现顺序建议 Explorer → TC → Opus，其余按需。
+统一出口是 `internal/win` 的 `isPathSource(hwnd)` + `folderOf(hwnd)`，
+供第 8 节的跟随器使用。
 
-## 8. 打开/保存对话框跟随资源管理器（已实现，对应 Lertaro `IFileDialogAdapter` + `IActivePathCollector`）
+## 8. 打开/保存对话框跟随文件管理器（已实现，对应 Lertaro `IFileDialogAdapter` + `IActivePathCollector`）
 
 语义是**全局自动跟随**，不经面板、不需要用户在 Baozi 里选任何东西：
 
 > 打开记事本「另存为」，框停在「我的文档」→ 打开资源管理器把目录切到「下载」→
 > 切回那个「另存为」框，**它的路径自己变成「下载」**。
 
-三块拼起来：每隔 300ms 看一眼前台窗口（`internal/win/follow.go`）、
-前台是资源管理器就读出它的当前目录、前台是文件对话框就按版本号决定要不要跳过去。
+三块拼起来：每隔 200ms 看一眼前台窗口（`internal/win/follow.go`）、
+前台是可提供目录的程序（资源管理器 / Total Commander）就读出它的当前目录、
+前台是文件对话框就按版本号决定要不要跳过去。
 
-### 8.1 记住资源管理器的目录（`ExplorerFolder`）
+### 8.1 记住文件管理器的目录
+
+#### 8.1.1 资源管理器（`ExplorerFolder`）
 
 读的是**地址栏控件**，不是 `ShellWindows` COM：
 
 ```
 EnumChildWindows( CabinetWClass ) → class == "Breadcrumb Parent" → 它的 ToolbarWindow32
   → WM_GETTEXT（SendMessageTimeout，500ms 超时）
-  → 剥掉 "地址: " / "Address: " 前缀                              ← 就是完整路径
+  → 剥掉 "地址: " / "Address: " 前缀
+  → resolveFolderText()：绝对路径就校验存在性；本地化名字查已知文件夹表
 ```
 
 Lertaro 的 `ExplorerPathCollector` 走的是 `ShellWindows`（CLSID `9BA05972-…`）+
@@ -292,16 +296,78 @@ Go 里手搓 `IDispatch` 又贵又脆，而**资源管理器的地址栏和文�
 window text 直接就是路径，一条 `EnumChildWindows` 解决。多标签时读 `CabinetWClass`
 顶窗（`ShellTabWindowClass` 自己那条读出来是空字符串），所以先用 `GetAncestor(GA_ROOTOWNER)` 上溯。
 
+**已知文件夹要单独还原**（`internal/win/knownfolder.go`）：在「下载 / 文档 / 音乐 /
+图片 / 视频 / 桌面」这类文件夹的根上，地址栏给的不是路径而是本地化名字 ——
+实测读到 `地址: 音乐`、`地址: 文档`。`isDir("音乐")` 为假，跟随器就只能当没读到，
+这正是用户报的"切到下载/文档路径不变"。
+
+名字的来源必须和 shell 用的一致，试过三种只有一种对：
+
+| 取法 | 本机结果 |
+|---|---|
+| `SHGetFileInfoW(路径, SHGFI_DISPLAYNAME)` | 只给 `Documents`。本机文档被重定向到 `D:\Backup\Documents`，重定向过的目录拿不到本地化名 |
+| `SHGetNameFromIDList(pidl, SIGDN_NORMALDISPLAY)` | 对这批目录返回空（`hr != 0`） |
+| **`FolderDescriptions\{FOLDERID}\LocalizedName` + `SHLoadIndirectString`** | **`文档` / `下载` / `音乐` …，正是地址栏上那几个字** |
+
+所以做法是：12 个 FOLDERID → `SHGetKnownFolderIDList` 取路径，同时读注册表
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{GUID}\LocalizedName`
+（值形如 `@C:\Windows\system32\windows.storage.dll,-21770`），用 **`shlwapi.dll` 的
+`SHLoadIndirectString`** 解析成本地化名。这是 shell 自己的字符串资源，换任何系统语言
+都自动跟着走，不用硬编码"文档"这种词。表缓存一次（`knownOnce`），之后只是查 map；
+另外把目录末段名也塞进去，给英文系统 / 没注册本地化名的条目兜底。
+
+注意 `SHLoadIndirectString` 在 **`shlwapi.dll`**，不在 `shell32.dll`（写错会
+`Failed to find ... procedure` 直接 panic）。
+
+#### 8.1.2 Total Commander（`TotalCommanderFolder`）
+
+照 Lertaro `Plugins\TotalCommander\Win32\Win32Helper.cs` 的远程控制协议：
+
+| 环节 | 细节 |
+|---|---|
+| 窗口 | 类名 `TTOTAL_CMD`（主窗口，不是面板子窗） |
+| 请求 | `WM_COPYDATA`，`dwData = 'G'+256*'W'`（22343），`wParam = 接收窗口`，`lpData` 是 **ASCII** 的 `"SP\0"`（源/活动面板）或 `"TP\0"` |
+| 回复 | `WM_COPYDATA`，`dwData = 'R'+256*'W'`（22354），内容是 **UTF-16** 路径，回给 `wParam` 指定的窗口 |
+| 换目录 | `dwData = 'C'+256*'D'`（17475），`lpData = [UTF-8 BOM]path 0x0D 0x00 "S" 0x00`（`"S"` 表示作用于活动面板；**`S` 后的尾 NUL 必须计入 `cbData`**，否则标志位解析不稳）。Baozi 只读不写，这条只给测试探针用 |
+
+命令串必须是 **ANSI** —— 只有"回复用 UTF-16"这一半由 `'W'` 决定，
+用 UTF-16 发命令 TC 不理你（Lertaro 源码原话）。
+
+两个实测踩出来的硬约束，缺一个就是"请求发成功、路径永远为空"：
+
+1. **接收窗口必须和发送在同一个 OS 线程。** TC 是同步 `SendMessage` 回来的，
+   只有"发送线程自己的窗口"才会被**嵌套投递**，发完立刻就能读到；
+   窗口开在别的线程，回复进那个线程的队列，这边读不到。
+   所以 `TotalCommanderFolder` 里是 `runtime.LockOSThread()` → 建 message-only
+   窗口（`HWND_MESSAGE`）→ 发请求 → 读回复 → `DestroyWindow`，用完即弃。
+2. **只能用 `SMTO_ABORTIFHUNG`，不能带 `SMTO_BLOCK`。** 带 BLOCK 时 Windows
+   不允许调用线程处理回到自己队列的消息，回复照样被丢掉。
+   `tools/tcprobe` 把四种组合跑了一遍，结论是：
+
+   ```
+   SendMessage                      -> 回调次数=1 路径="D:\Backup\Documents\"
+   SendMessageTimeout(no BLOCK)     -> 回调次数=1 路径="D:\Backup\Documents\"
+   SendMessageTimeout(BLOCK)        -> 回调次数=0 路径=""          ← 之前用的就是这个
+   SendMessage(wParam=0)            -> 回调次数=1 路径="D:\Backup\Documents\"
+   ```
+
+`sendMsg` 的语义因此分成两个：`sendMsg`（带 BLOCK，给对话框写文本用）和
+`sendMsgNoBlock`（TC 查询专用）。两者都是 `SendMessageTimeoutW` + 500ms 超时，
+TC 卡住也不会拖住跟随器。
+
+高权限场景另外调了 `ChangeWindowMessageFilterEx(receiver, WM_COPYDATA, MSGFLT_ALLOW, 0)`：
+Baozi 若以管理员身份运行，UIPI 会静默丢掉普通权限的 TC 的回复。
+
 ### 8.2 什么时候跳（照抄 `FileDialogNavigationTracker.cs`）
 
-状态只有两样：`lastDir`（最近一次资源管理器待过的目录）和 `version`（目录变一次 +1），
+状态只有两样：`lastDir`（最近一次文件管理器待过的目录）和 `version`（目录变一次 +1），
 外加每对话框一个 `seen[hwwnd] = 它上次同步时的 version`：
 
 | 情形 | 动作 |
 |---|---|
-| 前台是资源管理器 | 记下它的窗口（`lastExplorer`），顺手读一次目录更新 `lastDir` |
-| **对话框重新成为前台，且上一次活动的是那个资源管理器** | **现场重读**它的目录（不等轮询缓存），再按下面的版本规则决定跳不跳 |
-| 前台是资源管理器，目录与 `lastDir` 不同 | `lastDir = dir`，`version++` |
+| 前台是文件管理器（资源管理器 / TC） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
+| **对话框重新成为前台，且上一次活动的是那个文件管理器窗口** | **现场重读**它的目录（不等轮询缓存），再按下面的版本规则决定跳不跳 |
+| 前台是文件管理器，目录与 `lastDir` 不同 | `lastDir = dir`，`version++` |
 | 对话框**第一次**成为前台 | 只记 `seen[hwnd] = version`，**不导航** |
 | 再见到该对话框，且 `seen[hwnd] != version` | 记新版本 + `NavigateDialog(hwnd, lastDir)` |
 | 再见到该对话框，版本没变 | 不动 |
@@ -311,11 +377,14 @@ window text 直接就是路径，一条 `EnumChildWindows` 解决。多标签时
 下次切回来不能被打回旧目录。
 
 **「切回时现场重读」这一条是这次补上的**，对应 Lertaro 里那行
-`previousWasPathProvider && readProviderPath()`。原因：如果只在"轮询看到资源管理器"
-那一刻读目录，用户在资源管理器里换目录的瞬间可能正好落不到那一次采样上 ——
+`previousWasPathProvider && readProviderPath()`。原因：如果只在"轮询看到文件管理器"
+那一刻读目录，用户换目录的瞬间可能正好落不到那一次采样上 ——
 表现就是"第一次能跟，换个目录再切回去就不跟了"。改成切回对话框的时刻现读，
 读到的永远是最新的；而且只记住 hwnd、不缓存内容。反过来，上一次活动的若不是
-资源管理器（比如中间切过浏览器），就不重读，避免把人拽回旧目录。
+文件管理器（比如中间切过浏览器），就不重读，避免把人拽回旧目录。
+
+`lastExplorer` 已改名 `lastSource`：现在"目录来源"有两类，判断"上一次活动的是不是
+同一个来源窗口"和"能不能现读"都走 `isPathSource()` / `folderOf()` 两个分派点。
 
 ### 8.3 怎么跳（`NavigateDialog`，照 `StandardFileDialogAdapter`）
 
@@ -360,6 +429,25 @@ EnumChildWindows（递归） → 第一个 class == "Edit"    ← 文件名框�
 
 （六次采样里 `卡死` 全是 false，`IsHungAppWindow` 判的。）
 
+**已知文件夹那条**（这一轮补的，正是用户报的"切到下载/文档路径不变"）：
+
+```
+① 另存为框 0xa135a 初始地址: "地址: 文档"
+② 资源管理器切到 D:\work\baozi
+③ +500ms 地址: "地址: D:\work\baozi"      对话框还在=true 卡死=false
+④ 资源管理器切到 D:\Backup\Downloads → 地址栏显示 "地址: 下载"
+⑤ +500ms 地址: "地址: 下载"                对话框还在=true 卡死=false
+```
+
+**Total Commander 那条**（`FOLLOW_TC=1`，TC 11.50 x64；用 CD 命令替它换目录）：
+
+```
+② 让 TC 前台并切到 D:\work\baozi        → TC 当前目录="D:\work\baozi"
+③ +500ms 地址: "地址: D:\work\baozi"    对话框还在=true 卡死=false
+④ 让 TC 前台并切到 D:\work\baozi\internal → TC 当前目录="D:\work\baozi\internal"
+⑤ +500ms 地址: "地址: D:\work\baozi\internal" 对话框还在=true 卡死=false
+```
+
 Baozi 同一时刻的日志：
 
 ```
@@ -373,7 +461,10 @@ Baozi 同一时刻的日志：
 ```
 
 留下的探针：`tools/followtest`（整条链路，`FOLLOW_NOTEPAD=1` 改用真记事本、
-`FOLLOW_SECOND=<目录>` 指定第二轮目标）、`tools/exploredump`（资源管理器目录）、
+`FOLLOW_SECOND=<目录>` 指定第二轮目标、`FOLLOW_TC=1` 改用 Total Commander、
+`FOLLOW_TITLE=<标题>` 指定已知文件夹窗口的本地化标题）、`tools/exploredump`
+（资源管理器目录）、**`tools/folderprobe`（各文件管理器的目录读取 + 已知文件夹映射表）**、
+**`tools/tcprobe`（TC 协议单测，四种投递方式对比；`-cd <路径>` 只换目录）**、
 `tools/dlgprobe2`（枚举 + 单次导航 + 读文件名框）、`tools/dlgdump`（打印对话框全部子控件）。
 
 > 记事本的自动化发键在这台机器上抢不到前台（`Ctrl+Shift+S` 四次都没弹出另存为框），

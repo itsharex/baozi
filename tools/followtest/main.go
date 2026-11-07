@@ -19,6 +19,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"baozi/internal/win"
 )
 
 var (
@@ -45,6 +47,8 @@ var (
 	procIsHung                 = user32.NewProc("IsHungAppWindow")
 	procKeybdEvent             = user32.NewProc("keybd_event")
 	procGetCurrentThreadID     = kernel32.NewProc("GetCurrentThreadId")
+	procSendMessageTimeout     = user32.NewProc("SendMessageTimeoutW")
+	procFindWindow             = user32.NewProc("FindWindowW")
 )
 
 const (
@@ -52,7 +56,55 @@ const (
 	wmClose   = 0x0010
 	swRestore = 9
 	keyUpFlag = 0x0002
+
+	wmCopyData = 0x004A
+	// TC 的"换目录"命令：dwData = 'C' + 256*'D'
+	tcChangeDir = uintptr('C') + 256*uintptr('D')
+	smtoAbort   = 0x0002
 )
+
+// copyDataStruct 是 COPYDATASTRUCT 的布局。
+type copyDataStruct struct {
+	dwData uintptr
+	cbData uint32
+	_      uint32
+	lpData unsafe.Pointer
+}
+
+// foreground 返回当前前台窗口。
+func foreground() uintptr {
+	h, _, _ := procGetForegroundWindow.Call()
+	return h
+}
+
+// tcChangePanelDir 让 Total Commander 的活动面板切到 path。
+// 照 Lertaro 的 Win32Helper.ChangeSourcePanelDirectory：lpData 是
+// [UTF-8 BOM]path 0x0D 0x00 (flags" S") 0x00，flags 后的尾 NUL 必须计入 cbData。
+// TC 只在前台时才会执行这条命令。
+func tcChangePanelDir(tc uintptr, path string) bool {
+	buf := make([]byte, 0, len(path)+8)
+	buf = append(buf, 0xEF, 0xBB, 0xBF)
+	buf = append(buf, []byte(path)...)
+	buf = append(buf, 0x0D, 0x00)
+	buf = append(buf, 'S')
+	buf = append(buf, 0x00)
+	cds := copyDataStruct{
+		dwData: tcChangeDir,
+		cbData: uint32(len(buf)),
+		lpData: unsafe.Pointer(&buf[0]),
+	}
+	var out uintptr
+	r, _, _ := procSendMessageTimeout.Call(tc, wmCopyData, 0,
+		uintptr(unsafe.Pointer(&cds)), smtoAbort, 1000, uintptr(unsafe.Pointer(&out)))
+	return r != 0
+}
+
+// findTotalCommander 找 TC 主窗口（类名 TTOTAL_CMD）。
+func findTotalCommander() uintptr {
+	name, _ := syscall.UTF16PtrFromString("TTOTAL_CMD")
+	h, _, _ := procFindWindow.Call(uintptr(unsafe.Pointer(name)), 0)
+	return h
+}
 
 func className(h uintptr) string {
 	buf := make([]uint16, 256)
@@ -256,7 +308,33 @@ func main() {
 }
 
 // cycle 做一轮：资源管理器切到 dst → 切回对话框 → 连采 6 次地址栏。
+// FOLLOW_TC=1 时改用 Total Commander 当目录来源（TC 前台 + CD 命令换目录）。
 func cycle(dlg uintptr, dst, stepTag, obsTag string) {
+	if os.Getenv("FOLLOW_TC") != "" {
+		tc := findTotalCommander()
+		if tc == 0 {
+			fmt.Println(stepTag, "没找到 Total Commander 窗口")
+			return
+		}
+		fmt.Println(stepTag, "让 Total Commander 前台并切到", dst)
+		hold(tc, 1200)
+		ok := tcChangePanelDir(tc, dst)
+		fmt.Printf("   CD 命令已发=%v\n", ok)
+		hold(tc, 1500)
+		// 读回 TC 现在的目录，确认 CD 真的生效了（没生效的话后面测的就不是新目录）
+		fmt.Printf("   TC 当前目录=%q 前台=%#x\n", win.TotalCommanderFolder(tc), foreground())
+
+		focus(dlg)
+		hold(dlg, 3000)
+		for i := 0; i < 6; i++ {
+			alive, _, _ := procIsWindow.Call(dlg)
+			hung, _, _ := procIsHung.Call(dlg)
+			fmt.Printf("%s +%dms 地址: %q 对话框还在=%v 卡死=%v\n", obsTag, i*500, addressText(dlg), alive != 0, hung != 0)
+			time.Sleep(500 * time.Millisecond)
+		}
+		return
+	}
+
 	// ② 资源管理器切到目标目录（它会成为前台，Baozi 的跟随器这时记下新目录）
 	// 用绝对路径：exec.LookPath 只查 PATH，explorer.exe 不在里面。
 	if err := exec.Command(`C:\Windows\explorer.exe`, dst).Start(); err != nil {
@@ -268,7 +346,13 @@ func cycle(dlg uintptr, dst, stepTag, obsTag string) {
 
 	// 抢住前台：这台机器上客户端时不时把前台抢回去，而跟随器是按前台判断的，
 	// 前台一乱就什么都看不到。真实使用里没有这个干扰，测试里得自己压住。
-	hold(firstVisibleWithTitle(filepath.Base(dst)), 2400)
+	// 已知文件夹（下载/文档/音乐…）的窗口标题是本地化名字，跟目录名对不上，
+	// 所以允许用 FOLLOW_TITLE 直接指定要找的标题。
+	title := os.Getenv("FOLLOW_TITLE")
+	if title == "" {
+		title = filepath.Base(dst)
+	}
+	hold(firstVisibleWithTitle(title), 2400)
 
 	// ③ 切回对话框，等跟随器送路径
 	focus(dlg)

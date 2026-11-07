@@ -65,9 +65,23 @@ const (
 // SMTO_ABORTIFHUNG：对方挂起就立刻放弃；SMTO_BLOCK 保留同步语义（写文本要立刻回读）。
 // 超时兜底，所以对方真卡住时最多耽误 500ms，不会把我们（进而把整个跟随器）拖死。
 func sendMsg(hwnd, msg, wParam, lParam uintptr) (uintptr, bool) {
+	return sendMsgWith(hwnd, msg, wParam, lParam, smtoBlock|smtoAbortIfHung)
+}
+
+// sendMsgNoBlock 同上，但**不带 SMTO_BLOCK**。
+//
+// 这个区别对 Total Commander 是决定性的：带 SMTO_BLOCK 时 Windows 不允许调用线程
+// 处理"回到本线程队列的"消息，而 TC 的 WM_COPYDATA 回复正是这样投回来的
+// （Lertaro 的注释：the reply is delivered synchronously (nested) before it returns）。
+// 结果就是请求发出去了、TC 也处理了（SendMessageTimeout 返回成功），路却永远是空的。
+func sendMsgNoBlock(hwnd, msg, wParam, lParam uintptr) (uintptr, bool) {
+	return sendMsgWith(hwnd, msg, wParam, lParam, smtoAbortIfHung)
+}
+
+func sendMsgWith(hwnd, msg, wParam, lParam, flags uintptr) (uintptr, bool) {
 	var out uintptr
 	r, _, _ := procSendMessageTimeoutW.Call(hwnd, msg, wParam, lParam,
-		smtoBlock|smtoAbortIfHung, msgTimeoutMs, uintptr(unsafe.Pointer(&out)))
+		flags, msgTimeoutMs, uintptr(unsafe.Pointer(&out)))
 	return out, r != 0
 }
 
