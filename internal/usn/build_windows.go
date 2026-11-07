@@ -1,0 +1,208 @@
+//go:build windows
+
+package usn
+
+import (
+	"sort"
+	"strings"
+	"time"
+
+	"baozi/internal/config"
+	"baozi/internal/index"
+	"baozi/internal/pinyin"
+)
+
+// 卷上的 NTFS 元数据文件（$MFT、$RmMetadata、$Txf…）不是用户能点的东西，
+// 而且它们的父链指向卷根之外，留着只会污染结果。
+const metaPrefix = "$"
+
+// USN 记录里的 FileReferenceNumber 是 64 位：高 16 位是序列号，低 48 位才是
+// $MFT 里的记录号。路径还原只认记录号，比较前必须先掩码——
+// 否则父节点写的是 "序列号|5"，而根目录常量是 5，永远对不上（实测就卡在这）。
+const frnMask uint64 = 0x0000FFFFFFFFFFFF
+
+// rec 是枚举过程中留在内存里的最小记录。
+type rec struct {
+	frn    uint64
+	parent uint64
+	attrs  uint32
+	name   string
+}
+
+// Progress 是某个卷的增量位点。服务每轮重建后把它写进伴随文件，
+// 主进程据此判断"索引归服务管、不是我自己扫的"。
+type Progress struct {
+	Letter    string    `json:"letter"`
+	JournalID uint64    `json:"journalId"`
+	NextUsn   int64     `json:"nextUsn"`
+	Count     int       `json:"count"`
+	BuiltAt   time.Time `json:"builtAt"`
+}
+
+// BuildAll 枚举多个卷，合成一张索引快照。
+//
+// 与 WalkDir 的区别：不遍历目录，直接读 $MFT 记录（实测 C 盘 103 万条 3 秒），
+// 代价是大小与修改时间拿不到（USN 记录里没有这两项），所以 size/mod 一律为 0。
+// 搜索排序只看名字/类型/频次，不依赖它们。
+func BuildAll(vols []*Volume, cfg config.Index, progress func(scanned int)) (*index.Table, []Progress, error) {
+	hint := 0
+	for range vols {
+		hint += 1 << 20
+	}
+	b := index.NewBuilder(hint)
+
+	// 规则里有没有"路径片段"那类规则，决定 DFS 时要不要为每条拼一次 string。
+	hasPathRules := false
+	for _, rule := range cfg.Excludes {
+		if strings.ContainsAny(strings.TrimSpace(rule), `\/`) {
+			hasPathRules = true
+			break
+		}
+	}
+
+	rootPrefixes := make([]string, 0, len(cfg.Roots))
+	for _, r := range cfg.Roots {
+		if r == "" {
+			continue
+		}
+		rootPrefixes = append(rootPrefixes, strings.ToLower(strings.TrimRight(r, `\/`)))
+	}
+
+	var out []Progress
+	for _, vol := range vols {
+		p, err := buildOne(b, vol, cfg, rootPrefixes, hasPathRules, progress)
+		if err != nil {
+			return nil, out, err
+		}
+		out = append(out, p)
+	}
+	if progress != nil {
+		progress(b.Len())
+	}
+	return b.Table(), out, nil
+}
+
+func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []string, hasPathRules bool, progress func(int)) (Progress, error) {
+	// 1) 全量枚举，先收进扁平数组（每卷 100 万条起步）。
+	recs := make([]rec, 0, 1<<20)
+	j, err := vol.Journal()
+	if err != nil {
+		return Progress{}, err
+	}
+	err = vol.Enum(func(r *Record) bool {
+		frn := r.FRN & frnMask
+		if frn == RootFRN {
+			return true // 根目录自己加
+		}
+		if strings.HasPrefix(r.Name, metaPrefix) {
+			return true
+		}
+		recs = append(recs, rec{frn: frn, parent: r.ParentFRN & frnMask, attrs: r.Attrs, name: r.Name})
+		return true
+	})
+	if err != nil {
+		return Progress{}, err
+	}
+
+	// 2) 按父编号排序，DFS 时用二分找子集——比给每个目录建一个 map 省得多
+	//    （147 万目录各带一个 slice header 就要 35 MB）。
+	sort.Slice(recs, func(i, j int) bool {
+		if recs[i].parent != recs[j].parent {
+			return recs[i].parent < recs[j].parent
+		}
+		return recs[i].frn < recs[j].frn
+	})
+
+	// 3) 卷根节点
+	rootName := vol.Letter() + `:\`
+	rootID := b.Add(rootName, -1, index.KindDir, 0, 0)
+	if py := pinyin.Initials(rootName); py != "" {
+		b.SetPy(rootID, py)
+	}
+	rootPath := []byte(vol.Letter() + `:`)
+
+	// 4) DFS：从卷根往下走，边走边累积路径。
+	//    只有"父节点已经在索引里"的条目才可能被收录——父目录被排除/删掉的子树整棵不可达，
+	//    这和 WalkDir 的行为一致。
+	var walk func(parentFRN uint64, parentID int32, dirPath []byte)
+	walk = func(parentFRN uint64, parentID int32, dirPath []byte) {
+		lo := sort.Search(len(recs), func(i int) bool { return recs[i].parent >= parentFRN })
+		for i := lo; i < len(recs) && recs[i].parent == parentFRN; i++ {
+			r := &recs[i]
+			isDir := r.attrs&AttrDirectory != 0
+
+			// NTFS 的 reparse point（符号链接、目录联接）不跟随，避免环路。
+			if r.attrs&AttrReparsePoint != 0 {
+				continue
+			}
+			// 隐藏文件默认不收；隐藏**目录**照常进（备份盘经常整棵带 Hidden）。
+			if !isDir && !cfg.IncludeHidden && r.attrs&AttrHidden != 0 {
+				continue
+			}
+			if index.ExcludedNameOnly(cfg.Excludes, r.name) {
+				continue
+			}
+
+			childPath := make([]byte, 0, len(dirPath)+1+len(r.name))
+			childPath = append(childPath, dirPath...)
+			childPath = append(childPath, '\\')
+			childPath = append(childPath, r.name...)
+			if hasPathRules && index.ExcludedPathOnly(cfg.Excludes, string(childPath)) {
+				continue
+			}
+			// 只收起在配置根目录之下的条目（roots 通常是整盘，配子目录时这里起作用）。
+			if !underAny(childPath, rootPrefixes) {
+				continue
+			}
+
+			kind := index.KindFile
+			if isDir {
+				kind = index.KindDir
+			}
+			id := b.Add(r.name, parentID, kind, 0, 0)
+			if py := pinyin.Initials(r.name); py != "" {
+				b.SetPy(id, py)
+			}
+			if isDir {
+				walk(r.frn, id, childPath)
+			}
+			if progress != nil && b.Len()%20000 == 0 {
+				progress(b.Len())
+			}
+		}
+	}
+	walk(RootFRN, rootID, rootPath)
+
+	return Progress{
+		Letter:    vol.Letter(),
+		JournalID: j.ID,
+		NextUsn:   j.NextUsn,
+		Count:     len(recs),
+		BuiltAt:   time.Now(),
+	}, nil
+}
+
+// underAny 判断路径是否落在某个根目录之下（大小写不敏感）。
+func underAny(path []byte, roots []string) bool {
+	if len(roots) == 0 {
+		return true
+	}
+	low := make([]byte, len(path))
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		low[i] = c
+	}
+	s := string(low)
+	for _, r := range roots {
+		if r == "" {
+			continue
+		}
+		if strings.HasPrefix(s, r) && (len(s) == len(r) || s[len(r)] == '\\') {
+			return true
+		}
+	}
+	return false
+}

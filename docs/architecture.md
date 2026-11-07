@@ -1,0 +1,739 @@
+# Baozi 架构与取舍
+
+本文写给维护者：机制、公式、边界、已知问题。用户操作看 `README.md`。
+
+## 1. 进程模型
+
+```
+baozi.exe           用户态交互层（对应 Lertaro.App）
+ ├─ mygo 原生 UI     浮窗 / 托盘 / 设置
+ ├─ 索引             读 index.bin 快照（服务模式）；没有服务时自己 WalkDir（见 §9）
+ └─ 子进程 baozi-hook.exe   低级键盘钩子 + 全屏判定（对应 Lertaro.Service --hook）
+      └─ stdout 一行事件 → 主进程读 → toggle
+
+baozi-index.exe     可选：Windows 服务（LocalSystem），读 NTFS USN Journal 建索引
+ └─ 写 index.bin / index.progress.json / index.heartbeat，主进程只读不写
+```
+
+`baozi-index.exe` 不在跑的时候，一切行为与之前完全一致（普通权限、目录扫描）。
+
+为什么钩子必须独立进程：
+
+- `WH_KEYBOARD_LL` 需要一个独立的 Windows 消息循环，和 UI 主线程共用会互相拖慢；
+- 钩子被反作弊 / 安全软件干掉时，主进程还能活，重启钩子即可；
+- 主进程退出时关闭子进程 stdin，钩子读到 EOF 自杀，不留孤儿（已实测）。
+
+**不抄的地方**：Lertaro 把钩子做成 `LocalSystem` 服务拉起的提权进程，用来向管理员权限窗口发消息（UIPI 突破）。
+Baozi 暂时不做提权钩子：双击 Ctrl 只需要读按键，普通权限就够；真正需要操作高权限窗口的是第 6 条（文件对话框跳转），
+到那一步再按需把 hook 以 `runas` 启动，而不是无条件提权。
+
+## 2. 唤出链路与全屏抑制
+
+双击 Ctrl 的状态机（`cmd/baozi-hook/main.go`）：
+
+```
+Ctrl↓ Ctrl↑                    → armed = true，记录 lastCtrlUp
+Ctrl↓ 且 now-lastCtrlUp ≤ 400ms → 触发 toggle，armed = false
+中间出现任何非修饰键按下         → armed = false（避免 Ctrl+C 被误判）
+```
+
+全屏抑制（`internal/win/fullscreen.go`），命中任一即不唤出：
+
+1. `SHQueryUserNotificationState()` 返回 `QUNS_BUSY(2)` / `QUNS_RUNNING_D3D_FULL_SCREEN(3)` / `QUNS_PRESENTATION_MODE(4)`
+   —— 覆盖 D3D 独占游戏与演示模式；
+2. 前台窗口矩形覆盖所在显示器（容差 2px），且 `GWL_STYLE` 没有 `WS_CAPTION` —— 覆盖无边框全屏的播放器/游戏；
+3. 前台窗口是 `Progman` / `WorkerW` / `Shell_TrayWnd` 时永远不算全屏（那是桌面本身）。
+
+主进程 `show()` 里会再判一次，所以走 `RegisterHotKey` 的备用组合键也享受同样的抑制。
+
+为什么快捷键会"唤不出"（Lertaro 的老毛病）：
+`RegisterHotKey` 只能注册组合键，被别的程序抢占时注册失败且无提示，高权限窗口或独占全屏下也常不触发。
+Baozi 主路径不依赖它，组合键只是兜底。
+
+## 3. 索引
+
+### 数据结构
+
+照 NTFS `$MFT` 的存法：不存完整路径，只存"名字在 arena 里的位置 + 父节点编号"。
+
+```go
+// Node 定长 20 字节
+type Node struct {
+    Parent  int32  // 父节点下标，-1 表示根
+    NameOff uint32 // 名字在 Table.Names 里的偏移
+    SizeKB  int32  // 文件大小（KB）；目录为 0
+    ModSec  int32  // 相对 2020-01-01 的秒数
+    NameLen uint16 // 名字字节数
+    Kind    Kind
+}
+
+type Table struct {
+    Nodes []Node
+    Names []byte           // arena：所有文件名首尾相接
+    Py    map[int32]uint64 // 只对含汉字的条目有值，打包了"偏移+长度"
+}
+```
+
+取路径时顺着父链往上拼（`Table.PathOf`），代价 O(深度)。
+
+**为什么名字要进 arena 而不是每条一个 `string`**：179 万条如果各自分配，
+40.6 MB 的实际内容会占到 ~90 MB（16 字节 string 头、分配器按 size class 向上取整、
+每个对象的管理开销），还附带上百万个对象让 GC 每次都得扫。进 arena 之后是连续一块，
+对象数从 209 万降到 4.9 万。
+
+拼音首字母串同理：只有 9 千条含汉字的名字需要，旧结构却给每条都留了一个 16 字节字符串头
+（约 28.6 MB 纯浪费）。现在只给这 9 千条在 arena 尾部留位置，`Py` 里存打包的偏移+长度。
+
+### 扫描
+
+两条数据源，产出同一张 `Table`（同一个 `Builder`，同一套排除规则）：
+
+- **服务模式**：`internal/usn.BuildAll()` 读 `$MFT` 记录还原路径（16 秒 / 174 万条，见 §9）；
+- **进程内模式**：`index.Build()` 按配置根目录 `filepath.WalkDir`，规则：
+
+- 排除规则不带分隔符 → 按目录名/文件名匹配（支持通配）；带 `\` → 按路径片段匹配；
+- `defaultExcludes()` 那几条**永远生效**，`normalize()` 把用户的列表 `mergeExcludes()` 上去
+  （大小写不敏感去重）。原因是老配置里不可能有新增项，而隐藏目录解禁后 AppData 下几万个
+  缓存文件会立刻涌进结果：实测解禁前后索引从 141 万涨到 192 万，其中 AppData 占 18.7 万，
+  且 `Recent\*.lnk` 会靠类型分（0.85）把真正的文件挤出前列；
+- 不跟随 reparse point（符号链接、目录联接），避免环路和重复索引；
+- `includeHidden=false` **只**跳过带 `FILE_ATTRIBUTE_HIDDEN` 的**文件**；隐藏**目录**照常递归。
+  这条是被真实案例逼出来的：`D:\Backup` 带 Hidden 属性，旧逻辑整棵 `SkipDir`，
+  用户备份盘里几十个文件一条都没进索引，表现为"明明有这个文件却搜不到"；
+- 单个条目权限不足只跳过该条目，不中断整盘；
+- 根目录去重并去掉互相嵌套的项（`C:\` 和 `C:\Users` 同时配置时只扫前者）。
+
+### 落盘
+
+`index.bin`（v3，定长记录 + arena），不再是 gob。格式：
+
+```
+0..40  固定头：magic "BZID" | ver | count | namesLen | rawLen | rootsLen | pyCount | nodesOff | namesOff | pyOff
+40..   roots JSON
+..     [补齐到 8 字节]
+..     nodes  count × 20 字节
+..     names  namesLen（所有文件名首尾相接）
+..     py     pyCount × 10 字节（索引 u32 + 偏移 u32 + 长度 u16）
+```
+
+整文件用 gzip 压（23.4 MB / 179 万条，比 gob 还小一点），加载时一次解压到 `rawLen` 指定的缓冲，
+然后 `nodes` 段直接 `unsafe.Slice` 成 `[]Node`、`names` 段直接切片——**零解码、零拷贝**。
+版本不匹配仍直接判为需要重建。
+
+为什么换掉 gob，见第 15 节（三个理由都跟内存有关）。
+
+### 搜索预筛：不再预存小写表
+
+旧实现给每条名字预存一份 `strings.ToLower` 的结果（`catalog.lowers`，实测 39 MB + 42 万个对象）。
+现在直接在 arena 字节上做大小写不敏感的子串比较（`Table.Hits`）：ASCII 折大小写，
+汉字的 UTF-8 字节都 >0x7f、原样比较才是对的。零分配，也不用为 179 万条多存一份。
+
+搜索主循环因此从"读预生成的小写串"变成"读 arena 的一段字节"，
+命中的少数候选才取 `Name(i)` 构造 string（会分配一次，但候选最多 5000 条）。
+
+## 4. 排序（可直接复算）
+
+```
+Freq  = 0.7 * log1p(count)/log1p(maxCount) + 0.3 * exp(-ageHours/168)
+Type  = 开始菜单应用 1.00；自定义命令 0.95；目录 0.60
+        类型优先级第 i 名 → 0.90 - 0.05*i（下限 0.15）；未列入类型 0.20
+Acc   = 见下表
+Score = (0.5*Freq + 0.3*Type + 0.2*Acc) / (0.5+0.3+0.2)
+```
+
+类型顺序的最高档只到 **0.90**，不是 1.00：这是"开始菜单应用永远排最前"的实现方式。
+若 `.exe` 也给 1.00，它会和应用同分，胜负只能落到准确度上，应用就沉下去了。
+应用、命令这两类不吃 `typeOrder`，它们的档位在代码里写死（`search.TypeScore`）。
+
+| 匹配形态 | Acc |
+|---|---|
+| 文件名完全等于查询 | 1.00 |
+| 拼音首字母串完全等于查询（`dbgz` → 豆包工作） | 0.97 |
+| 文件名以查询开头 | 0.95 |
+| 拼音全拼完全等于查询（`doubaogongzuo`） | 0.95 |
+| 拼音首字母串以查询开头（`dbg`） | 0.90 |
+| 命中词边界（空格 `.` `-` `_` `(` `[` `\` `/` `@` `+` `,` `{` 之后） | 0.88 |
+| 拼音全拼以查询开头 | 0.88 |
+| 文件名包含查询 | 0.78 |
+| 拼音全拼包含查询 | 0.70 |
+| 目录路径包含查询 | 0.62 |
+| 字符按顺序散落（`vsc` → Visual Studio Code） | 0.35–0.52（按连续度） |
+| 拼音首字母散落命中 | 0.45 |
+| 多关键词 | 取各 token 最小值（AND 语义）；拼音只在单关键词时启用 |
+
+同分比较顺序：总分 → Acc → Freq → 名字更短 → 字典序（`search.Less`）。
+
+用户要的"第一频次、第二类型、最后准确性"就是默认权重 0.5 / 0.3 / 0.2；
+权重可改，改完不用重启（下次打开配置时生效于新查询）。
+
+### 结果构成：应用优先，但不能只剩应用
+
+只靠类型分挡不住"应用铺满全榜"：输入单个字母 `d`，191 个开始菜单应用里有几十个命中，
+且应用类型分 1.00，前 80 条一度是 72 应用 + 8 文件，用户看到的字面效果就是"只显示应用"。
+所以截断前后各做一次结构性处理：
+
+1. **非应用保底**（`truncateMixed`）：80 条里固定留 `max/4`（默认 20 条）给文件/目录，
+   应用最多占 60 条。普通文件类型分只有 0.20，不给名额就永远进不了前 80。
+2. **打散应用连续块**（`search.Balance`，`maxAppRun = 3`）：应用最多连续 3 条，
+   之后插一条别的类型。两类各自保持原分数顺序，一个结果都不丢。
+
+实测 `d`：`结果 80: 应用 60, 文件 20`，第 4 条就是 `DuplicateDesktop.exe`（应用 0.980 → 0.956 → 0.956 → 文件 0.460）。
+代价是**分数序被局部打破**（第 4 条文件分数低于第 5 条应用），这是"优先但不独占"必然的取舍；
+真要严格按分数看，把 `maxAppRun` 调大或干脆设 0 即可（`cmd/baozi/main.go` 的常量）。
+
+### 拼音怎么接进来的
+
+- `internal/pinyin` 用 `mozillazg/go-pinyin`，只保留 `[a-z0-9]` 并统一小写：
+  `豆包工作 (Beta)` → `dbgzbeta`，输入不用纠结空格和括号。
+- **索引节点存一份首字母串**（`index.Node.Py`），只对含汉字的名字算，纯 ASCII 名字留空。
+  这样敲 `dbgz` 时是字符串比较，不用在百万条目上逐条转拼音。
+  落盘版本因此从 1 升到 2，旧快照会自动重建一次。
+- 预筛也要跟着改：`dbgz` 在文件名里找不到字面，`containsAll` 会把它全滤掉，
+  所以加了 `pyContains`——拼音首字母串包含全部 token 就放行。
+- 应用（开始菜单，几百个）在加载时同时算首字母串和全拼串，三路都能命中。
+- 弱点：多音字取字典默认读音（"重"可能算成 `z` 而不是 `c`）；
+  首字母只做"包含"不做散落子序列（`dz` 匹配不到 `dbgz`），因为后者在全表上太贵。
+
+## 5. 历史
+
+`history.json` 每条是 `{path, name, kind, ext, hint, exec, args, count, lastUsed}`。
+
+- **元数据**：`kind` 是 `file` / `dir` / `app` / `command`。应用记录的是 `shell:AppsFolder\<AppUserModelID>`，
+  只看路径的话 `filepath.Base` 会得到一串 AUMID、按扩展名取图标只会拿到通用文件图标——这就是"名字和图标不对劲"的根因。
+  写入时用 `TouchEntry(Entry)` 合并元数据（新值为空不覆盖旧值），读出时优先用记录里的 `name/kind/ext/hint`，
+  老记录只有 `path` 才回退推断。图标因此可以按"路径/AUMID"取 `Shell.FileIcon`，而不是按扩展名取 `TypeIcon`。
+- **持久化时机**：每次 `Touch` 后 400ms 防抖 `Save()`（`time.AfterFunc` + `Reset`），`Flush()` 供退出前补一刀。
+  早先只在 `OnWillQuit` 落盘，进程被强杀/崩溃就全丢——现在不依赖"正常退出"。
+- **排序**：`0.7*log1p(count)/log1p(maxCount) + 0.3*exp(-ageHours/168)`；`lastUsed` 单调递增（同一毫秒内两次打开也不会乱序）；
+  超上限按次数裁剪。空查询时 `Recent(12)` 就是"快捷菜单里的历史"。
+
+## 6. 局域网文件互传（对应 dashbeam，已实现）
+
+dashbeam 的骨架是 iroh（QUIC + TLS1.3 + BLAKE3 分块 + ticket + mDNS + 可漫游续传）。
+Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由是手机端零安装、实现面最小：
+
+> **方向是单向的：只发不收。** 早先的 `/u` multipart 上传、`%LOCALAPPDATA%\Baozi\inbox\` 落盘目录、
+> 首页底部的上传表单已经整条拆除——共享页面对局域网里的人是只读的，任何 POST 都返回 404。
+> 保留上传等于把自己的磁盘对整段局域网开一个写入口，用户明确不需要，也不再是"分享"的语义。
+
+1. **服务端**：`internal/share` 起随机端口的 `http.Server`，首页在 `/`，访问码挂在路径前缀 `/s/<code>/`。
+   - **链接是一次性的**：`Start(bind, ttl)` 起服务时就定下失效时刻（`<0` 用 `DefaultTTL = 1 小时`），
+     `time.AfterFunc(ttl, closeExpired)` 到点直接 `srv.Close()`，之后连端口都连不上；
+     请求路径里另有 `Expired()` 检查兜边界（返回 410）。界面「链接有效期」下拉默认 1 小时，
+     可选 10 分钟 / 30 分钟 / 2 小时 / 8 小时 / 24 小时，存进 `config.share.ttlMinutes`。
+     不做"只要不停止就一直分享"——分享是临时通道，用完即弃。
+   - **不再一打开窗口就开服务**：先「添加文件 / 添加文件夹」攒候选（`shareWindow.pending`），
+     再点「生成链接」，才是"选文件 → 分享 → 得到一条链接"的顺序。
+   - **访问码是 4 位**，字符集排除易混淆字符（`0 O o`、`1 I l i`、`5 S`、`2 Z`、`8 B`），
+     用户要能照着窗口把码敲进手机；**校验区分大小写**（同码不同大小写视为不同的码，
+     路由层 `subtle.ConstantTimeCompare` 直接比原始字节，不做折叠）。
+     生成用 `crypto/rand` + 拒绝采样消除取模偏差。
+   - 4 位 ≈ 19 bit，远弱于原来的 16 字节 hex，所以加了**失败熔断**：连续输错 `maxTokenFails = 20`
+     次直接 `srv.Close()` 停服，`Breached()` 供界面提示，点「重新生成链接」换新码。
+   - **URL 必须带端口**：`http://<ip>:<port>/s/<code>/`。端口是随机的，早先漏拼端口导致链接落到 80 端口打不开
+     （`TestStartBindSpecific` 就是被这个 bug 抓出来的）。
+2. **绑定网卡**：`Start(bind, ttl)`，`bind` 为空 = 所有网卡（`":0"`），否则听 `bind:0`。
+   界面下拉列出 `Bindings()`（接口名 + IPv4，标注虚拟网卡），选择存进 `config.share.bind`，换网卡会重启会话。
+   `LANIP()` 的挑选顺序：私有地址且非虚拟网卡 → 任意私有地址 → 第一个候选；
+   虚拟网卡按接口名关键词判定（`vmware` / `vmeter` / `virtualbox` / `hyper-v` / `wsl` / `docker` / `mumu` 等）。
+   这一步是必须的：装了 VMware / MuMu 的机器上，自动挑到的很可能是虚拟网卡地址，对端根本不存在。
+3. **下载**：`/d/<name>`，文件走 `http.ServeContent`（支持 Range）；目录**实时打包成 zip 流**边压边发，不落临时文件。
+   只分享一项时根路径直接 302 到 `d/<name>`（打开链接就下载）；多项才渲染列表页。
+   **下载链接一律写成绝对路径 `/s/<code>/d/<name>`**：早先写的是相对 `d/<name>`，用户把地址栏结尾斜杠
+   丢掉（`/s/ABCD`）再打开页面时，浏览器会把链接解析成 `/s/d/<name>`（把访问码那段当成文件名），点下去必然 404。
+   现在 `/s/<code>`（无斜杠）301 到带斜杠版本，两条路都兜住。
+4. **单向**：路由只有 `""`/`/`（列表页或单项直下）与 `d/<name>`（下载）两支，其余一律 404。
+   服务端不持有任何目录用于写入，`Session` 里没有 inbox 字段，`Start` 也不接收落盘路径。
+5. **发现**：不广播 mDNS，直接展示绑定的（或自动挑的）IPv4 + 二维码（`skip2/go-qrcode`，纯 Go 无 cgo），手机扫码即可。
+
+与 dashbeam 的差距（明确没做）：无 QUIC、无 NAT 打洞、无公网中继、无分块哈希与断点续传、无端到端加密
+（明文 HTTP + 一次性令牌，仅限可信局域网）。Windows 防火墙首次放行需用户点一次确认。
+
+## 7. 未实现：读取第三方文件管理器当前目录（对应 Lertaro `IActivePathCollector`）
+
+只读、不接管对方搜索。按目标进程分三条路：
+
+1. **资源管理器（Explorer）**
+   走 Shell COM：`IShellWindows` → 遍历 `IWebBrowser2` → `get_HWND` 与前台窗口比对 →
+   `IServiceProvider` → `IShellBrowser` → `IShellView` → `IFolderView2::GetCurrentFolder` → `GetDisplayName`。
+   Go 侧需要手写 vtable 调用（`syscall.SyscallN` + 接口结构体），或引入 `go-ole` 只借 IDispatch，其余自建。
+2. **Total Commander**
+   正则解析窗口标题（TC 标题就是当前路径）；或向 `TOTALCMD#BAR#DATA` 窗口发 `WM_COPYDATA` 查询。
+   注意用户可自定义标题模板，所以标题解析要留在"兜底"，优先用 TC 的 `CD` 命令接口做双向通信。
+3. **Directory Opus / OneCommander**
+   Opus 有官方 COM/命令接口（`dopusrt.exe /acmd`）；OneCommander 无公开接口，只能标题/UI Automation 兜底。
+
+统一出口：`internal/activepath` 提供 `Current() (path string, source string, ok bool)`，
+供第 6 条和托盘"在此处搜索"使用。实现顺序建议 Explorer → TC → Opus，其余按需。
+
+## 8. 打开/保存对话框跟随资源管理器（已实现，对应 Lertaro `IFileDialogAdapter` + `IActivePathCollector`）
+
+语义是**全局自动跟随**，不经面板、不需要用户在 Baozi 里选任何东西：
+
+> 打开记事本「另存为」，框停在「我的文档」→ 打开资源管理器把目录切到「下载」→
+> 切回那个「另存为」框，**它的路径自己变成「下载」**。
+
+三块拼起来：每隔 300ms 看一眼前台窗口（`internal/win/follow.go`）、
+前台是资源管理器就读出它的当前目录、前台是文件对话框就按版本号决定要不要跳过去。
+
+### 8.1 记住资源管理器的目录（`ExplorerFolder`）
+
+读的是**地址栏控件**，不是 `ShellWindows` COM：
+
+```
+EnumChildWindows( CabinetWClass ) → class == "Breadcrumb Parent" → 它的 ToolbarWindow32
+  → WM_GETTEXT（SendMessageTimeout，500ms 超时）
+  → 剥掉 "地址: " / "Address: " 前缀                              ← 就是完整路径
+```
+
+Lertaro 的 `ExplorerPathCollector` 走的是 `ShellWindows`（CLSID `9BA05972-…`）+
+`Document.Folder.Self.Path`，还要用 `ShellTabWindowClass` 判多标签里的活动标签。
+Go 里手搓 `IDispatch` 又贵又脆，而**资源管理器的地址栏和文件对话框是同一套控件**，
+window text 直接就是路径，一条 `EnumChildWindows` 解决。多标签时读 `CabinetWClass`
+顶窗（`ShellTabWindowClass` 自己那条读出来是空字符串），所以先用 `GetAncestor(GA_ROOTOWNER)` 上溯。
+
+### 8.2 什么时候跳（照抄 `FileDialogNavigationTracker.cs`）
+
+状态只有两样：`lastDir`（最近一次资源管理器待过的目录）和 `version`（目录变一次 +1），
+外加每对话框一个 `seen[hwwnd] = 它上次同步时的 version`：
+
+| 情形 | 动作 |
+|---|---|
+| 前台是资源管理器 | 记下它的窗口（`lastExplorer`），顺手读一次目录更新 `lastDir` |
+| **对话框重新成为前台，且上一次活动的是那个资源管理器** | **现场重读**它的目录（不等轮询缓存），再按下面的版本规则决定跳不跳 |
+| 前台是资源管理器，目录与 `lastDir` 不同 | `lastDir = dir`，`version++` |
+| 对话框**第一次**成为前台 | 只记 `seen[hwnd] = version`，**不导航** |
+| 再见到该对话框，且 `seen[hwnd] != version` | 记新版本 + `NavigateDialog(hwnd, lastDir)` |
+| 再见到该对话框，版本没变 | 不动 |
+
+「第一次只登记」是为了不在程序刚弹出对话框、它自己指定了目录时把它拽走；
+「版本没变就不动」是 Lertaro 源码里明写的坑：用户手动在框里换过目录，
+下次切回来不能被打回旧目录。
+
+**「切回时现场重读」这一条是这次补上的**，对应 Lertaro 里那行
+`previousWasPathProvider && readProviderPath()`。原因：如果只在"轮询看到资源管理器"
+那一刻读目录，用户在资源管理器里换目录的瞬间可能正好落不到那一次采样上 ——
+表现就是"第一次能跟，换个目录再切回去就不跟了"。改成切回对话框的时刻现读，
+读到的永远是最新的；而且只记住 hwnd、不缓存内容。反过来，上一次活动的若不是
+资源管理器（比如中间切过浏览器），就不重读，避免把人拽回旧目录。
+
+### 8.3 怎么跳（`NavigateDialog`，照 `StandardFileDialogAdapter`）
+
+不是注入 DLL，而是**往"文件名"框写完整路径，再让它回车**
+（新式 Common Item Dialog 的文件名框仍是一个普通 `Edit`，进程外能写）。
+
+```
+IsFileDialog(hwnd)?                       ← #32770 且内部有 "Breadcrumb Parent"
+EnumChildWindows（递归） → 第一个 class == "Edit"    ← 文件名框（ComboBoxEx32/1148 里面）
+  → 目录补尾 "\"，WM_SETTEXT 写入
+  → 父窗口 WM_COMMAND((EN_CHANGE<<16)|ctrlID)
+  → 回读校验；不一致就绝不回车（否则会把框里原来那个文件名提交掉）
+  → 250ms 后 SetFocus + EM_SETSEL + WM_KEYDOWN/WM_KEYUP VK_RETURN
+```
+
+三个必须注意的点：
+
+- **必须 `EnumChildWindows` 递归**。`FindWindowExW` 只扫直接子窗口，而 `Breadcrumb Parent`
+  和文件名框都在两三层以下 —— 用它就会"明明有对话框却认不出来"。
+- **绝不 `AttachThreadInput`**。它把本线程和对话框线程的输入队列绑死；
+  而 Go 的 goroutine 会在 OS 线程之间迁移、那个线程之后还会被 runtime 复用，
+  等于把对方的输入队列挂在一个不再处理消息的线程上 —— 对方窗口就此永久无响应。
+  实测代价：在记事本的"另存为"上直接把记事本按死（用户报的"切回 notepad 卡死"）。
+  现在一个 `AttachThreadInput` 都没有，也不自己抢前台（切回对话框这个动作本身
+  就保证了它是前台）。
+- **跨进程消息一律带超时**：`SendMessageTimeoutW` + `SMTO_BLOCK|SMTO_ABORTIFHUNG` + 500ms。
+  裸 `SendMessage` 只要对方卡一下就把调用方（进而把整个跟随器）拖死。
+
+面板那条手动路（唤起时记住对话框、`Enter` 改成"送过去"）已经删掉：它不符合这个语义，
+而且会顶掉 `Enter` 原本的"打开文件"。开关是 `config.json` 的 `"dialogFollow": false`。
+
+实测（2026-11-07，WinForms `OpenFileDialog` 靶子 `dist\dlg-target.ps1`，
+`tools/followtest` 在一个进程里连跑两轮 —— 第二轮专门覆盖"再换个目录再切回来"）：
+
+```
+① 另存为框 0x4c0426 初始地址: "地址: 文档"
+② 资源管理器切到 D:\work\baozi
+③ +500ms 地址: "地址: D:\work\baozi" 对话框还在=true 卡死=false
+④ 资源管理器切到 C:\Windows\System32
+⑤ +500ms 地址: "地址: C:\Windows\System32" 对话框还在=true 卡死=false
+```
+
+（六次采样里 `卡死` 全是 false，`IsHungAppWindow` 判的。）
+
+Baozi 同一时刻的日志：
+
+```
+跟随: 第一次见到对话框 0x4c0426，只登记（版本 0）
+跟随: 记住目录 "D:\work\baozi"（版本 1）
+跟随: 对话框 0x4c0426 版本 0→1，送到 "D:\work\baozi"
+对话框跟随: 0x4c0426 -> D:\work\baozi
+跟随: 记住目录 "C:\Windows\System32"（版本 2）
+跟随: 对话框 0x4c0426 版本 1→2，送到 "C:\Windows\System32"
+对话框跟随: 0x4c0426 -> C:\Windows\System32
+```
+
+留下的探针：`tools/followtest`（整条链路，`FOLLOW_NOTEPAD=1` 改用真记事本、
+`FOLLOW_SECOND=<目录>` 指定第二轮目标）、`tools/exploredump`（资源管理器目录）、
+`tools/dlgprobe2`（枚举 + 单次导航 + 读文件名框）、`tools/dlgdump`（打印对话框全部子控件）。
+
+> 记事本的自动化发键在这台机器上抢不到前台（`Ctrl+Shift+S` 四次都没弹出另存为框），
+> 所以"记事本现场"只能由用户手动复现；功能路径与 WinForms 靶子完全相同
+> （都是 `#32770` + Common Item Dialog）。
+
+### 8.4 那些弯路：为什么只能走"文件名框 + 回车"
+
+DLL 注入那条（`WH_CBT` 捕获 + `IShellView::Navigate`）需要往目标进程里塞代码，
+本机没有 C 编译器（`gcc/g++/cl/tcc/zig/clang` 全无），Go 的 `-buildmode=c-shared` 出 DLL
+再改 COM vtable 也不现实，还会被杀软盯上。放弃。
+
+早期对着一台真实 Win11「打开」对话框（记事本）试过的所有手段：
+
+| 手段 | 结果 |
+|---|---|
+| `SetWindowTextW` 写地址栏 `Edit(id=41477)` | **文本进去了**（读回来确认），但地址栏与列表不动 |
+| `WM_COMMAND(CBN_SELENDOK / CBN_KILLFOCUS)` 发给 band / ComboBoxEx32 / 对话框 | 全部被无视 |
+| `SendMessage`/`PostMessage` 造 `VK_RETURN`（补扫描码、补 `WM_CHAR`） | 无反应 |
+| 真实 `SendInput`（Unicode 键事件，26 个全部被接受）写**地址栏** | 编辑框内容不变 |
+| `SetFocus`（含 `AttachThreadInput`） | 无效；`GetGUIThreadInfo` 读对话框线程 `HwndFocus = 0x0` |
+| `Ctrl+L` | 这版对话框不切编辑态（地址栏 `Edit` 仍 `visible=false`） |
+| 真实鼠标点面包屑右侧空白 | **有效**：地址栏 `Edit` 变成 `visible=true`，但打字仍进不去 |
+| 真实鼠标点标题栏抢前台 + `SetForegroundWindow` | 后台进程会被前台锁拒绝（前台仍是别的程序） |
+
+差别只有一处：**这些试的都是"地址栏"（`Edit(id=41477)`），而不是"文件名"框**。
+地址栏写进去只改显示、不回灌给 Shell 视图；文件名框是对话框真正会读的那个输入，
+写它 + 回车，Shell 自己就会导航。
+
+### 现在也给的后备
+
+`Ctrl+Shift+C` 复制选中项所在目录到剪贴板：在框里 `Ctrl+L` → `Ctrl+V` → 回车也能跳。
+只在"那套 WM_SETTEXT 被外壳拒掉 / 对话框被别的程序挡住"时还要手工救一次。
+`dirOf()` 负责"目录给自身、文件给所在目录、`shell:` 虚拟项无目录"的口径。
+
+
+## 9. 索引服务化（已实现）
+
+最初索引跑在主进程里（`filepath.WalkDir`），179 万条要分钟级，且必须是普通权限。
+现在多了一个可选的服务进程，形态如下：
+
+```
+BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普通权限）
+  FSCTL_QUERY_USN_JOURNAL   → 位点                读 index.bin（<300ms）
+  FSCTL_ENUM_USN_DATA       → 全量 $MFT 记录      搜索只读这份快照
+  FSCTL_READ_USN_JOURNAL    → 增量                每 30s 盯 mtime，变了就整体换
+        ↓ 写
+  index.bin + index.progress.json + index.heartbeat
+```
+
+### 三条原语
+
+| FSCTL | 作用 | 实测 |
+|---|---|---|
+| `0x000900f4` QUERY_USN_JOURNAL | 拿 journalID / FirstUsn / NextUsn | 立即 |
+| `0x000900b3` ENUM_USN_DATA | 按 FRN 顺序吐整个卷的 $MFT 记录 | C 盘 103 万条 **3.05 秒** |
+| `0x000900bb` READ_USN_JOURNAL | 从 NextUsn 起读增量，可阻塞等待 | 每条变化都拿到 |
+
+`USN_RECORD_V2` 的布局（偏移即代码里用的）：`RecordLength@0` `Major@4`
+`FRN@8` `ParentFRN@16` `Usn@24` `Reason@40` `FileAttributes@52` `NameLen@56`
+`NameOff@58`，名字是 UTF-16。只认 MajorVersion==2（卷上极少见 3/4）。
+
+### 三件必须知道的坑
+
+1. **FRN 要掩码**。记录里的 FileReferenceNumber 是 64 位，高 16 位是序列号，
+   低 48 位才是 $MFT 记录号。路径还原必须 `frn & 0x0000FFFFFFFFFFFF` 再比——
+   否则父节点写的是「序列号|5」，而根目录常量是 5，整棵树一条都接不上
+   （实测就是这里挂了，索引只剩两个盘符）。
+2. **USN 记录没有大小和时间**。这两项在 `$STANDARD_INFORMATION` 属性里，要另读；
+   所以由 USN 建出来的索引 `SizeKB/ModSec` 一律为 0。搜索排序只看名字/类型/频次，
+   界面也不显示这两项，所以不补。
+3. **隐藏文件的判定不能靠路径**。USN 只给属性位，直接用 `FILE_ATTRIBUTE_HIDDEN`；
+   隐藏**目录**照常进（和 WalkDir 一致，见 §3 的扫描段）。
+
+### 路径还原
+
+没有目录可走，只能靠父子关系拼：
+
+1. 枚举时丢掉 `$` 开头的 NTFS 元数据（`$Mft`/`$RmMetadata`/`$Txf`…，父链指向卷根外）；
+2. 按 `parent` 排序，DFS 时用 `sort.Search` 二分定位子集——**不给每个目录建 map**
+   （147 万目录各带一个 slice header 就要 35 MB）；
+3. 从 `RootFRN=5` 往下走，边走边用 `[]byte` 累积路径（一个 buffer 反复截断，
+   不为每条都分配一个字符串）；
+4. 父节点被排除/删掉的子树整棵不可达，行为与 WalkDir 跳过 `SkipDir` 一致；
+   reparse point（符号链接、目录联接）不跟随，避免环路。
+
+### 增量怎么做（只当触发器，不逐条改表）
+
+索引是 arena + 定长记录的快照，逐条增删会留碎片和 tombstone。而全量重建只要
+**16 秒（两盘 174 万条）**，所以增量的作用只是「什么时候值得重扫一遍」：
+
+- 累计 ≥ 200 条变化 → 重建；
+- 或者 ≥ 2 分钟一直有零散变化 → 重建；
+- 主程序点「立即重建」时写 `index.rebuild` 信标（服务没有 IPC 端口，用文件最省事）。
+
+主进程侧的交接同样是文件：服务每轮重建写 `index.bin`，每分钟写 `index.heartbeat`，
+主进程 30 秒 stat 一次 mtime，变了就 `index.Load` 后 `idxReplace`（原子换指针，
+正在进行的搜索不受影响）。
+
+### 权限与开关
+
+- 服务以 `LocalSystem` 跑（`sc create` 自动启动），只有它能打开 `\\.\C:` 读 USN；
+  主进程始终是普通权限——这是服务化真正的收益。
+- 安装/卸载在设置页「索引」分区，「启用快速索引（需管理员）」会 `ShellExecute
+  "runas"` 拉起 `baozi-index.exe --install --data-dir <数据目录>`，弹一次 UAC。
+  卸载同样走 `--uninstall`（停服务 → 等 Stopped → Delete）。
+- **心跳在才用服务**。主进程不看"服务装没装"，只看 `index.heartbeat` 是否在 3 分钟内
+  ——装了但停了（或服务崩了）就自动回退到自己扫，不会卡在等一个死的服务。
+- 服务首次建索引期间 vs 之后内存差很大：建完必须 `debug.FreeOSMemory()`，
+  否则构建期的 recs/排序/arena 会一直挂在 working set 上（实测残留 556 MB，
+  回收后 **62 MB**）。
+
+### 实测数字
+
+| | WalkDir（主进程） | USN（服务） |
+|---|---|---|
+| 全量 174 万条 | 分钟级 | **16.8 秒**（其中枚举 6 秒） |
+| 运行权限 | 普通用户 | 服务（SYSTEM） |
+| 常驻内存 | 主进程 238 MB | 主进程 238 MB + 服务 62 MB |
+| 新建文件可见 | 下次重建 | ≤2 分钟（或 200 条变化） |
+| 索引文件 | 23.4 MB | 20.0 MB（无 size/mod，压缩率更高） |
+
+## 10. 已知边界
+
+- 没有提权钩子：管理员权限窗口里的文件对话框暂时适配不到（见 §7/§8）。
+- 索引是快照：文件增删要等服务重建（≤2 分钟）或 `rescanMinutes` 到期才反映。
+- 路径查询（输入含 `\` 或 `/`）需要逐条还原路径，比纯名字查询慢，已限制候选上限 5000 条。
+- 服务建出来的索引没有大小和时间（`SizeKB/ModSec=0`），按大小/时间排序用不了这两项。
+- 非 NTFS 卷（U 盘 exFAT、网络盘）不能走 USN，配置里加这种根目录时服务会跳过它，
+  主进程回退到 WalkDir。
+- 互传是明文 HTTP + 一次性令牌，只适合可信局域网；大文件没有断点续传。
+- 设置界面只覆盖常用项，`config.json` 里的冷门字段仍可手改；界面保存是整份覆盖，不保留手写注释。
+- 内存：空索引时进程约 190MB（mygo 原生 UI + Go 运行时 + D3D），索引本身另算。
+
+## 11. 图形化设置与热更新
+
+第二个 mygo 窗口（880×760，`VibrancyGlass`，可滚动），分区与 `config` 结构一一对应：
+
+| 分区 | 控件 | 写回字段 |
+|---|---|---|
+| 唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
+| 排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果） | `search.weights` / `typeOrder` / `maxResults` |
+| 索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
+| 自定义命令 | `TextArea`，每行 `关键字 \| 显示名 \| 程序 \| 参数` | `commands` |
+
+「保存并应用」的执行顺序（顺序不能反）：
+
+1. 写 `config.json`；
+2. 组合键变了 → 先 `Unregister` 旧键再 `Register` 新键（直接覆盖注册会静默失败）；
+3. 重启钩子进程：关掉它的 stdin 让它自杀，等 2s，仍在就 `Kill`，再重新拉起——钩子读的是同一份 `config.json`，不重启就还是旧间隔/旧全屏策略；
+4. 根目录变了 → 触发一次重建（`index.Build`）。
+
+界面本身的可测性：`ui.NewTester(view, w, h)` 可以不开窗口就把视图渲染出来并断言文案，
+所以面板、设置、互传三个界面都有快照式测试；键盘链路（双击 Ctrl → 输入 → Enter → 落盘）则用
+`BAOZI_DEBUG=1` 配合模拟按键跑端到端。
+
+踩过的坑，都写进了代码注释：
+
+- 窗口创建后立刻 `Show()` 会被忽略（窗口存在但永远隐藏），必须延迟到事件循环里（`time.AfterFunc` + `panel.Update`）。
+- 面板 `Show()` 之后还要 `Focus()` 窗口、且回车要在输入框上 `OnSubmit` 才可靠：
+  `c.Shortcut(0, ui.KeyEnter)` 在焦点位于 `TextInputBase` 时收不到回车。
+- **打包必须带 `-H=windowsgui`**：Go 在 Windows 上默认给 console 子系统，双击 exe 会先弹一个黑色终端窗口。
+  换成 GUI 子系统后没有控制台，日志改写到 `%LOCALAPPDATA%\Baozi\baozi.log`（`dualWriter` 同时喂 stderr 和文件，
+  stderr 写失败不能让文件写入跟着失败）。钩子进程仍是 console 子系统，但主程序用
+  `SysProcAttr{HideWindow: true, CreationFlags: CREATE_NO_WINDOW}` 拉起，不会弹。
+- **`OnClose` 里 `PreventDefault()` 会把整个退出取消**：mygo 的 `Application.Quit` 是
+  `prepareQuit` → 逐个 `w.close()`，任意窗口的 `OnClose` 拒绝关闭就让 `prepareQuit` 返回 false、退出流程整体作废。
+  我们的面板/设置/互传三个窗口都是"关闭=隐藏"，于是托盘「退出」表现为**日志写了收尾、钩子也退了，但主进程还在**。
+  修法：`application.quitting`（`atomic.Bool`）在真正退出前置真，三个窗口的 `OnClose` 见到它为真就直接放行。
+  另有 `BAOZI_AUTOQUIT=3s` 走同一条 `a.quit()` 路径，实测退出后 `baozi`/`baozi-hook` 两个进程都不残留。
+- 托盘图标在 `OnWillQuit` 里 `Destroy()`，不要放 `OnQuit`：`prepareQuit` 末尾会 `stopNativeCalls()`，
+  到 `OnQuit` 时 native 通道已经关了。
+- **`SetForegroundWindow` 会被 Windows 前台锁拒绝**：mygo 的 `Window.Focus()` 内部就这一个调用。
+  从别的应用或任务栏切回来时，我们的进程既不是前台进程、最近也没收到输入，于是
+  `SetForegroundWindow` 只让任务栏闪一下，面板显示了但打字进不去（用户报的"点任务栏再双击 Ctrl 无法输入"）。
+  修法在 `cmd/baozi/foreground_windows.go`：先 `AttachThreadInput(自己线程, 前台窗口线程, TRUE)`
+  把两者输入队列接到一起，再 `SetForegroundWindow` + `BringWindowToTop` + `SetFocus`，最后成对脱离。
+  焦点还要等窗口真正成为前台之后交给输入框（`panel.Update(func(){ input.Focus() })`），
+  否则会被刚被激活的窗口抢回去。实测四种前台：记事本、任务栏（`Shell_TrayWnd`，无标题）、
+  设置窗口、面板自己——都能唤出后直接打字。
+- **新建窗口必须带 `Hidden: true`**：`mygo.NewWindow` 不带这一项就是创建即显示。设置窗口漏了这一个字段，
+  结果 Baozi 一启动就弹一个 880×760 的设置窗口，占着任务栏、抢着前台——这也是"点任务栏后唤出不聚焦"的
+  一半原因。互传窗口一开始就写了 `Hidden: true`，所以没暴露。
+- 面板可见但已经不是前台时，`toggle()` 这一下应当**取回焦点**而不是收起：否则用户按了快捷键看到面板消失，
+  还得再按一次。判断用 `panel.IsFocused()`。
+- **`SHQueryUserNotificationState` 的状态从出参拿，返回值是 HRESULT**：
+  `HRESULT SHQueryUserNotificationState(QUERY_USER_NOTIFICATION_STATE *pquns)`。
+  之前按 `proc.Call()` 的返回值当状态读，那个值是 `E_INVALIDARG` 之类的错误码，永远不可能等于 2/3/4，
+  等于这条判定从来没起过作用（D3D 独占全屏只能靠窗口矩形那条兜底）。
+  现在传 `&quns` 并且只在 `hr == 0` 时采信。
+- **全屏判定要把「最大化」排除掉**：这是用户报"启动后不弹面板 / 有时唤不出"的另一半原因。
+  `D:\work\baozi` 这一版之前，判定是「窗口矩形覆盖整个显示器 + 没有 `WS_CAPTION`」。
+  任务栏设成自动隐藏时，最大化窗口的矩形就等于整个显示器（甚至越过顶边 8px）；
+  Total Commander 这类能关掉系统标题栏、自绘标题的程序 `WS_CAPTION` 也是 0，
+  于是它明明只是个最大化窗口，却被判成全屏应用，`show()` 直接"忽略唤出"。
+  修法是先 `IsZoomed(hw)`，最大化就返回——真正的全屏（浏览器 F11、游戏无边框全屏）用的是
+  `SetWindowPos` 铺满屏幕，不是最大化状态，所以不会误伤。
+  实测两种前台对照：无边框覆盖全屏的窗口 → `fullscreen=true`；Total Commander 最大化 → `fullscreen=false`。
+
+## 12. 界面：从 Pane 借了什么
+
+参考对象是 [Pane](https://github.com/LBEILC/Pane)（Windows 11 / WinUI 3 / .NET 10 的磨砂玻璃效率工具）。
+它和 Baozi 的重合面只有「唤出 + 搜索 + 结果列表」这一段，所以只借**这一段的视觉与交互**：
+
+| Pane 的做法 | Baozi 的落点 |
+|---|---|
+| 首页是图标网格，「最近使用」+「已固定」两段，不是空白也不是纯列表 | `application.homeGrid()`：两个 `ui.Grid(panelCols=6)` 分段渲染；`pinnedCount` 记录 results 里属于「已固定」的前缀长度 |
+| 选中应用 `Ctrl+K` 固定到首页 | `application.togglePin()` + `history.Store.TogglePin()`；标记存 `Entry.Pinned`，`Pinned(n)` 取固定项，`trim()` 优先保留固定项 |
+| 底栏左边写「会做什么」，右边写键位 | `footer()` + `keyCap()`：左边 `打开 抖音` / `已固定 · 记事本`，右边三组键帽 |
+| 选中行是「浅色胶囊 + 细边」 | `row()` 用 `Accent.Alpha(0.16)` 底 + `Accent.Alpha(0.5)` 1px 边；名称 14 粗、路径 11 灰 |
+| 顶栏放大镜 + 右上品牌胶囊 | 同一个 `SearchIcon` SVG + 右端「Baozi」胶囊 |
+| `Ctrl+Enter` 打开所在文件夹 | `application.openFolder()`：文件开父目录，目录开自身，`shell:` 路径直接跳过 |
+
+**为什么要自己画选中态**：mygo 的 `ui.ListState.Selected` 一旦设置，List 会用整块 accent 填充画选中行
+（还压在行自己的背景上）。要让「浅色胶囊 + 细边」成立，就把 `Selected` 留空（`a.list.Selected = nil`），
+选中由 `row()` 自己画，滚动仍然靠 `choose()` 里的 `ScrollIntoView`。
+
+**首页方向键按行移动**：网格一行 6 个，`↑`/`↓` 走 `±panelCols`，`←`/`→` 走 `±1`；
+有查询时回到单列语义（`±1`）。这一条写在 `view()` 的 `home := a.query == ""` 分支里。
+
+**没有抄的部分**：剪贴板历史、鼠标手势、超级面板、AI、批量重命名、定时关机、`Tab` 展开的三栏文件窗口
+（左分类/中结果/右预览）、`Alt+数字` 动作排。前四类与 Baozi 的定位不重合；三栏文件窗口依赖
+「读第三方文件管理器当前目录」（§7）尚未实现；动作排需要一套「对任意文字的动作注册表」，
+现在只有「打开 / 打开文件夹 / 固定」三个确定动作，做成键帽更诚实。
+
+**可测性**：界面仍用 `ui.NewTester` 在内存里渲染，新增三条行为测试——
+`TestHomeGridSplitsPinned`（固定项进「已固定」段）、`TestCtrlKPinsFromKeyboard`（焦点在输入框时 `Ctrl+K` 也生效）、
+`TestHomeGridArrowMovesByRow`（`↓` 走一行）。
+注意 Tester 环境**没有 native 消息循环**，`icon()` 里的 `Shell.FileIcon` 会一直阻塞，
+所以这类测试要先 `stubAllIcons()` 把图标缓存填上纯色位图。
+同理，`mygo.App.OpenAtLogin` 走的是 `onMainValue`，在 Tester 下没有主循环也会永久阻塞——
+自启状态因此在 `ready()` 里问系统一次存进 `application.openAtLogin`，设置窗口和托盘只读缓存。
+
+## 13. 启动方式与图标资源
+
+**开机自启**用 mygo 的 `App.SetOpenAtLogin`，Windows 上就是写用户的 Run 键：
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `Baozi`，
+内容 `"<绝对路径>" --mygo-opened-at-login`。选 Run 键而不是计划任务，是因为 Baozi 不需要提权；
+需要管理员权限的程序才应该用「最高可用权限」的登录任务。
+
+`--mygo-opened-at-login` 是"被系统拉起来的"标记，mygo 在 `init` 里读 `os.Args` 后会把它剥掉，
+主程序只通过 `App.WasOpenedAtLogin()` 看到布尔值。`ready()` 里据此决定首帧要不要 `show()`：
+自启就只建托盘 + 钩子进程待在后台。状态不存 `config.json`——系统的 Run 键才是唯一事实，
+用户可能在任务管理器里禁用，存一份副本必然两边打架。
+
+**图标**：同一个包子形象（暖橙圆角底 + 奶油白包子 + 顶部三褶），三处复用：
+
+| 落点 | 载体 | 机制 |
+|---|---|---|
+| 托盘/通知栏 | `cmd/baozi/assets/tray.png`（32×32） | `go:embed` 进 `trayPNG`，`TrayOptions.Icon` 要的就是 PNG |
+| exe 图标 | `cmd/baozi/assets/baozi.ico`（7 个尺寸） | 由 `rsrc` 编成 `rsrc_windows_amd64.syso`（COFF 资源），`go build` 自动链接 |
+| 窗口图标 | 无单独设置 | mygo 的 `WindowOptions` 没有 Icon 字段，窗口图标直接取 exe 的资源，所以上一条改完窗口/任务栏/Alt+Tab 一起变 |
+
+为什么要 syso 而不能只放旁边一个 ico：PE 的图标在 `.rsrc` 节里，Windows 读的是那一段，
+旁边放文件只会被忽略。`rsrc` 本地没有二进制时用 `go run github.com/akavel/rsrc@v0.10.2`。
+
+为什么要程序化画：托盘 16px、任务栏 32px、资源管理器大图标 256px，同一张位图缩到 16px 会糊；
+`tools/icongen` 对每个尺寸按解析式重画（4×4 超采样、边缘 1px 抗锯齿），小尺寸自动省掉褶子。
+
+## 14. 卸载
+
+入口在托盘「卸载：清除自启与数据…」，范围是"摘自启 + 删数据目录"，**exe 保留**（`cmd/baozi/uninstall.go`）。
+先走 `mygo.Dialog.Message`（`MessageWarning`、按钮 `取消 / 卸载`、`DefaultButton: 0`、
+`CancelButton: 0`、`DestructiveButtons: [1]`、`Detail` 里逐条列出会删什么），`res.Button != 1` 就当取消。
+调用方用 `go a.uninstall()`：模态对话框不该占着主线程的消息循环。
+
+确认后的顺序（顺序不能反）：
+
+```
+SetOpenAtLogin(false)  → history.Close() → share.stop() → uninstalling=true → quitting=true
+→ shutdown()（关钩子、取消扫描、跳过历史落盘）→ 等扫描 goroutine 结束
+→ closeLog()（放开日志句柄）→ os.RemoveAll(dataDir) → App.Quit()
+```
+
+几个必须这样排的理由：
+
+- **`history.Close()` 和 `uninstalling` 标记都是为了"删完又长回来"**。历史 `Touch` 后有 400ms
+  防抖落盘，最后一笔可能在目录删掉之后才触发；`Save` 里有 `os.MkdirAll(filepath.Dir(path))`，
+  于是 `history.json` 带着目录一起被重建。`Close()` 停定时器并让之后的 `Save` 变空操作；
+  `shutdown()` 里也加了 `!a.uninstalling.Load()` 才 `Flush`。
+- **`closeLog()` 必须在 `RemoveAll` 之前**：Windows 不允许删除正在写入的文件，句柄不放开会删一半。
+  `logFile` 存的是 `setupLog()` 打开的那个句柄，关完把 `log.SetOutput` 换成 stderr（GUI 下等于丢弃，反正马上退）。
+- **要等后台扫描结束**：`shutdown()` 的 `scanOff()` 只是取消 context，扫描 goroutine 可能正处在落盘阶段。
+  现在 `rescan()` 有 `scanWG.Add/Done`，卸载用 `waitScan` 等它（上限 5s）。
+- **顺带修正的真 bug**：`rescan()` 原来在 `ctx.Err() != nil` 时仍会 `index.Save` 已扫到的部分结果。
+  这不只影响卸载——用户点「重新建立索引」又立刻退出，也会留下半份 `index.gob`，
+  下次启动当完整索引加载，搜索结果就缺东西。现在取消即返回，不落盘。
+- `config.Dir()` 与 `history.Save()` 都有 `MkdirAll`，所以卸载流程里 `RemoveAll` 之后不能再有任何
+  触碰它们的调用。`quitting` 置真让三个窗口的 `OnClose` 放行，`App.Quit` 才能正常关窗退出。
+
+验证方式（隔离，不动真实数据）：`BAOZI_DATA_DIR=<临时目录> BAOZI_HEADLESS=1 BAOZI_UNINSTALL=1`，
+实测结果是临时目录整个消失、`Run` 里没有 `Baozi`、`baozi`/`baozi-hook` 两个进程都退出。
+真实数据目录（含 179 万条索引）未被这一路测试碰到。
+
+## 15. 内存：从 526 MB 压到 265 MB
+
+用户报"占用了 500 多 M，太多了"。先把事实量出来，再谈怎么改。
+
+### 诊断
+
+`tools/memprobe`（`//go:build ignore`）加载真实索引后逐段打印：`Node` 结构 56 字节、
+1,791,246 条、结构本体 95.7 MB、名字内容 40.6 MB（平均 23.8 B/条）、
+`Py` 只有 9,228 条（0.1 MB，却给每条留了 16 字节字符串头）、
+模拟 `catalog.lowers` 再加 39 MB。
+
+pprof（`BAOZI_PPROF=1`）`-inuse_space` 抓到 `reflect.growslice` 86 MB、
+`internal/saferio.ReadData` 74 MB、`encoding/gob.decString` 25 MB，
+`index.Load` cum 185 MB（占全部活数据 95.8%）——索引几乎就是全部，gob 解码另产 160 MB 垃圾。
+
+`BAOZI_MEMSTAT=8s` 的曲线（`heap=456MB inuse=459 sys=496 objs=2092272 gc=8`）说明 GC 根本没被触发：
+活数据大 + 默认 GOGC=100。
+
+### 第一轮：GC 策略 + 归还空闲页
+
+- `main()` 里 `debug.SetGCPercent(40)`：让 GC 更早介入，代价是 CPU；
+- 新增 `releaseMemory()`：命中快照不扫描时、扫描结束后各调一次，
+  延迟 2s 再 `debug.FreeOSMemory()`（别让 STW 卡首帧）。
+
+结果：`Private 526 → 369 MB`、`WS 490 → 326 MB`、`heap 457 → 209 MB`。但索引本身仍是 185 MB。
+
+### 第二轮：改存储格式（v3）
+
+三件事一起做，因为它们的收益互相独立：
+
+1. **`Node` 56 → 20 字节**：去掉 `Name string`（改偏移+长度）、去掉 `Py string`
+   （改 `map[int32]uint64` 打包偏移，只有 9 千条）、`Size int64` → `int32 KiB`、
+   `Mod int64` → `int32`（相对 2020-01-01，够用到 2088 年）。
+   `179 万 × 36 字节 = 省 64 MB`。
+2. **名字进 arena**：名字不再每条一个字符串对象，而是 `Names []byte` 里连续的一段。
+   省的其实不是内容（40.6 MB 不变），是 179 万个小对象的头和按 size class 取整的浪费。
+3. **去掉 `catalog.lowers`**：预存小写表 39 MB。改成在 arena 字节上直接做大小写不敏感比较
+   （`containsFold`：ASCII 折大小写，汉字字节 >0x7f 原样比）。
+
+顺带把 `gob` 换成定长记录 + arena + gzip：加载变成"一次解压 + `unsafe.Slice`"，
+零解码、零拷贝，也不再产生 growslice / ReadData 那两笔峰值。
+
+引擎编号 `storeVersion = 3`，文件名从 `index.gob` 改成 `index.bin`（旧文件不会自动删，
+它已经不被读取，可以手工清掉）。
+
+### 结果（真机实测，1,791,388 条）
+
+| 指标 | 原始 | 第一轮止血 | 第二轮改格式 |
+|---|---|---|---|
+| Private | 526 MB | 369 MB | **269 MB** |
+| WorkingSet | 490 MB | 327 MB | **223 MB** |
+| Go heap | 457 MB | 209 MB | **97 MB** |
+| 堆对象数 | 2,092,272 | 2,092,272 | **48,7xx** |
+| 索引文件 | 23.47 MB | 23.47 MB | 23.42 MB |
+
+对象数降 97.7% 比字节数更关键：GC 每次要扫的活对象少了一个数量级，
+`gc=65` 之后曲线完全躺平（`heap=97 inuse=111 sys=264`，几十轮采样不变）。
+
+### 踩过的坑
+
+- **py 记录宽度写错**：`Save` 里借 4 字节的 `buf` 写 2 字节长度，实际写了 12 字节，
+  而 `pyRecLen=10`，整段错位——读回来的拼音串是一大截乱码（`PyOf` 返回跨几千字节的字符串）。
+  症状是拼音搜索全部失效。定长格式必须让"写出去的字节数"与"声明的记录宽度"严格相等。
+- **`config.normalize()` 会把空 `roots` 复原成 `SystemRoots()`**，所以拿不到"零索引基线"，
+  想量纯 UI 只能改代码或换数据目录。
+- `unsafe.Slice` 要求段起点按 4 字节对齐，所以 `nodesOff` 要 `align8`；
+  对齐不满足时代码回退到逐条解析，不会崩。
+- 新格式读回来之后 `Nodes`/`Names` 都指向那块 `raw`，`Table` 必须一起持有 `raw`，
+  否则切片会悬垂——`raw` 字段就是为这个留的。

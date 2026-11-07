@@ -1,0 +1,15 @@
+# 编译产物（dist 里的靶子脚本是测试资产，要入库）
+dist/*
+!dist/dlg-target.ps1
+*.exe
+*.dll
+*.exe~
+
+# 本地运行产物
+*.log
+*.err
+*.out
+
+# Go 常规
+*.test
+*.prof
