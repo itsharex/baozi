@@ -19,7 +19,7 @@ Windows 上的快速启动器：**双击 Ctrl 唤出**，搜文件、搜应用�
 | — | 图形化设置，不用手改 JSON | 已实现 |
 | — | Listary 式自定义命令（`term`、`code` …） | 已实现 |
 | — | Pane 式界面：首页图标网格（已固定 / 最近使用）、底栏键帽提示、`Ctrl+K` 固定、`Ctrl+Enter` 开文件夹、`Ctrl+Shift+C` 复制目录 |
-| 5 | 读取文件管理器当前目录 | 已实现资源管理器（`CabinetWClass` 地址栏面包屑 + 已知文件夹本地化名还原，见 §8）与 Total Commander（`WM_COPYDATA` 远程协议）；其它文件管理器未做 |
+| 5 | 读取文件管理器当前目录 | 已实现五种来源：资源管理器（地址栏面包屑 + 已知文件夹本地化名还原）、Total Commander（`WM_COPYDATA` 远程协议）、Directory Opus、XYplorer、xplorer2；每种都能在设置里单独关掉 |
 | 6 | 打开 / 保存框跟随：文件管理器换目录后，切回那个框，路径自动变过去 | 已实现（照 Lertaro 的 `FileDialogNavigationTracker`），见 `docs/architecture.md` §8 |
 | — | 开机自动启动（登录后静默待在托盘，不弹面板） | 已实现，设置里可开关 |
 | — | 快速索引服务（直接读 NTFS USN Journal，174 万条 17 秒） | 已实现，设置里一键装/卸 |
@@ -154,7 +154,7 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 | Baozi 设置 | 面板底栏「设置」/ 托盘「设置…」 | 所有配置项，改完即时生效 |
 | Baozi 文件互传 | 面板底栏「文件互传」/ 托盘「文件互传…」 | 生成一条带有效期的局域网链接（默认 1 小时），手机浏览器**直接下载**共享内容 |
 
-设置界面的分区：**唤出**（双击 Ctrl 开关、间隔、备用组合键、全屏抑制、开机自动启动）、**排序**（三条权重滑杆、类型优先级、最多结果数）、**索引**（根目录、排除目录、包含隐藏文件、重建间隔、立即重建）、**自定义命令**（每行 `关键字 | 显示名 | 程序 | 参数`，2/3/4 段都能解析）。
+设置界面的分区：**唤出**（双击 Ctrl 开关、间隔、备用组合键、全屏抑制、开机自动启动）、**文件对话框跟随**（总开关 + 五种目录来源逐项开关）、**排序**（三条权重滑杆、类型优先级、最多结果数）、**索引**（根目录、排除目录、包含隐藏文件、重建间隔、立即重建）、**自定义命令**（每行 `关键字 | 显示名 | 程序 | 参数`，2/3/4 段都能解析）。
 点「保存并应用」后会：写盘 → 组合键重新注册 → 重启钩子进程（它读的是同一份 config.json）→ 根目录变了就重建索引。不必退出软件。
 
 ## 文件互传怎么用
@@ -272,10 +272,19 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 2. 打开资源管理器，把目录切到「下载」；
 3. 切回那个「另存为」框 —— **它的路径自己变成了「下载」**。
 
-目录来源支持**资源管理器**和 **Total Commander**（`internal/win/follow.go` 的
-`isPathSource` / `folderOf` 两处分派）。规则照
-[Lertaro](https://github.com/lertaro/lertaro) 的
-`Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs` 原样搬：
+目录来源支持五种，都能在设置里单独关掉（`settings` → 「文件对话框跟随」）：
+
+| 来源 | 怎么读 |
+|---|---|
+| 资源管理器 | `CabinetWClass` 里 `Breadcrumb Parent → ToolbarWindow32` 的 window text |
+| Total Commander | `TTOTAL_CMD` + `WM_COPYDATA` 远程协议（`'G'+256*'W'` 查询，UTF-16 回复） |
+| Directory Opus | `dopus.lister` → `dopus.filedisplaycontainer` → `dopus.ctl.treepath` 的 window text |
+| XYplorer | `WM_COPYDATA`（`0x00400001`）发 UTF-16 脚本，脚本自己 `copydata` 回投 `<curpath>` |
+| xplorer2 | `ATL:ExplorerFrame` 里**可见**那个 `ComboBox` 的 `WM_GETTEXT` |
+
+规则照 [Lertaro](https://github.com/lertaro/lertaro) 的
+`Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs` 原样搬（每种来源的读法
+照它 `Plugins\<Name>\` 下对应的 `*PathCollector.cs`）：
 
 - 记「最近一次文件管理器待过的目录」，目录一变就把版本号 `+1`；
 - 一个对话框**第一次**成为前台时**只登记**、不导航——程序刚弹出它时往往自己指定了目录，
@@ -303,6 +312,13 @@ shell 自己的本地化字符串（`@…\windows.storage.dll,-21770`），用 `
 TC 以 `WM_COPYDATA`（`dwData = 'R'+256*'W'`，UTF-16）回当前活动面板的路径。
 两个实测硬约束：接收窗口必须和发送在**同一个 OS 线程**（回复靠嵌套投递送回来），
 且只能用 `SMTO_ABORTIFHUNG`、**不能带 `SMTO_BLOCK`**（带了回复直接被丢掉）。
+XYplorer 是同一个形状（脚本自己回投），所以收发那一套在 `internal/win/copydata.go` 里共用。
+
+**Directory Opus / XYplorer / xplorer2 这三种没在真机上验证过** —— 用户这几样一个都没装。
+窗口类名、协议、字段全按 Lertaro 的 collector 写；能验证的只有：没装时判定为假、
+不会把普通窗口误判成来源；读不到时返回空，不导航也不崩。装了的人读得不对，
+`tools/folderprobe` 会把容器 / `ComboBox` / 地址栏原文打出来。
+OneCommander 与 Files 没做：两者都要 UI Automation 才拿得到路径。
 
 动别人的窗口这件事只有一条铁律：**不 `AttachThreadInput`**，不抢前台——它会把两个线程的
 输入队列绑死，Go 的线程还会被 runtime 换走，结果就是对方的窗口永久无响应
@@ -337,6 +353,25 @@ Total Commander（`FOLLOW_TC=1`，TC 11.50 x64）：
 ④ TC 切到 D:\work\baozi\internal   → ⑤ +500ms 地址: "地址: D:\work\baozi\internal"
 ```
 
+接完五种来源之后的重跑（收发抽到 `copydata.go`、分派改成按来源开关过滤的方法，
+所以两条链路都重测了一遍）：
+
+```
+# TC 当来源
+② TC 切到 D:\work\baozi            → ③ +500ms 地址: "地址: D:\work\baozi"      卡死=false
+④ TC 切到 D:\work\baozi\internal   → ⑤ +500ms 地址: "地址: D:\work\baozi\internal" 卡死=false
+
+# 资源管理器 + 已知文件夹
+④ 资源管理器切到 D:\Backup\Downloads（地址栏显示"地址: 下载"）
+                                   → ⑤ +500ms 地址: "地址: 下载"  卡死=false
+```
+
+跟随器启动时的日志会把实际启用的来源列出来：
+
+```
+对话框跟随: 已启动（来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2）
+```
+
 Baozi 侧同一时刻的日志：
 
 ```
@@ -348,9 +383,10 @@ Baozi 侧同一时刻的日志：
 ```
 
 局限：只认标准 `#32770` + 面包屑地址栏的对话框。Electron / Qt 自绘的、AutoCAD 那类专有对话框不覆盖
-（Lertaro 是靠适配器注册表逐个适配的，这里先不做）。目录来源目前只接了资源管理器和 Total Commander；
-Directory Opus / XYplorer / OneCommander / Files 还没接。配置里 `"dialogFollow": false` 可整个关掉，
-关掉后 Baozi 不再读任何别人的窗口。
+（Lertaro 是靠适配器注册表逐个适配的，这里先不做）。`config.json` 里 `"dialogFollow": false`
+可整个关掉，`"pathSources": {"opus": false}` 这类可以逐个关掉某种来源（省略即开）；
+两种都在设置界面「文件对话框跟随」里，改完保存立刻生效，不用重启。
+关掉之后 Baozi 不再读那个程序的窗口。
 
 ## 界面（借鉴 Pane）
 

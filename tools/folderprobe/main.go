@@ -36,7 +36,11 @@ var (
 	procILFree                 = shell32.NewProc("ILFree")
 	procCLSIDFromString        = ole32.NewProc("CLSIDFromString")
 	procCoTaskMemFree          = ole32.NewProc("CoTaskMemFree")
+	procSendMessageW           = user32.NewProc("SendMessageW")
 )
+
+// WM_GETTEXT：xplorer2 的地址栏 ComboBox 只有这个能拿到文本（GetWindowText 返回空）。
+const wmGetText = 0x000D
 
 // SIGDN_NORMALDISPLAY：shell 给这个条目"人看到的名字"（对已知文件夹就是本地化名）。
 const sigdnNormalDisplay = 0
@@ -95,13 +99,77 @@ func main() {
 			found++
 			fmt.Printf("[TotalCommander] %#x title=%q\n             目录=%q\n",
 				h, windowText(h), win.TotalCommanderFolder(h))
+		case win.IsDirectoryOpus(h):
+			found++
+			fmt.Printf("[DirectoryOpus] %#x title=%q\n             容器：%s\n             目录=%q\n",
+				h, windowText(h), opusDump(h), win.OpusFolder(h))
+		case win.IsXyplorer(h):
+			found++
+			fmt.Printf("[XYplorer] %#x title=%q\n             目录=%q\n",
+				h, windowText(h), win.XyplorerFolder(h))
+		case win.IsXplorer2(h):
+			found++
+			fmt.Printf("[xplorer2] %#x title=%q\n             地址栏：%s\n             目录=%q\n",
+				h, windowText(h), xplorer2Dump(h), win.Xplorer2Folder(h))
 		}
 		return 1
 	})
 	procEnumWindows.Call(cb, 0)
 	if found == 0 {
-		fmt.Println("没找到资源管理器 / Total Commander 窗口")
+		fmt.Println("没找到任何受支持的文件管理器窗口")
+		fmt.Println("（Directory Opus / XYplorer / xplorer2 未安装时自然不会出现；" +
+			"这也正是「装了别的程序不会被误判成来源」的检查）")
 	}
+}
+
+// opusDump 列出 Opus lister 里的文件显示容器、它们的可见性与地址栏原文。
+func opusDump(root uintptr) string {
+	var parts []string
+	cb := syscall.NewCallback(func(c uintptr, _ uintptr) uintptr {
+		if !strings.EqualFold(className(c), "dopus.filedisplaycontainer") {
+			return 1
+		}
+		vis, _, _ := procIsWindowVisible.Call(c)
+		bar := ""
+		var barCb = syscall.NewCallback(func(b uintptr, _ uintptr) uintptr {
+			if bar == "" && strings.EqualFold(className(b), "dopus.ctl.treepath") {
+				bar = windowText(b)
+			}
+			return 1
+		})
+		procEnumChildWindows.Call(c, barCb, 0)
+		parts = append(parts, fmt.Sprintf("%#x(visible=%v, bar=%q, text=%q)", c, vis != 0, bar, windowText(c)))
+		return 1
+	})
+	procEnumChildWindows.Call(root, cb, 0)
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, " ")
+}
+
+// xplorer2Dump 列出 xplorer2 里所有 ComboBox 的可见性、父窗口与 WM_GETTEXT 结果。
+func xplorer2Dump(root uintptr) string {
+	var parts []string
+	cb := syscall.NewCallback(func(c uintptr, _ uintptr) uintptr {
+		if !strings.EqualFold(className(c), "ComboBox") {
+			return 1
+		}
+		vis, _, _ := procIsWindowVisible.Call(c)
+		parent, _, _ := procGetParent.Call(c)
+		text := ""
+		var buf [512]uint16
+		procSendMessageW.Call(c, wmGetText, 512, uintptr(unsafe.Pointer(&buf[0])))
+		text = windows.UTF16ToString(buf[:])
+		parts = append(parts, fmt.Sprintf("%#x(visible=%v, parent=%#x[%s], getText=%q)",
+			c, vis != 0, parent, className(parent), text))
+		return 1
+	})
+	procEnumChildWindows.Call(root, cb, 0)
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, " ")
 }
 
 // probeName 用 KnownFolder 的 PIDL 问 shell"这个名字叫什么"，同时拿真实路径。

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"baozi/internal/config"
+	"baozi/internal/win"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -37,6 +38,14 @@ type settingsWindow struct {
 	excludes      string
 	includeHidden bool
 	rescanMinutes float64
+
+	// 文件对话框跟随：总开关 + 每一种目录来源各一个勾选
+	followOn    bool
+	srcExplorer bool
+	srcTotalCmd bool
+	srcOpus     bool
+	srcXyplorer bool
+	srcXplorer2 bool
 
 	commands string
 
@@ -94,6 +103,13 @@ func (s *settingsWindow) load() {
 	s.includeHidden = cfg.Index.IncludeHidden
 	s.rescanMinutes = float64(cfg.Index.RescanMinutes)
 
+	s.followOn = cfg.DialogFollowOn()
+	s.srcExplorer = cfg.PathSourceEnabled(win.SourceExplorer)
+	s.srcTotalCmd = cfg.PathSourceEnabled(win.SourceTotalCmd)
+	s.srcOpus = cfg.PathSourceEnabled(win.SourceOpus)
+	s.srcXyplorer = cfg.PathSourceEnabled(win.SourceXyplorer)
+	s.srcXplorer2 = cfg.PathSourceEnabled(win.SourceXplorer2)
+
 	lines := make([]string, 0, len(cfg.Commands))
 	for _, c := range cfg.Commands {
 		lines = append(lines, strings.Join([]string{
@@ -127,6 +143,7 @@ func (s *settingsWindow) view(c *ui.Context) {
 		ui.Scroll(c).Grow(1).Children(func() {
 			ui.Column(c).Padding(24, 24).Gap(22).Children(func() {
 				s.hotkeySection(c, t)
+				s.followSection(c, t)
 				s.rankSection(c, t)
 				s.indexSection(c, t)
 				s.commandSection(c, t)
@@ -162,6 +179,29 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 		ui.Checkbox(c, &s.fullscreen, "全屏应用（游戏、全屏视频）前台时不响应")
 		ui.Checkbox(c, &s.openAtLogin, "开机自动启动（登录后静默待在托盘，不弹面板）")
 		ui.Text(c, "自启靠系统的 Run 键，任务管理器「启动」页里能单独禁用；禁用后这里的勾选会跟着变回未勾选。").FontSize(11).TextColor(t.TextMuted)
+	})
+}
+
+// followSection 是"文件对话框跟随"的开关：一个总开关 + 每一种目录来源各一个勾选。
+// 关掉的来源连读都不读（跟随器每次轮询都会问一遍，改完保存立刻生效，不用重启）。
+func (s *settingsWindow) followSection(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Gap(10).Children(func() {
+		sectionTitle(c, t, "文件对话框跟随", "另存为 / 打开框开着时，去文件管理器换个目录，再切回那个框，路径自动变过去")
+		ui.Checkbox(c, &s.followOn, "启用跟随（关掉后 Baozi 完全不读别的程序的窗口）")
+
+		ui.Row(c).Gap(18).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "目录来源").FontSize(12).TextColor(t.TextMuted).Width(70)
+			ui.Checkbox(c, &s.srcExplorer, "资源管理器")
+			ui.Checkbox(c, &s.srcTotalCmd, "Total Commander")
+			ui.Checkbox(c, &s.srcOpus, "Directory Opus")
+		})
+		ui.Row(c).Gap(18).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "").Width(70)
+			ui.Checkbox(c, &s.srcXyplorer, "XYplorer")
+			ui.Checkbox(c, &s.srcXplorer2, "xplorer2")
+		})
+		ui.Text(c, "只勾真正装了的即可，没装的多一次「窗口类名」判断而已。"+
+			"OneCommander 与 Files 要靠 UI Automation 取路径，暂不支持。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
@@ -286,6 +326,18 @@ func (s *settingsWindow) save() {
 
 	cfg.Commands = parseCommands(s.commands)
 
+	// 文件对话框跟随：总开关 + 各来源。写具体布尔值（不是省略），
+	// 这样用户一旦手动关掉某个来源，下次读配置不会被"缺省即开"又打开。
+	followOn := s.followOn
+	cfg.DialogFollow = &followOn
+	cfg.PathSources = &config.PathSources{
+		Explorer: boolPtr(s.srcExplorer),
+		TotalCmd: boolPtr(s.srcTotalCmd),
+		Opus:     boolPtr(s.srcOpus),
+		Xyplorer: boolPtr(s.srcXyplorer),
+		Xplorer2: boolPtr(s.srcXplorer2),
+	}
+
 	if err := config.Save(&cfg, s.app.cfgPath); err != nil {
 		s.message = "保存失败：" + err.Error()
 		log.Printf("保存配置: %v", err)
@@ -316,6 +368,8 @@ func (s *settingsWindow) save() {
 	// 组合键要重新注册；钩子进程读的是 config.json，必须重启才能拿到新间隔。
 	s.app.restartHotkeys(oldCombo)
 	s.app.restartHook()
+	// 跟随器的总开关 / 来源勾选：不重启进程，改完立刻按新配置走。
+	s.app.syncFollow()
 
 	rootsDirty := rootsChanged(oldRoots, cfg.Index.Roots)
 	if rootsDirty {
@@ -360,6 +414,10 @@ func (a *application) restartHook() {
 	}
 	a.startHook()
 }
+
+// boolPtr 给"写了具体值"的配置项用：设置页保存时，每个来源都写明确的 true/false，
+// 这样用户关掉某个来源之后，不会因为"缺省即开"又给它打开。
+func boolPtr(v bool) *bool { return &v }
 
 func splitList(s string) []string {
 	parts := strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' })

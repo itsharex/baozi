@@ -19,10 +19,23 @@ type Config struct {
 	History  History   `json:"history"`
 	Share    Share     `json:"share"`
 	Commands []Command `json:"commands"`
-	// DialogFollow 打开"文件对话框跟着资源管理器走"：另存为框开着时去资源管理器换目录，
+	// DialogFollow 打开"文件对话框跟着文件管理器走"：另存为框开着时去资源管理器换目录，
 	// 再切回那个框，路径自动变成新目录（Lertaro / Listary 的行为）。
 	// 用指针是为了区分"没写"（默认开）和"写了 false"（明确关掉，Baozi 就不再读别人的窗口）。
 	DialogFollow *bool `json:"dialogFollow,omitempty"`
+	// PathSources 指定从哪些文件管理器取当前目录。每项缺省为开：
+	// 老配置里没有这一块，用户已有的行为不变。
+	PathSources *PathSources `json:"pathSources,omitempty"`
+}
+
+// PathSources 是"文件对话框跟随"的目录来源开关，和 internal/win 的 Source* 常量一一对应。
+// 用指针是为了区分"没写"（默认开）和"写了 false"（明确关掉这个来源）。
+type PathSources struct {
+	Explorer *bool `json:"explorer,omitempty"`
+	TotalCmd *bool `json:"totalcmd,omitempty"`
+	Opus     *bool `json:"opus,omitempty"`
+	Xyplorer *bool `json:"xyplorer,omitempty"`
+	Xplorer2 *bool `json:"xplorer2,omitempty"`
 }
 
 // DialogFollowOn 表示"文件对话框跟随"是否开启：配置里没写就是开（和产品默认一致）。
@@ -31,6 +44,32 @@ func (c *Config) DialogFollowOn() bool {
 		return true
 	}
 	return *c.DialogFollow
+}
+
+// PathSourceEnabled 报某个目录来源是否启用；没写就是启用。
+// kind 取值与 internal/win 的 SourceExplorer / SourceTotalCmd / SourceOpus /
+// SourceXyplorer / SourceXplorer2 一致。
+func (c *Config) PathSourceEnabled(kind string) bool {
+	p := c.PathSources
+	if p == nil {
+		return true
+	}
+	var v *bool
+	switch kind {
+	case "explorer":
+		v = p.Explorer
+	case "totalcmd":
+		v = p.TotalCmd
+	case "opus":
+		v = p.Opus
+	case "xyplorer":
+		v = p.Xyplorer
+	case "xplorer2":
+		v = p.Xplorer2
+	default:
+		return true
+	}
+	return v == nil || *v
 }
 
 // Share 控制局域网互传。

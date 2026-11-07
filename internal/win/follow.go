@@ -1,11 +1,16 @@
 // 读文件管理器当前目录 + 文件对话框自动跟随。
 //
-// 对应 Lertaro 的 `IActivePathCollector`（ExplorerPathCollector / TotalCommanderPathCollector）
-// 与 `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs`：
+// 对应 Lertaro 的 `IActivePathCollector`（各文件管理器一个 collector）与
+// `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs`：
 //
 //  1. 记住"最近一次文件管理器所在的目录"（lastDir），目录一变就把版本号 +1；
-//     文件管理器目前接了两个：资源管理器（CabinetWClass，读地址栏面包屑）和
-//     Total Commander（TTOTAL_CMD，走 WM_COPYDATA 远程控制协议，见 totalcmd.go）；
+//     目录来源目前接了五种（见 sources.go 的 Source*）：
+//     - 资源管理器（CabinetWClass，读地址栏面包屑 + 已知文件夹名字还原）
+//     - Total Commander（TTOTAL_CMD，WM_COPYDATA 远程控制协议，totalcmd.go）
+//     - Directory Opus（dopus.lister，文件显示容器的地址栏，opus.go）
+//     - XYplorer（ThunderRT6FormDC，脚本协议问 <curpath>，xyplorer.go）
+//     - xplorer2（ATL:ExplorerFrame，读可见的地址栏 ComboBox，xplorer2.go）
+//     每种都能在设置里单独关掉。
 //  2. 每当一个「打开 / 另存为」框成为前台：
 //     - 第一次见到它，只登记"它已经同步到当前版本"，不导航
 //     （程序刚弹出的对话框往往自己指定了目录，不该立刻覆盖）；
@@ -56,21 +61,27 @@ func IsExplorer(root uintptr) bool {
 }
 
 // isPathSource 判断这个窗口能不能提供"当前目录"。
-// 目前是资源管理器 + Total Commander（后者见 totalcmd.go；Lertaro 里 Directory Opus /
-// XYplorer / OneCommander / Xplorer2 / Files 各有一个 collector，这里陆续接）。
-func isPathSource(hwnd uintptr) bool {
-	return IsExplorer(hwnd) || IsTotalCommander(hwnd)
+// 五种来源见 sources.go；每种都可以在设置里单独关掉（关掉后连读都不读）。
+func (f *DialogFollow) isPathSource(hwnd uintptr) bool {
+	kind := sourceKind(hwnd)
+	return kind != "" && f.sourceEnabled(kind)
 }
 
 // folderOf 按窗口类型选对应的读法。
-func folderOf(hwnd uintptr) string {
-	switch {
-	case IsExplorer(hwnd):
-		return ExplorerFolder(hwnd)
-	case IsTotalCommander(hwnd):
-		return TotalCommanderFolder(hwnd)
+func (f *DialogFollow) folderOf(hwnd uintptr) string {
+	kind := sourceKind(hwnd)
+	if kind == "" || !f.sourceEnabled(kind) {
+		return ""
 	}
-	return ""
+	return sourceFolder(kind, hwnd)
+}
+
+// sourceEnabled 问某个来源是否启用；拼 follow 时没给 enabled 就一律启用。
+func (f *DialogFollow) sourceEnabled(kind string) bool {
+	if f.enabled == nil {
+		return true
+	}
+	return f.enabled(kind)
 }
 
 // ExplorerFolder 读资源管理器当前目录。
@@ -140,12 +151,15 @@ type DialogFollow struct {
 
 	onNavigate func(FollowEvent)
 	dbg        func(format string, args ...any)
+	// enabled 回答"某个来源现在还开不开"。设置在运行中被改时，跟随器下一次轮询
+	// 就能看到新值，不需要重启。
+	enabled func(kind string) bool
 }
 
 // NewDialogFollow 建一个跟随器。onNavigate 在不阻塞轮询的 goroutine 里回调，
-// 用来打日志 / 更新界面提示；dbg 可以为 nil。
-func NewDialogFollow(onNavigate func(FollowEvent), dbg func(string, ...any)) *DialogFollow {
-	return &DialogFollow{seen: map[uintptr]int{}, onNavigate: onNavigate, dbg: dbg}
+// 用来打日志 / 更新界面提示；dbg 和 enabled 可以为 nil（nil 表示全部来源启用）。
+func NewDialogFollow(onNavigate func(FollowEvent), dbg func(string, ...any), enabled func(kind string) bool) *DialogFollow {
+	return &DialogFollow{seen: map[uintptr]int{}, onNavigate: onNavigate, dbg: dbg, enabled: enabled}
 }
 
 func (f *DialogFollow) logf(format string, args ...any) {
@@ -194,14 +208,14 @@ func (f *DialogFollow) poll() {
 
 	root := RootOwner(raw)
 	switch {
-	case isPathSource(root):
+	case f.isPathSource(root):
 		f.mu.Lock()
 		f.lastActive = root
 		f.lastSource = root
 		f.mu.Unlock()
-		// 这里顺手读一次只是为了让"停在资源管理器里不动"也能被记住，
+		// 这里顺手读一次只是为了让"停在文件管理器里不动"也能被记住，
 		// 真正决定导航目标的还是 handleDialog 里那次现场重读。
-		f.rememberDir(folderOf(root))
+		f.rememberDir(f.folderOf(root))
 
 	case IsFileDialog(root):
 		f.mu.Lock()
@@ -212,8 +226,8 @@ func (f *DialogFollow) poll() {
 
 		// 上一次活动的就是那个文件管理器窗口 → 现读它此刻的目录（不是轮询时缓存的那个）。
 		// 上一次活动的是别的程序就不重读 —— 否则用户手动在框里换过的目录会被拽回去。
-		if prev != 0 && src != 0 && prev == src && isPathSource(src) {
-			f.rememberDir(folderOf(src))
+		if prev != 0 && src != 0 && prev == src && f.isPathSource(src) {
+			f.rememberDir(f.folderOf(src))
 		}
 		f.handleDialog(root)
 

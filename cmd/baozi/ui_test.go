@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,13 +60,45 @@ func TestSettingsViewRenders(t *testing.T) {
 	a := testApp(t)
 	s := &settingsWindow{app: a}
 	s.load()
-	tester := ui.NewTester(s.view, 880, 760)
+	tester := ui.NewTester(s.view, 880, 900)
 	tester.Frame()
 	for _, want := range []string{"Baozi 设置", "双击 Ctrl 唤出面板", "保存并应用"} {
 		if !tester.HasText(want) {
 			t.Fatalf("设置界面缺少 %q", want)
 		}
 	}
+	// 文件对话框跟随那一块：总开关 + 五种目录来源，一个都不能少。
+	for _, want := range []string{
+		"文件对话框跟随", "启用跟随",
+		"资源管理器", "Total Commander", "Directory Opus", "XYplorer", "xplorer2",
+	} {
+		if !tester.HasText(want) {
+			t.Fatalf("设置界面缺少来源开关 %q", want)
+		}
+	}
+	dumpPreview(t, tester)
+}
+
+// dumpPreview 在 BAOZI_PREVIEW=<绝对路径> 时把这一帧存成 PNG，
+// 靠肉眼核对布局（挤压、换行、对齐）。平时不写盘。
+func dumpPreview(t *testing.T, tr *ui.Tester) {
+	t.Helper()
+	p := os.Getenv("BAOZI_PREVIEW")
+	if p == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatalf("建预览目录: %v", err)
+	}
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatalf("建预览文件: %v", err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, tr.Image()); err != nil {
+		t.Fatalf("写预览 PNG: %v", err)
+	}
+	t.Logf("预览已写入 %s", p)
 }
 
 func TestSettingsParseCommands(t *testing.T) {

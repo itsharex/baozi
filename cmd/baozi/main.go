@@ -105,10 +105,13 @@ type application struct {
 	// 只能读按住状态做边沿检测（keyStep）。
 	heldLeft, heldRight, heldUp, heldDown bool
 
-	// follow 是文件对话框跟随：记住资源管理器最近待过的目录，那个「打开 / 另存为」框
+	// follow 是文件对话框跟随：记住文件管理器最近待过的目录，那个「打开 / 另存为」框
 	// 再次回到前台时把路径送过去（Lertaro 的 IActivePathCollector + NavigationTracker）。
 	follow       *win.DialogFollow
 	followCancel context.CancelFunc
+	// sources 是"现在哪些目录来源开着"。跟随器在自己的 goroutine 里每 200ms 问一次，
+	// 而配置指针在保存时会被整体替换，所以这里用原子指针存一份快照，避免数据竞争。
+	sources atomic.Pointer[map[string]bool]
 
 	status string // 索引/钩子状态，显示在底栏
 
@@ -1226,18 +1229,11 @@ func (a *application) ready() {
 	a.settings = newSettingsWindow(a)
 	a.share = newShareWindow(a)
 
-	// 文件对话框跟随：记住资源管理器最近待过的目录，那个「打开 / 另存为」框再回到前台时
+	// 文件对话框跟随：记住文件管理器最近待过的目录，那个「打开 / 另存为」框再回到前台时
 	// 自动把路径送过去（Lertaro 的 IActivePathCollector + FileDialogNavigationTracker）。
-	// 关掉开关（config.dialogFollow = false）就完全不碰别人的窗口。
-	if a.cfg.DialogFollowOn() {
-		ctx, cancel := context.WithCancel(context.Background())
-		a.followCancel = cancel
-		a.follow = win.NewDialogFollow(func(ev win.FollowEvent) {
-			log.Printf("对话框跟随: %#x -> %s", ev.HWND, ev.Dir)
-		}, log.Printf)
-		a.follow.Start(ctx)
-		log.Print("对话框跟随: 已启动")
-	}
+	// 目录来源五种（资源管理器 / TC / Opus / XYplorer / xplorer2），设置里可逐个关掉；
+	// 关掉总开关（config.dialogFollow = false）就完全不碰别人的窗口。
+	a.syncFollow()
 
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
 		a.shutdown()
@@ -1498,6 +1494,64 @@ func (a *application) startHook() {
 			}
 		}
 	}()
+}
+
+// syncFollow 按当前配置启停跟随器，并刷新"哪些来源开着"的快照。
+// 设置页保存后调它：总开关一改就真的停/起，来源勾选改了下次轮询立刻生效。
+func (a *application) syncFollow() {
+	a.refreshPathSources()
+
+	if !a.cfg.DialogFollowOn() {
+		if a.followCancel != nil {
+			a.followCancel()
+			a.followCancel = nil
+			a.follow = nil
+			log.Print("对话框跟随: 已停止")
+		}
+		return
+	}
+	if a.follow != nil {
+		return // 已经在跑，来源开关通过 sources 快照热更新
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.followCancel = cancel
+	a.follow = win.NewDialogFollow(func(ev win.FollowEvent) {
+		log.Printf("对话框跟随: %#x -> %s", ev.HWND, ev.Dir)
+	}, log.Printf, a.pathSourceOn)
+	a.follow.Start(ctx)
+	log.Print("对话框跟随: 已启动（来源：" + a.enabledSourceSummary() + "）")
+}
+
+// refreshPathSources 把当前配置里的来源开关拍成一份快照给跟随器读。
+func (a *application) refreshPathSources() {
+	m := make(map[string]bool, len(win.SourceNames()))
+	for _, kind := range win.SourceNames() {
+		m[kind] = a.cfg.PathSourceEnabled(kind)
+	}
+	a.sources.Store(&m)
+}
+
+// pathSourceOn 是给跟随器的查询接口：这个来源现在开不开。
+func (a *application) pathSourceOn(kind string) bool {
+	m := a.sources.Load()
+	if m == nil {
+		return true
+	}
+	return (*m)[kind]
+}
+
+// enabledSourceSummary 只用于日志：把开着的来源列出来，关掉的标出来。
+func (a *application) enabledSourceSummary() string {
+	parts := make([]string, 0, len(win.SourceNames()))
+	for _, kind := range win.SourceNames() {
+		if a.pathSourceOn(kind) {
+			parts = append(parts, win.SourceLabel(kind))
+		}
+	}
+	if len(parts) == 0 {
+		return "无（只剩跟随框架，不会读任何窗口）"
+	}
+	return strings.Join(parts, " / ")
 }
 
 func (a *application) shutdown() {

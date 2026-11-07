@@ -258,13 +258,22 @@ Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由�
 2. **Total Commander** —— 已实现。走 TC 的 `WM_COPYDATA` 远程控制协议
    （`TTOTAL_CMD` + `'G'+256*'W'` 查询 / `'C'+256*'D'` 换目录，见 8.1.2），
    不解析窗口标题 —— 用户自定义标题模板会让标题解析失效，只留作兜底。
-3. **未实现**：Directory Opus（有 `dopusrt.exe /acmd`）、XYplorer、OneCommander、
-   Xplorer2、Files、Double Commander。Lertaro 在 `Plugins\<Name>\` 下各有一个
-   `*PathCollector.cs`，要接新的就在 `internal/win/` 加一个同形文件，并在
-   `follow.go` 的 `isPathSource` / `folderOf` 两处分派。Opus 优先级最高。
+3. **Directory Opus** —— 已实现（`opus.go`）。读文件显示容器的地址栏
+   （`dopus.lister` → `dopus.filedisplaycontainer` → `dopus.ctl.treepath`，见 8.1.3）。
+   不用 `dopusrt.exe /acmd`：那要起一个进程、走剪贴板或临时文件，比读窗口慢得多。
+4. **XYplorer** —— 已实现（`xyplorer.go`）。没有专用查询命令，走它的脚本通道
+   （`WM_COPYDATA` + UTF-16 脚本，脚本自己 `copydata` 回投答案，见 8.1.4）。
+5. **xplorer2** —— 已实现（`xplorer2.go`）。没有远程接口，只能读地址栏 `ComboBox`
+   的 `WM_GETTEXT`，且必须只看可见的那个（见 8.1.5）。
+6. **OneCommander / Files** —— **不做**。两者都只能走 UI Automation（类名由 WPF /
+   WinAppSDK 运行时生成，含 guid 或全机共用，进程名 + UIA 是唯一可靠路径）。
+   Go 里手搓 IUIAutomation 的代价与本机收益不成比例，且这两种用户都没装。
+7. **Double Commander** —— 未做。Lertaro 没有它的 collector，没有可靠读法可抄。
 
-统一出口是 `internal/win` 的 `isPathSource(hwnd)` + `folderOf(hwnd)`，
-供第 8 节的跟随器使用。
+统一出口是 `internal/win/sources.go` 的 `sourceKind(hwnd)` + `sourceFolder(kind, hwnd)`，
+跟随器侧再包一层 `(*DialogFollow).isPathSource` / `folderOf`（见第 8 节），
+新增一种来源只要在 `SourceNames` / `sourceKind` / `sourceFolder` 三处加一行。
+五种来源都能在设置里单独关掉（`config.pathSources`，见第 11 节）。
 
 ## 8. 打开/保存对话框跟随文件管理器（已实现，对应 Lertaro `IFileDialogAdapter` + `IActivePathCollector`）
 
@@ -274,7 +283,7 @@ Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由�
 > 切回那个「另存为」框，**它的路径自己变成「下载」**。
 
 三块拼起来：每隔 200ms 看一眼前台窗口（`internal/win/follow.go`）、
-前台是可提供目录的程序（资源管理器 / Total Commander）就读出它的当前目录、
+前台是可提供目录的程序（五种来源，见第 7 节）就读出它的当前目录、
 前台是文件对话框就按版本号决定要不要跳过去。
 
 ### 8.1 记住文件管理器的目录
@@ -338,8 +347,6 @@ window text 直接就是路径，一条 `EnumChildWindows` 解决。多标签时
 1. **接收窗口必须和发送在同一个 OS 线程。** TC 是同步 `SendMessage` 回来的，
    只有"发送线程自己的窗口"才会被**嵌套投递**，发完立刻就能读到；
    窗口开在别的线程，回复进那个线程的队列，这边读不到。
-   所以 `TotalCommanderFolder` 里是 `runtime.LockOSThread()` → 建 message-only
-   窗口（`HWND_MESSAGE`）→ 发请求 → 读回复 → `DestroyWindow`，用完即弃。
 2. **只能用 `SMTO_ABORTIFHUNG`，不能带 `SMTO_BLOCK`。** 带 BLOCK 时 Windows
    不允许调用线程处理回到自己队列的消息，回复照样被丢掉。
    `tools/tcprobe` 把四种组合跑了一遍，结论是：
@@ -351,12 +358,84 @@ window text 直接就是路径，一条 `EnumChildWindows` 解决。多标签时
    SendMessage(wParam=0)            -> 回调次数=1 路径="D:\Backup\Documents\"
    ```
 
-`sendMsg` 的语义因此分成两个：`sendMsg`（带 BLOCK，给对话框写文本用）和
-`sendMsgNoBlock`（TC 查询专用）。两者都是 `SendMessageTimeoutW` + 500ms 超时，
-TC 卡住也不会拖住跟随器。
+这两条不是 TC 独有的，凡"发一条消息、对方同步回投答案"的协议都适用，
+所以收发那一套抽到了 `internal/win/copydata.go`（`queryCopyData`），
+**Total Commander 和 XYplorer 共用**：`LockOSThread` → 注册一次窗口类
+`BaoziQueryWnd` → 建 message-only 窗口 → `build(receiver)` 生成 payload →
+`sendMsgNoBlock` → 读回复 → `DestroyWindow`。`build` 是回调而不是现成的字节：
+XYplorer 的脚本必须把接收窗口的 hwnd 拼进去，只能建完窗口才生成。
+`sendMsg` 的语义因此仍是两个：`sendMsg`（带 BLOCK，给对话框写文本用）和
+`sendMsgNoBlock`（查询专用）。两者都是 `SendMessageTimeoutW` + 500ms 超时，
+对方卡住也不会拖住跟随器。
 
 高权限场景另外调了 `ChangeWindowMessageFilterEx(receiver, WM_COPYDATA, MSGFLT_ALLOW, 0)`：
-Baozi 若以管理员身份运行，UIPI 会静默丢掉普通权限的 TC 的回复。
+Baozi 若以管理员身份运行，UIPI 会静默丢掉普通权限进程的回复。
+
+#### 8.1.3 Directory Opus（`OpusFolder`）
+
+照 Lertaro `Plugins\DirectoryOpus\DirectoryOpusPathCollector.cs`。窗口层次是：
+
+```
+dopus.lister（lister 主窗口，一个 Opus 窗口）
+  └ dopus.filedisplaycontainer（文件显示容器，一个标签页一个）
+       └ dopus.ctl.treepath（活动标签的地址栏，window text 就是完整路径）
+```
+
+非活动标签没有地址栏，读容器自己的 window text（Opus 把每个标签的目录放在自己的标题上）。
+
+**双栏怎么选"用户正在看的那一栏"**：先按 lister 标题唯一定位某一栏（标题前缀就是
+目录名），标题判断不出来再看键盘焦点落在哪个容器里（`GetGUIThreadInfo` 取
+`hwndFocus`，再沿父链上溯）。两条都判不出就**返回空、不导航** ——
+Lertaro 的第三层"按几何距离猜横竖分屏"故意没做：跳到另一栏的目录，
+比这一下不跳更让人难受。
+
+另外过一遍 `resolveFolderText`：Opus 报出来的可能是本地化拼写（`C:\用户\…`），
+那不是存在的路径。Lertaro 的 `LocalizedPathResolver`（逐段翻译目录名）没做，
+没有装 Opus 的机器可验，宁可不写这段猜逻辑。
+
+#### 8.1.4 XYplorer（`XyplorerFolder`）
+
+照 Lertaro `Plugins\Xyplorer\Win32\Win32Helper.cs`。窗口类名 `ThunderRT6FormDC`
+（VB6 主窗体，任何 VB6 程序都用这个），所以必须再过一道**进程名 `xyplorer*`** 才算数。
+
+XYplorer 没有 TC 那样的查询命令，它暴露的是"跑一段 XYplorer 脚本"：
+
+| 环节 | 细节 |
+|---|---|
+| 请求 | `WM_COPYDATA`，`dwData = 0x00400001`（RUN_SCRIPT），`lpData` 是 **UTF-16** 的脚本文本 |
+| 脚本 | `::$return = "<curpath>"; copydata <接收窗口>, "$return", 2;` |
+| 回复 | 脚本自己用 `copydata` 回投，`dwData = 2`，内容是 UTF-16 路径 |
+
+`$return` 在引号里是给 XYplorer 做字符串替换的，不是字面量；接收窗口的 hwnd 必须
+以十进制数字直接写进脚本 —— 这就是 `queryCopyData` 的 `build` 要拿到 receiver 的原因。
+脚本按 UTF-16LE 编码、不带尾 NUL（和 .NET `Encoding.Unicode.GetBytes` 一致）。
+
+#### 8.1.5 xplorer2（`Xplorer2Folder`）
+
+照 Lertaro `Plugins\Xplorer2\Win32\{Win32Helper,WindowProbe}.cs`。框架类
+`ATL:ExplorerFrame`，同样要配进程名 `xplorer2*`。xplorer2 没有远程控制接口，
+只能读窗口：地址栏是一个 `ComboBox`，**`WM_GETTEXT` 的回复才是路径**，
+同一个句柄 `GetWindowText` 返回空（Lertaro 专门量过这一点）。
+
+两个坑：
+
+1. 一帧里有**两个** `ComboBox` —— 传统地址栏（显示面包屑时它被隐藏）和面包屑自己那个。
+   隐藏的那个还留着上一次访问的路径（实测活动面板在 `D:\Notes` 时，隐藏的传统栏
+   仍报 `C:\Windows`）。所以**只看可见的**：看不见的一律不算，宁可返回空。
+2. 编辑中途 `ComboBox` 会短暂报出纯数字垃圾，还有 `::` 开头的 shell 命名空间
+   （此电脑之类），都不是文件系统路径，要滤掉（还要 `filepath.IsAbs` + `isDir`）。
+
+面包屑那个自己的窗口在 ATL 里是**无名类**（`ATL:%p`），只能按**文字**认它 ——
+类名对不上，window text 是 `CrumbBar`。认出来之后，焦点面板那条 `ComboBox`
+的父窗口就是它，优先用；其余可见的 `ComboBox` 当兜底。
+
+> **这三种（Opus / XYplorer / xplorer2）没有在真机上验证过** —— 用户明确说这几样
+> 他一个都没装。实现完全照 Lertaro 的 collector 写，能验证的只有：
+> 未安装时 `IsDirectoryOpus` / `IsXyplorer` / `IsXplorer2` 一律为假（`tools/folderprobe`
+> 在本机跑出来只有资源管理器与 TC），因此不会把普通窗口误判成目录来源、不会乱跳；
+> 读不到时返回空串，跟随器按"没读到"处理，不导航也不崩。
+> 装了这几样的人如果读出来不对，`tools/folderprobe` 会打印容器 / `ComboBox` /
+> 地址栏原文，照着改就行。
 
 ### 8.2 什么时候跳（照抄 `FileDialogNavigationTracker.cs`）
 
@@ -365,7 +444,7 @@ Baozi 若以管理员身份运行，UIPI 会静默丢掉普通权限的 TC 的�
 
 | 情形 | 动作 |
 |---|---|
-| 前台是文件管理器（资源管理器 / TC） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
+| 前台是文件管理器（五种来源之一） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
 | **对话框重新成为前台，且上一次活动的是那个文件管理器窗口** | **现场重读**它的目录（不等轮询缓存），再按下面的版本规则决定跳不跳 |
 | 前台是文件管理器，目录与 `lastDir` 不同 | `lastDir = dir`，`version++` |
 | 对话框**第一次**成为前台 | 只记 `seen[hwnd] = version`，**不导航** |
@@ -383,8 +462,9 @@ Baozi 若以管理员身份运行，UIPI 会静默丢掉普通权限的 TC 的�
 读到的永远是最新的；而且只记住 hwnd、不缓存内容。反过来，上一次活动的若不是
 文件管理器（比如中间切过浏览器），就不重读，避免把人拽回旧目录。
 
-`lastExplorer` 已改名 `lastSource`：现在"目录来源"有两类，判断"上一次活动的是不是
-同一个来源窗口"和"能不能现读"都走 `isPathSource()` / `folderOf()` 两个分派点。
+`lastExplorer` 已改名 `lastSource`：现在"目录来源"有五种，判断"上一次活动的是不是
+同一个来源窗口"和"能不能现读"都走 `(*DialogFollow).isPathSource()` /
+`folderOf()` 两个分派点（它们是方法不是包级函数了，因为要先按设置过滤来源）。
 
 ### 8.3 怎么跳（`NavigateDialog`，照 `StandardFileDialogAdapter`）
 
@@ -460,10 +540,48 @@ Baozi 同一时刻的日志：
 对话框跟随: 0x4c0426 -> C:\Windows\System32
 ```
 
+**接完五种来源之后的回归**（2026-11-07 23:35 / 23:37，同一天连跑两轮；
+这一轮把收发抽成 `copydata.go`、分派改成按来源开关过滤的方法，所以必须重测一遍）：
+
+```
+# FOLLOW_TC=1（TC 当来源）
+① 另存为框 0x25e0e5e 初始地址: "地址: 文档"
+② TC 切到 D:\work\baozi            → TC 当前目录="D:\work\baozi"
+③ +500ms 地址: "地址: D:\work\baozi"        对话框还在=true 卡死=false
+④ TC 切到 D:\work\baozi\internal    → TC 当前目录="D:\work\baozi\internal"
+⑤ +500ms 地址: "地址: D:\work\baozi\internal" 对话框还在=true 卡死=false
+
+# 资源管理器 + 已知文件夹（FOLLOW_TITLE=下载）
+① 另存为框 0xc7114c 初始地址: "地址: 文档"
+④ 资源管理器切到 D:\Backup\Downloads → 面包屑显示 "地址: 下载"
+⑤ +500ms 地址: "地址: 下载"          对话框还在=true 卡死=false
+```
+
+两轮各六次采样，`卡死` 全是 false；跟随器启动日志同时也报了来源清单：
+
+```
+对话框跟随: 已启动（来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2）
+```
+
+**五种来源的识别在同一天用 `tools/folderprobe` 核过**（本机没装 Opus / XYplorer /
+xplorer2，所以只应看到资源管理器与 TC，一个都不能多）：
+
+```
+[TC] 发 0x1d07fc：ok=true dwData=0x5752（='R'+256*'W'） 回复路径="D:\Backup\Documents\"
+[TotalCommander] 0x1d07fc  目录="D:\Backup\Documents"
+[资源管理器] 0xa1214 title="System32" 地址栏原文="地址: C:\Windows\System32" 解析目录="C:\Windows\System32"
+[资源管理器] 0x71278 title="梦境寻忆" 地址栏原文="地址: D:\Backup\Downloads\梦境寻忆" 解析目录同上
+[资源管理器] 0x8830e02 title="本地磁盘 (D:)" 地址栏原文="地址: D: \" 解析目录="D:\"
+```
+
+（这同时是"不会误判"的证据：机器上跑着一堆普通程序，Opus / XYplorer / xplorer2
+三条判定一个都没触发。）
+
 留下的探针：`tools/followtest`（整条链路，`FOLLOW_NOTEPAD=1` 改用真记事本、
 `FOLLOW_SECOND=<目录>` 指定第二轮目标、`FOLLOW_TC=1` 改用 Total Commander、
 `FOLLOW_TITLE=<标题>` 指定已知文件夹窗口的本地化标题）、`tools/exploredump`
-（资源管理器目录）、**`tools/folderprobe`（各文件管理器的目录读取 + 已知文件夹映射表）**、
+（资源管理器目录）、**`tools/folderprobe`（五种来源的识别 + 目录读取 + 已知文件夹映射表；
+装了 Opus / XYplorer / xplorer2 时还会打印容器、`ComboBox` 与地址栏原文）**、
 **`tools/tcprobe`（TC 协议单测，四种投递方式对比；`-cd <路径>` 只换目录）**、
 `tools/dlgprobe2`（枚举 + 单次导航 + 读文件名框）、`tools/dlgdump`（打印对话框全部子控件）。
 
@@ -590,6 +708,12 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 ## 10. 已知边界
 
 - 没有提权钩子：管理员权限窗口里的文件对话框暂时适配不到（见 §7/§8）。
+- **Directory Opus / XYplorer / xplorer2 三种来源没有在真机上验证过**（用户自述这几样
+  一个都没装）。窗口类名、协议、字段全按 Lertaro 的 collector 写；能验证的只有
+  "没装时不会被误判、读不到时返回空不崩"。
+- OneCommander 与 Files 不做：两者都要 UI Automation 才拿得到路径（见 §7 第 6 条）。
+- Directory Opus 的两个高级判法没做：本地化路径逐段还原（`LocalizedPathResolver`）、
+  双栏按几何距离猜哪一栏是活动的。双栏判不出时宁可不动。
 - 索引是快照：文件增删要等服务重建（≤2 分钟）或 `rescanMinutes` 到期才反映。
 - 路径查询（输入含 `\` 或 `/`）需要逐条还原路径，比纯名字查询慢，已限制候选上限 5000 条。
 - 服务建出来的索引没有大小和时间（`SizeKB/ModSec=0`），按大小/时间排序用不了这两项。
@@ -606,16 +730,26 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 | 分区 | 控件 | 写回字段 |
 |---|---|---|
 | 唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
+| 文件对话框跟随 | 开关（总）、两行 `Checkbox`（五种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2） | `dialogFollow` / `pathSources.*` |
 | 排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果） | `search.weights` / `typeOrder` / `maxResults` |
 | 索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
 | 自定义命令 | `TextArea`，每行 `关键字 \| 显示名 \| 程序 \| 参数` | `commands` |
+
+「目录来源」是逐项写的 `true`/`false`（不是省略），否则用户关掉某一项之后，
+下次读配置会因为"缺省即开"又给它打开。运行时的取法：
+
+- **总开关**：`syncFollow()` 按 `dialogFollow` 起/停跟随器，改完保存立刻生效，不用重启进程；
+- **来源勾选**：`application.sources` 是一份 `atomic.Pointer[map[string]bool]` 快照
+  （配置指针在保存时整体替换，拿它给另一个 goroutine 每 200ms 读一次会数据竞争），
+  跟随器每次轮询先问一遍，关掉的来源连窗口都不读。
 
 「保存并应用」的执行顺序（顺序不能反）：
 
 1. 写 `config.json`；
 2. 组合键变了 → 先 `Unregister` 旧键再 `Register` 新键（直接覆盖注册会静默失败）；
 3. 重启钩子进程：关掉它的 stdin 让它自杀，等 2s，仍在就 `Kill`，再重新拉起——钩子读的是同一份 `config.json`，不重启就还是旧间隔/旧全屏策略；
-4. 根目录变了 → 触发一次重建（`index.Build`）。
+4. 根目录变了 → 触发一次重建（`index.Build`）；
+5. `syncFollow()` 刷新来源快照（必要时起停跟随器）。
 
 界面本身的可测性：`ui.NewTester(view, w, h)` 可以不开窗口就把视图渲染出来并断言文案，
 所以面板、设置、互传三个界面都有快照式测试；键盘链路（双击 Ctrl → 输入 → Enter → 落盘）则用
