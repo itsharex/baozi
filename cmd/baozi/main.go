@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	_ "net/http/pprof" // BAOZI_PPROF=1 时才真的监听，平时只是注册 handler
 	"os"
@@ -20,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,6 +97,11 @@ type application struct {
 	list        ui.ListState
 	input       ui.Handle
 	icons       map[string]*ui.Bitmap
+	// thumbAsk 记录"已经去要过缩略图的键"（失败的也算），避免每帧重复下单。
+	// thumbSem 限制同时在取的缩略图个数：Shell 那边是 COM 走 explorer 的缩略图
+	// 提供者，一次放几十个进去只会互相拖慢，4 个足够铺满一屏。
+	thumbAsk map[string]bool
+	thumbSem chan struct{}
 	// offline 为 true 时不向 Shell 要图标（视图测试里没有消息循环，要了会永久阻塞）。
 	offline bool
 	// scale 是显示器的最大缩放比例，启动时问一次就缓存：Screen.Displays 也走
@@ -150,6 +157,22 @@ type application struct {
 	// 那一帧正在渲染这条列表，边遍历边重建会越界。先记下来，视图开头统一处理。
 	pendingOp  string // "" | "delete" | "pin" | "unpin"
 	pendingIdx int
+	// 首页「已固定」区里拖动排序：同样不能在卡片渲染途中改 results，
+	// 松手那一帧记下起点与落点，下一帧 view 开头结算。
+	pendingPinMove *pinMove
+
+	// pinDragPts 存每张固定卡片本帧的拖动偏移。Draggable 要求这个指针跨帧稳定，
+	// 每帧新建一个 Point 会把拖动中的卡片拽回原位。
+	pinDragPts    map[int]*ui.Point
+	pinDragFrom   int
+	pinDragActive bool
+	pinDragX      float32
+	pinDragY      float32
+}
+
+// pinMove 是一次拖动排序的意图，from/to 都是 results 的下标。
+type pinMove struct {
+	from, to int
 }
 
 // resultKey 是结果在历史里的键：普通项用路径，命令用关键字。
@@ -160,8 +183,13 @@ func resultKey(r search.Result) string {
 	return r.Command
 }
 
-// applyPending 执行上一帧右键菜单里选的动作。只在 view 开头调用（那时还没开始遍历结果）。
+// applyPending 执行上一帧右键菜单里选的动作、以及拖动排序的结果。
+// 只在 view 开头调用（那时还没开始遍历结果）。
 func (a *application) applyPending() {
+	if mv := a.pendingPinMove; mv != nil {
+		a.pendingPinMove = nil
+		a.applyPinMove(*mv)
+	}
 	if a.pendingOp == "" {
 		return
 	}
@@ -209,6 +237,91 @@ func (a *application) applyPending() {
 	if op == "delete" {
 		a.status = "已从历史删除（搜索仍能搜到）：" + r.Name
 	}
+}
+
+// applyPinMove 把一次拖动排序落进历史，然后重建首页。
+func (a *application) applyPinMove(mv pinMove) {
+	recentTo := len(a.results) - a.pinnedCount
+	if a.pinnedCount < 2 || mv.from < recentTo || mv.to < recentTo ||
+		mv.from >= len(a.results) || mv.to >= len(a.results) {
+		return
+	}
+	keys := make([]string, 0, a.pinnedCount)
+	for i := recentTo; i < len(a.results); i++ {
+		keys = append(keys, resultKey(a.results[i]))
+	}
+	relFrom, relTo := mv.from-recentTo, mv.to-recentTo
+	k := keys[relFrom]
+	keys = append(keys[:relFrom], keys[relFrom+1:]...)
+	keys = slices.Insert(keys, relTo, k)
+	if !a.hist.ReorderPinned(keys) {
+		return
+	}
+	a.status = fmt.Sprintf("已保存固定顺序：%s 移到第 %d 位", a.results[mv.from].Name, relTo+1)
+	a.results = a.historyResults(maxPinned)
+	a.choose(recentTo + relTo)
+}
+
+// pinDragPoint 取某张固定卡片跨帧复用的拖动偏移指针。
+func (a *application) pinDragPoint(i int) *ui.Point {
+	if a.pinDragPts == nil {
+		a.pinDragPts = map[int]*ui.Point{}
+	}
+	pt, ok := a.pinDragPts[i]
+	if !ok {
+		pt = &ui.Point{}
+		a.pinDragPts[i] = pt
+	}
+	return pt
+}
+
+// trackPinDrag 把这张卡片的拖动状态接起来：拖动中记录最新偏移，
+// 松手那一帧把偏移归零（否则卡片会粘在拖到的位置），并记下这次移动的意图。
+func (a *application) trackPinDrag(i int, el ui.Element) {
+	pt := a.pinDragPoint(i)
+	if el.Pressed() {
+		if !a.pinDragActive || a.pinDragFrom != i {
+			a.pinDragActive, a.pinDragFrom = true, i
+		}
+		o := el.DragOffset()
+		a.pinDragX, a.pinDragY = o.X, o.Y
+		return
+	}
+	if !a.pinDragActive || a.pinDragFrom != i {
+		return
+	}
+	a.pinDragActive = false
+	*pt = ui.Point{}
+	a.pendingPinMove = a.pinMoveFor(i, a.pinDragX, a.pinDragY)
+	a.pinDragX, a.pinDragY = 0, 0
+}
+
+// pinMoveFor 把拖动位移换算成落点。
+// 卡片 84 宽、行内间距 6，所以一列 90；卡片高约 83（4 + 32 图标 + 5 + 三行字 38 + 4）、
+// 行间距 6，所以一行 89。这两个数字要跟 card() 与 homeGrid() 保持一致。
+func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
+	recentTo := len(a.results) - a.pinnedCount
+	if a.pinnedCount < 2 || from < recentTo {
+		return nil
+	}
+	colShift := int(math.Round(float64(dx) / 90))
+	rowShift := int(math.Round(float64(dy) / 89))
+	if colShift == 0 && rowShift == 0 {
+		return nil
+	}
+	rel := from - recentTo
+	to := rel + colShift + rowShift*panelCols
+	if to < 0 {
+		to = 0
+	}
+	if to >= a.pinnedCount {
+		to = a.pinnedCount - 1
+	}
+	if to == rel {
+		return nil
+	}
+	a.pinDragPts = nil // 位置要变了，旧的偏移指针不能再对号入座
+	return &pinMove{from: from, to: recentTo + to}
 }
 
 func (a *application) view(c *ui.Context) {
@@ -435,7 +548,14 @@ func (a *application) card(c *ui.Context, i int) {
 		bg = t.SurfaceHover
 		border = t.Accent.Alpha(0.6)
 	}
-	ui.Column(c).Width(84).Padding(8, 4).Gap(5).AlignItems(ui.Center).Radius(12).
+	// 「已固定」区的卡片可以拖着重排：拖动中的那张换底色+亮边，让人知道"手上有东西"。
+	pinned := i >= len(a.results)-a.pinnedCount
+	dragging := pinned && a.pinDragActive && a.pinDragFrom == i
+	if dragging {
+		bg = t.SurfaceHover
+		border = t.Accent.Alpha(0.8)
+	}
+	col := ui.Column(c).Width(84).Padding(8, 4).Gap(5).AlignItems(ui.Center).Radius(12).
 		Background(bg).BorderWidth(1).BorderColor(border).
 		OnClick(func() {
 			a.chosen = i
@@ -450,6 +570,12 @@ func (a *application) card(c *ui.Context, i int) {
 			ui.Text(c, wrapName(r.Name, 76, 3)).FontSize(10.5).TextColor(t.Text).
 				TextAlign(ui.Center).MaxLines(3).LineHeight(1.2).Tooltip(r.Name)
 		})
+	if !pinned {
+		return
+	}
+	// 拖动本身不改数据：松手时才在下一帧的 applyPending 里重排（渲染途中不能改 results）。
+	col = col.Draggable(a.pinDragPoint(i), ui.DraggableOptions{})
+	a.trackPinDrag(i, col)
 }
 
 // itemMenu 是首页卡片和结果行共用的右键菜单：固定 / 取消固定、从历史删除。
@@ -576,6 +702,11 @@ func (a *application) resultIcon(c *ui.Context, r search.Result, size float32) {
 				ui.Image(c, bm).Size(size, size)
 				return
 			}
+		} else if thumbable(r) {
+			if bm := a.thumbIcon(r, size); bm != nil {
+				ui.Image(c, bm).Size(size, size)
+				return
+			}
 		}
 		ui.Icon(c, g).FontSize(size).TextColor(t.TextMuted)
 		return
@@ -645,6 +776,94 @@ func (a *application) appIcon(r search.Result, px int) *ui.Bitmap {
 		a.icons[key] = bitmap
 	}
 	return bitmap
+}
+
+// thumbable 判断这条结果要不要显示内容缩略图：图片、视频、PDF。
+// 其它文档不取 —— .txt/.docx 的缩略图多半是白纸或空白页，还不如统一线框好认。
+func thumbable(r search.Result) bool {
+	if r.Kind != search.KindFile || r.Path == "" {
+		return false
+	}
+	ext := strings.ToLower(strings.TrimPrefix(r.Ext, "."))
+	return imageExts[ext] || videoExts[ext] || ext == "pdf"
+}
+
+// thumbIcon 返回这条结果的缩略图；还没取到就先返回 nil（本帧画线框），
+// 并在后台下单，取回后经 panel.Update 重绘。
+//
+// 为什么异步：冷态一张 19ms、最慢 80ms，一屏十几行同步取就是几百毫秒的白屏。
+// 宁可先看到线框图标，也别为了小图把面板唤出的手感拖慢。
+func (a *application) thumbIcon(r search.Result, size float32) *ui.Bitmap {
+	// 与 appIcon 同样按 2.2 倍请求：22 逻辑 px 的方块，2.2 倍后缩下来才不糊。
+	px := int(size * 2.2)
+	if s := a.scale; s > 1 {
+		px = int(float32(px) * s)
+	}
+	key := fmt.Sprintf("thumb:%d:%s", px, r.Path)
+	// 先看缓存：已经取到的图不依赖 Shell，离线（视图测试）也能照常画出来。
+	if bm, ok := a.icons[key]; ok {
+		return bm // ok 但 bm 为 nil：这张系统给不出缩略图，别再反复试
+	}
+	if a.offline || !a.cfg.ThumbnailsOn() {
+		return nil
+	}
+	if a.thumbAsk == nil {
+		a.thumbAsk = map[string]bool{}
+		a.thumbSem = make(chan struct{}, 4)
+	}
+	if a.thumbAsk[key] {
+		return nil
+	}
+	select {
+	case a.thumbSem <- struct{}{}:
+		a.thumbAsk[key] = true
+		go a.loadThumb(key, r.Path, px)
+	default:
+		// 四个在飞已经满了：这次不排队，等下一帧有空位再来
+	}
+	return nil
+}
+
+// loadThumb 在后台线程取一张缩略图。COM 的 STA 与线程绑定，所以进去第一件事
+// 是把线程钉住（win.Thumbnail 内部自己 LockOSThread，不用这里管）。
+func (a *application) loadThumb(key, path string, px int) {
+	defer func() { <-a.thumbSem }()
+	data, err := win.Thumbnail(path, px)
+	if err != nil {
+		a.writeIcon(key, nil)
+		return
+	}
+	bm, _ := ui.DecodeBitmap(data)
+	a.writeIcon(key, bm) // 解码失败时 bm 为 nil，同样记成"取不到"
+}
+
+// writeIcon 把异步取回的图塞进缓存并在 UI 线程重绘。
+// icons 只在 UI 线程读写（渲染、以及这里的 Update 回调），所以不用加锁。
+func (a *application) writeIcon(key string, bm *ui.Bitmap) {
+	stash := func() {
+		a.icons[key] = bm
+		// 滚过几百张图之后缓存会一直涨；超过上限就把缩略图整批丢掉（程序图标留着）。
+		// 不做 LRU：缩略图重建只要 1ms，为省这点钱维护链表不值。
+		if len(a.icons) > 900 {
+			a.dropThumbs()
+		}
+	}
+	if a.panel == nil {
+		stash()
+		return
+	}
+	a.panel.Update(stash)
+}
+
+func (a *application) dropThumbs() {
+	for k := range a.icons {
+		if strings.HasPrefix(k, "thumb:") {
+			delete(a.icons, k)
+		}
+	}
+	for k := range a.thumbAsk {
+		delete(a.thumbAsk, k)
+	}
 }
 
 // screenScale 取所有显示器里最大的缩放比例（图标要按物理像素请求，缩下来才清晰）。

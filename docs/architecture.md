@@ -246,7 +246,7 @@ Score = (0.5*Freq + 0.3*Type + 0.2*Acc) / (0.5+0.3+0.2)
 
 ## 5. 历史
 
-`history.json` 每条是 `{path, name, kind, ext, hint, exec, args, count, lastUsed}`。
+`history.json` 每条是 `{path, name, kind, ext, hint, exec, args, count, lastUsed, pinned, pinOrder}`。
 
 - **元数据**：`kind` 是 `file` / `dir` / `app` / `command`。应用记录的是 `shell:AppsFolder\<AppUserModelID>`，
   只看路径的话 `filepath.Base` 会得到一串 AUMID、按扩展名取图标只会拿到通用文件图标——这就是"名字和图标不对劲"的根因。
@@ -256,6 +256,10 @@ Score = (0.5*Freq + 0.3*Type + 0.2*Acc) / (0.5+0.3+0.2)
   早先只在 `OnWillQuit` 落盘，进程被强杀/崩溃就全丢——现在不依赖"正常退出"。
 - **排序**：`0.7*log1p(count)/log1p(maxCount) + 0.3*exp(-ageHours/168)`；`lastUsed` 单调递增（同一毫秒内两次打开也不会乱序）；
   超上限按次数裁剪。空查询时 `Recent(12)` 就是"快捷菜单里的历史"。
+- **已固定的位置是显式的**（`pinned` + `pinOrder`）：`pinOrder` 从 1 起，越小越靠左，由首页拖动决定；
+  固定时取 `pinSeq+1` 追加到末尾，取消固定归 0，重新固定又排到最后。
+  **为什么不能沿用"最近使用倒序"**：那样每用一次某个固定项，它就跳到最前面，用户摆好的排版自己会跑。
+  `pinOrder == 0` 只出现在老版本的历史里，`Open` 时按 `lastUsed` 倒序补一遍再落盘。
 
 ## 6. 局域网文件互传（对应 dashbeam，已实现）
 
@@ -770,6 +774,11 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
   在正则里不成立，因为 `\.log$` 的反斜杠到处都是）；也没有"正则 + 拼音"的组合。
   正则语法错误只有结果区一行提示，不会自动帮你修模式。
 - 正则模式是会话级状态（`application.regexOn`），不写 `config.json`：重启回到普通搜索。
+- 缩略图只给 `.png/.jpg/.mp4/.pdf` 这类有意义的文件取；`.txt/.docx/.xlsx` 不取
+  （它们的缩略图多半是白纸或空白页，还不如线框图标好认）。取不到时按线框显示，不会反复重试。
+- 拖动排序只在首页「已固定」段有效，搜索态没有这个入口；拖动期间其它卡片不会让位，
+  松手才整段重排（`Draggable` 的语义就是"元素跟指针走"，不做拖拽占位动画）。
+- 缩略图缓存没有磁盘层，进程重启后要按系统 thumbcache 重新取（热态 1 ms/张，可接受）。
 - 服务建出来的索引没有大小和时间（`SizeKB/ModSec=0`），按大小/时间排序用不了这两项。
 - 非 NTFS 卷（U 盘 exFAT、网络盘）不能走 USN，配置里加这种根目录时服务会跳过它，
   主进程回退到 WalkDir。
@@ -785,7 +794,7 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 |---|---|---|
 | 唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
 | 文件对话框跟随 | 开关（总）、两行 `Checkbox`（五种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2） | `dialogFollow` / `pathSources.*` |
-| 排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果） | `search.weights` / `typeOrder` / `maxResults` |
+| 排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.thumbnails` |
 | 索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
 | 自定义命令 | `TextArea`，每行 `关键字 \| 显示名 \| 程序 \| 参数` | `commands` |
 
@@ -892,6 +901,65 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 所以这类测试要先 `stubAllIcons()` 把图标缓存填上纯色位图。
 同理，`mygo.App.OpenAtLogin` 走的是 `onMainValue`，在 Tester 下没有主循环也会永久阻塞——
 自启状态因此在 `ready()` 里问系统一次存进 `application.openAtLogin`，设置窗口和托盘只读缓存。
+
+### 内容缩略图（`internal/win/thumb.go`）
+
+结果行左侧对 `.png/.jpg/.mp4/.pdf` 这类文件显示的是**内容缩略图**，不是扩展名图标。
+两条限制叠在一起，才逼出这个自实现的 `win.Thumbnail`：
+
+1. **mygo 的 `Shell.FileIcon` 拿不到缩略图**。它内部固定传 `SIIGBF_ICONONLY`（源码注释原话
+   "as FileIcon draws its icon, without thumbnails"），所以哪怕放开 `isProgram` 的判断，
+   png 也只会拿到同一枚蓝色"图片类型"图标。要看内容必须自己调
+   `IShellItemImageFactory::GetImage`，且 flags 不带 `ICONONLY`。
+2. **成本差一个量级**。同一个函数按两种 flags 各取一次（`tools/thumbprobe`，28 张系统壁纸、48px）：
+
+   | 场景 | 每张 | 首屏 10 张 | 全部 80 条 |
+   |---|---|---|---|
+   | 类型图标（`ICONONLY`） | 平均 2.0 ms（首张 26 ms） | ~20 ms | ~110 ms |
+   | 缩略图 · 冷 | 平均 19.1 ms，最慢 80 ms | ~190 ms | ~1.5 s |
+   | 缩略图 · 热（系统 thumbcache 已建） | 平均 1.1 ms | ~11 ms | ~90 ms |
+
+   冷态同步取一屏就是几百毫秒白屏。所以**搜索完全不碰图标**（不受影响），要控的只是渲染：
+   渲染时只"下单"，图回来再 `panel.Update` 重绘，第一帧仍是线框图标。
+
+实现要点：
+
+- `Thumbnail(path, px)` 自己组 COM 调用：`SHCreateItemFromParsingName` +
+  `IShellItemImageFactory::GetImage(SIIGBF_CROPTOSQUARE|BIGGERSIZEOK)`。
+  `CROPTOSQUARE` 是因为照片是 4:3 的，按比例缩进方块会拉变形；`BIGGERSIZEOK` 让 Shell
+  从更大的缓存图缩下来，22 逻辑 px 才不糊。
+- **COM 的 STA 与线程绑定**，而这个函数跑在后台 goroutine 里：进去先 `runtime.LockOSThread()`，
+  `CoInitializeEx(COINIT_APARTMENTTHREADED)` 返回 `S_OK`/`S_FALSE` 时配对 `CoUninitialize`；
+  `RPC_E_CHANGED_MODE` 说明线程已被别人初始化，不要动它。
+- 返回值是 `HBITMAP`，用 `GetObjectW` 取 `DIBSECTION` 直接读 `bmBits`（32 位 BGRA + 直通 alpha），
+  转 `image.NRGBA` 再 `png.Encode`，交给 `ui.DecodeBitmap`。
+- **并发与去重**：`thumbSem` 容量 4（Shell 那边是 COM 走 explorer 的缩略图提供者，
+  放几十个进去只会互相拖慢）；`thumbAsk` 记住请求过的 key（含失败的），避免每帧重复下单。
+- **缓存**：`icons` 复用应用图标那张 map，key 是 `thumb:<px>:<path>`。
+  成功的存位图、失败的也存（值为 nil），这样"系统给不出缩略图"的文件不会每次滚动都重试。
+  超过 900 条就整批丢掉缩略图部分——重建一张只要 1 ms，不值得维护 LRU。
+- **`ui.List` 是虚拟列表**（只有可见行调 `row()`），所以"只给可见行取图"不需要额外判断。
+- 开关：`search.thumbnails`（`*bool`，nil 视为开），设置界面的「排序」区有勾选。
+  关掉后一律线框图标。
+
+### 已固定区的拖动排序
+
+首页「已固定」的卡片可以拖动重排，松手即保存。三个不能省的细节：
+
+- **不能在卡片渲染途中改 `results`**：那一帧还在遍历它，改了就越界。
+  松手时只记下 `pendingPinMove{from,to}`，下一帧 `view()` 开头的 `applyPending()` 统一结算
+  （和右键菜单的"固定/删除"走同一条通道）。
+- **`Draggable` 的 offset 指针必须跨帧稳定**：`pinDragPts map[int]*ui.Point` 按卡片缓存指针，
+  每帧新建一个 `Point` 会把拖动中的卡片拽回原位。结算前要 `*pt = ui.Point{}` 归零，
+  否则卡片会粘在拖到的位置；重排后 `pinDragPts` 整表清空，避免旧下标对上新的卡片。
+- **位移怎么换算成落点**：卡片 84 宽 + 行内间距 6 = 一列 90 DIP；卡片高约 83 + 行距 6 = 一行 89 DIP。
+  `round(dx/90)` 加 `round(dy/89)*panelCols` 就是"挪了几格"，再夹到 `[0, pinnedCount-1]`。
+  这两个数字必须和 `card()`、`homeGrid()` 保持一致，改布局时一起改。
+
+`Draggable` 的语义是"元素跟着指针走、松手才停"，所以拖动期间其它卡片不会让位——
+出现的是"被拖的卡片盖住目标位"的观感，松手后整段重排。测试 `TestPinDragReorders` 用
+`ui.Tester` 的 `Press/Move/Release` 真跑一遍：往右拖一格，「甲甲」从第一位变成第二位，
+且 `hist.Pinned` 的顺序在重开后依然是新顺序。
 
 ## 13. 启动方式与图标资源
 

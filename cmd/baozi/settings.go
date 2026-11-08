@@ -33,6 +33,8 @@ type settingsWindow struct {
 
 	typeOrder  string
 	maxResults float64
+	// thumbnails 决定图片/视频显示内容缩略图还是线框图标。
+	thumbnails bool
 
 	roots         string
 	excludes      string
@@ -97,6 +99,7 @@ func (s *settingsWindow) load() {
 	s.wAcc = cfg.Search.Weights.Accuracy
 	s.typeOrder = strings.Join(cfg.Search.TypeOrder, ", ")
 	s.maxResults = float64(cfg.Search.MaxResults)
+	s.thumbnails = cfg.ThumbnailsOn()
 
 	s.roots = strings.Join(cfg.Index.Roots, "\n")
 	s.excludes = strings.Join(cfg.Index.Excludes, "\n")
@@ -219,6 +222,9 @@ func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, "最多显示结果数").FontSize(12).TextColor(t.TextMuted).Width(150)
 			ui.NumberInput(c, &s.maxResults, 10, 500, 10).Width(120)
 		})
+		ui.Checkbox(c, &s.thumbnails, "图片、视频、PDF 显示内容缩略图")
+		ui.Text(c, "缩略图在后台取，取到才替换掉线框图标，不会拖慢唤出。"+
+			"关掉后一律用单色线框图标（系统没有缩略图提供者的文件本来也只有线框）。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
@@ -317,6 +323,7 @@ func (s *settingsWindow) save() {
 	cfg.Search.Weights = config.Weights{Frequency: s.wFreq, Type: s.wType, Accuracy: s.wAcc}
 	cfg.Search.TypeOrder = splitList(s.typeOrder)
 	cfg.Search.MaxResults = int(s.maxResults)
+	cfg.Search.Thumbnails = boolPtr(s.thumbnails)
 
 	oldRoots := s.app.cfg.Index.Roots
 	cfg.Index.Roots = splitLines(s.roots)

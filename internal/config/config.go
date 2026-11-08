@@ -100,6 +100,14 @@ type Search struct {
 	Weights    Weights  `json:"weights"`
 	TypeOrder  []string `json:"typeOrder"`
 	MaxResults int      `json:"maxResults"`
+	// Thumbnails 控制图片/视频在结果里显示内容缩略图还是类型线框图标。
+	// 指针是为了区分"没配置过"（nil，按开处理）和"用户明确关掉"。
+	Thumbnails *bool `json:"thumbnails,omitempty"`
+}
+
+// ThumbnailsOn 报告是否显示缩略图：没配置过默认开。
+func (c *Config) ThumbnailsOn() bool {
+	return c.Search.Thumbnails == nil || *c.Search.Thumbnails
 }
 
 // Weights 三项权重，内部会归一化，不需要凑成 1。

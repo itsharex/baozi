@@ -45,6 +45,10 @@ type Entry struct {
 	LastUsed int64 `json:"lastUsed"` // Unix 纳秒
 	// Pinned 表示被固定到首页（Ctrl+K），与次数/时间无关，也永远不会被 trim 掉。
 	Pinned bool `json:"pinned,omitempty"`
+	// PinOrder 是「已固定」区里的位置，从 1 起，越小越靠左。
+	// 0 表示还没排过序：老版本的历史里固定项全都没这个字段，Open 时按最近
+	// 使用补一次，之后位置就只由用户拖动决定，不再随使用次数自己跳。
+	PinOrder int64 `json:"pinOrder,omitempty"`
 }
 
 // Store 是内存中的历史表，落盘为 JSON。
@@ -54,8 +58,10 @@ type Store struct {
 	entries  map[string]*Entry
 	maxCount int
 	lastUsed int64 // 单调递增的最近使用时间戳，避免同毫秒写入导致顺序不稳
-	max      int
-	dirty    bool
+	// pinSeq 是「已固定」序号的发号器，只会变大，删除/取消固定都不回收。
+	pinSeq int64
+	max    int
+	dirty  bool
 
 	saveDelay time.Duration // >0 时每次变更加防抖落盘
 	saveTimer *time.Timer
@@ -93,6 +99,26 @@ func Open(path string, max int, saveDelay time.Duration) (*Store, error) {
 		if e.LastUsed > s.lastUsed {
 			s.lastUsed = e.LastUsed
 		}
+		if e.PinOrder > s.pinSeq {
+			s.pinSeq = e.PinOrder
+		}
+	}
+	// 老数据迁移：固定项没有 pinOrder 时按最近使用倒序补一遍。
+	// 不补的话它们会一直"没有位置"，每次算 Pinned 都靠 LastUsed 兜底，
+	// 只要用过一次就会跳到最前面 —— 用户会以为固定排版自己会跑。
+	var legacy []*Entry
+	for _, e := range s.entries {
+		if e.Pinned && e.PinOrder == 0 {
+			legacy = append(legacy, e)
+		}
+	}
+	if len(legacy) > 0 {
+		sort.Slice(legacy, func(i, j int) bool { return legacy[i].LastUsed > legacy[j].LastUsed })
+		for _, e := range legacy {
+			s.pinSeq++
+			e.PinOrder = s.pinSeq
+		}
+		s.dirty = true
 	}
 	return s, nil
 }
@@ -225,7 +251,8 @@ func (s *Store) Frequent(n int) []Entry {
 	return list
 }
 
-// Pinned 返回固定到首页的条目，按最近使用倒序。
+// Pinned 返回固定到首页的条目。位置由 PinOrder 决定（用户拖出来的顺序），
+// 没有序号的（理论上不会出现，Open 已经补过）按最近使用兜底。
 func (s *Store) Pinned(n int) []Entry {
 	s.mu.RLock()
 	list := make([]Entry, 0, len(s.entries))
@@ -235,7 +262,18 @@ func (s *Store) Pinned(n int) []Entry {
 		}
 	}
 	s.mu.RUnlock()
-	sort.Slice(list, func(i, j int) bool { return list[i].LastUsed > list[j].LastUsed })
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].PinOrder != list[j].PinOrder {
+			if list[i].PinOrder == 0 {
+				return false
+			}
+			if list[j].PinOrder == 0 {
+				return true
+			}
+			return list[i].PinOrder < list[j].PinOrder
+		}
+		return list[i].LastUsed > list[j].LastUsed
+	})
 	if n > 0 && len(list) > n {
 		list = list[:n]
 	}
@@ -266,6 +304,12 @@ func (s *Store) TogglePin(path string) (bool, bool) {
 	}
 	e.Pinned = !e.Pinned
 	pinned := e.Pinned
+	if e.Pinned {
+		s.pinSeq++
+		e.PinOrder = s.pinSeq // 新固定的排在最后，用户可以再拖
+	} else {
+		e.PinOrder = 0
+	}
 	s.dirty = true
 	s.mu.Unlock()
 	if err := s.Save(); err != nil {
@@ -313,10 +357,52 @@ func (s *Store) Unpin(path string) bool {
 		return false
 	}
 	e.Pinned = false
+	e.PinOrder = 0
 	s.dirty = true
 	s.mu.Unlock()
 	_ = s.Save()
 	return true
+}
+
+// ReorderPinned 按给定顺序重排「已固定」的位置（首页拖动排序用），立刻落盘。
+// 只认列表里、且当前确实是固定的路径；其余固定项接着往后编号，不会撞格。
+// 返回是否真的改变了什么（顺序没变就不写盘）。
+func (s *Store) ReorderPinned(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	s.mu.Lock()
+	var seq int64
+	changed := false
+	for _, p := range paths {
+		e, ok := s.entries[p]
+		if !ok || !e.Pinned {
+			continue
+		}
+		seq++
+		if e.PinOrder != seq {
+			e.PinOrder = seq
+			changed = true
+		}
+	}
+	for _, e := range s.entries {
+		if e.Pinned && e.PinOrder == 0 {
+			seq++
+			e.PinOrder = seq
+			changed = true
+		}
+	}
+	if s.pinSeq < seq {
+		s.pinSeq = seq
+	}
+	if changed {
+		s.dirty = true
+	}
+	s.mu.Unlock()
+	if changed {
+		_ = s.Save()
+	}
+	return changed
 }
 
 // trim 把条目数压到上限内：固定项优先保留，其余保留次数多的。
