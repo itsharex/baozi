@@ -68,7 +68,14 @@ func IsTessoa(root uintptr) bool {
 
 // TessoaFolder 读 tessoa 当前活动窗格的目录。
 // 失败（没装、进程已退、输出不是目录）一律返回空串，跟随器会当它没提供路径。
-func TessoaFolder(root uintptr) string {
+func TessoaFolder(root uintptr) string { return tessoaFolder(root, false) }
+
+// TessoaFolderFresh 是"现在就重新问一次"，不吃缓存。
+// 文件对话框出现那一刻必须给到焦点窗格的最新目录：tessoa 切窗格 / 切布局都不会
+// 改变前台窗口，400ms 缓存里很可能还是上一个窗格的值。
+func TessoaFolderFresh(root uintptr) string { return tessoaFolder(root, true) }
+
+func tessoaFolder(root uintptr, fresh bool) string {
 	if !IsTessoa(root) {
 		return ""
 	}
@@ -83,7 +90,7 @@ func TessoaFolder(root uintptr) string {
 	}
 
 	tessoaMu.Lock()
-	if tessoaLast.hwnd == root && time.Since(tessoaLast.at) < tessoaCacheTTL {
+	if !fresh && tessoaLast.hwnd == root && time.Since(tessoaLast.at) < tessoaCacheTTL {
 		dir := tessoaLast.dir
 		tessoaMu.Unlock()
 		return dir

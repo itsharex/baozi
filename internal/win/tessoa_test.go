@@ -129,3 +129,84 @@ func TestTessoaFolderCachesQuery(t *testing.T) {
 		t.Fatalf("缓存过期后应再问一次，实际共 %d 次", calls)
 	}
 }
+
+// 对话框出现那一刻要"现在就问"，不能吃 400ms 缓存：
+// tessoa 切窗格 / 切布局都不改变前台窗口，缓存里很可能还是上一个窗格的目录。
+func TestTessoaFolderFreshBypassesCache(t *testing.T) {
+	hw := findTessoaWindow()
+	if hw == 0 {
+		t.Skip("这台机器没有正在运行的 tessoa")
+	}
+	orig := tessoaRunQuery
+	t.Cleanup(func() {
+		tessoaRunQuery = orig
+		tessoaMu.Lock()
+		tessoaLast = tessoaHit{}
+		tessoaMu.Unlock()
+	})
+	calls := 0
+	dir := t.TempDir()
+	tessoaRunQuery = func(string) ([]byte, error) {
+		calls++
+		return []byte(dir + "\r\n"), nil
+	}
+	tessoaMu.Lock()
+	tessoaLast = tessoaHit{}
+	tessoaMu.Unlock()
+
+	if got := TessoaFolder(hw); !strings.EqualFold(got, dir) {
+		t.Fatalf("第一次查询应返回 %q，实际 %q", dir, got)
+	}
+	if calls != 1 {
+		t.Fatalf("第一次查询应起一次进程，实际 %d 次", calls)
+	}
+	if got := TessoaFolderFresh(hw); !strings.EqualFold(got, dir) {
+		t.Fatalf("fresh 查询应返回 %q，实际 %q", dir, got)
+	}
+	if calls != 2 {
+		t.Fatalf("fresh 查询必须绕开缓存、再起一次进程，实际共 %d 次", calls)
+	}
+}
+
+// 4 窗格 / 切布局时前台窗口不变，跟随器只能靠 tessoa 的窗口标题变化来发现"窗格换了"。
+func TestTessoaPollsOnTitleChange(t *testing.T) {
+	hw := findTessoaWindow()
+	if hw == 0 {
+		t.Skip("这台机器没有正在运行的 tessoa")
+	}
+	orig := tessoaRunQuery
+	t.Cleanup(func() {
+		tessoaRunQuery = orig
+		tessoaMu.Lock()
+		tessoaLast = tessoaHit{}
+		tessoaMu.Unlock()
+	})
+	calls := 0
+	dir := t.TempDir()
+	tessoaRunQuery = func(string) ([]byte, error) {
+		calls++
+		return []byte(dir + "\r\n"), nil
+	}
+
+	f := NewDialogFollow(nil, nil, nil)
+	f.lastSource = hw
+	f.lastFg = hw
+	// 标题与当前一致：不该去起进程。
+	real := WindowTextTimeout(hw)
+	f.lastTitle = real
+	f.lastTitleAt = time.Now().Add(-time.Hour)
+	f.pollActiveSource(hw, hw)
+	if calls != 0 {
+		t.Fatalf("标题没变不该起进程，实际 %d 次", calls)
+	}
+	// 标题变了（相当于切了窗格）：这次要读，并把目录记住。
+	f.lastTitle = real + " ·"
+	f.lastTitleAt = time.Now().Add(-time.Hour)
+	f.pollActiveSource(hw, hw)
+	if calls != 1 {
+		t.Fatalf("标题变了应读一次，实际 %d 次", calls)
+	}
+	if got := f.LastDir(); !strings.EqualFold(got, dir) {
+		t.Fatalf("lastDir 应为 %q，实际 %q", dir, got)
+	}
+}

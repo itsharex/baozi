@@ -10,14 +10,16 @@
 //     - Directory Opus（dopus.lister，文件显示容器的地址栏，opus.go）
 //     - XYplorer（ThunderRT6FormDC，脚本协议问 <curpath>，xyplorer.go）
 //     - xplorer2（ATL:ExplorerFrame，读可见的地址栏 ComboBox，xplorer2.go）
+//     - tessoa（Rust+wgpu 自绘，UIA 树只有顶层一个节点，只能调它的
+//     `--print-cwd` 问活动窗格，tessoa.go）
 //     每种都能在设置里单独关掉。
-//  2. 每当一个「打开 / 另存为」框成为前台：
-//     - 第一次见到它，只登记"它已经同步到当前版本"，不导航
-//     （程序刚弹出的对话框往往自己指定了目录，不该立刻覆盖）；
-//     - 之后它再次成为前台、而版本号变过（期间文件管理器换过目录）→ 把 lastDir 送过去。
+//  2. 每当一个「打开 / 另存为」框成为前台，且上一次活动的确实是文件管理器：
+//     - 第一次见到它，把最近记住的目录送过去；
+//     - 之后它再出现、而版本号变过（期间文件管理器换过目录）→ 再送一次；
+//     - 版本没变就一动不动，免得把用户手动在框里选的目录拽回去。
 //
-// 于是用户的实际感受就是：另存为框默认在我的文档 → 去资源管理器切到下载 → 切回另存为框，
-// 路径自己变成下载。Lertaro 注释里另有一条经验也照抄了：
+// 于是用户的实际感受就是：在文件管理器里按"打开 / 另存为"，框直接落在他刚才看的位置。
+// Lertaro 注释里另有一条经验也照抄了：
 // 只有"上一次激活的确实是文件管理器"时才重读它的路径，否则用户手动在对话框里选的目录
 // 会在下一次激活时被打回旧目录。
 package win
@@ -40,6 +42,9 @@ var (
 const (
 	gaRootOwner      = 2
 	explorerPollTick = 200 * time.Millisecond
+	// tessoaTitleInterval 是"读活动窗格标题"的最小间隔。
+	// 读标题要往 tessoa 发 WM_GETTEXT，人眼跟不上更快的变化，500ms 够用。
+	tessoaTitleInterval = 500 * time.Millisecond
 )
 
 // RootOwner 沿 GA_ROOTOWNER 上溯：多标签资源管理器里前台常是 ShellTabWindowClass 这类子窗口，
@@ -74,6 +79,15 @@ func (f *DialogFollow) folderOf(hwnd uintptr) string {
 		return ""
 	}
 	return sourceFolder(kind, hwnd)
+}
+
+// folderOfFresh 同上，但要求现场重读（只有 tessoa 会因此多起一个进程）。
+func (f *DialogFollow) folderOfFresh(hwnd uintptr) string {
+	kind := sourceKind(hwnd)
+	if kind == "" || !f.sourceEnabled(kind) {
+		return ""
+	}
+	return sourceFolderFresh(kind, hwnd)
 }
 
 // sourceEnabled 问某个来源是否启用；拼 follow 时没给 enabled 就一律启用。
@@ -148,6 +162,10 @@ type DialogFollow struct {
 	// lastSource 是最近一次活动的那个文件管理器窗口（资源管理器 / Total Commander）。
 	lastActive uintptr
 	lastSource uintptr
+	// lastTitle 是最后看过的那个来源窗口的标题。tessoa 换窗格时前台窗口不变，
+	// 只能拿标题（它带着活动目录名）当变更信号。
+	lastTitle   string
+	lastTitleAt time.Time
 
 	onNavigate func(FollowEvent)
 	dbg        func(format string, args ...any)
@@ -197,16 +215,23 @@ func (f *DialogFollow) poll() {
 	if raw == 0 {
 		return
 	}
-	// 前台没变就不用再往下走：读地址栏要往别人进程发消息，能不读就不读。
+	root := RootOwner(raw)
+
 	f.mu.Lock()
-	if raw == f.lastFg {
-		f.mu.Unlock()
-		return
+	same := raw == f.lastFg
+	if !same {
+		f.lastFg = raw
 	}
-	f.lastFg = raw
+	src := f.lastSource
 	f.mu.Unlock()
 
-	root := RootOwner(raw)
+	if same {
+		// 前台没变一般不用再往下走：读地址栏要往别人进程发消息，能不读就不读。
+		// 但 tessoa 是个例外，见 pollActiveSource。
+		f.pollActiveSource(root, src)
+		return
+	}
+
 	switch {
 	case f.isPathSource(root):
 		f.mu.Lock()
@@ -216,6 +241,9 @@ func (f *DialogFollow) poll() {
 		// 这里顺手读一次只是为了让"停在文件管理器里不动"也能被记住，
 		// 真正决定导航目标的还是 handleDialog 里那次现场重读。
 		f.rememberDir(f.folderOf(root))
+		if sourceKind(root) == SourceTessoa {
+			f.noteTitle(root)
+		}
 
 	case IsFileDialog(root):
 		f.mu.Lock()
@@ -225,17 +253,60 @@ func (f *DialogFollow) poll() {
 		f.mu.Unlock()
 
 		// 上一次活动的就是那个文件管理器窗口 → 现读它此刻的目录（不是轮询时缓存的那个）。
-		// 上一次活动的是别的程序就不重读 —— 否则用户手动在框里换过的目录会被拽回去。
+		// 上一次活动的是别的程序就不重读也不跟随 —— 否则用户手动在框里换过的目录会被拽回去。
 		if prev != 0 && src != 0 && prev == src && f.isPathSource(src) {
-			f.rememberDir(f.folderOf(src))
+			// 现场重读且不吃缓存：tessoa 切窗格 / 切布局都不会改变前台窗口，
+			// 轮询期间记下的那个目录很可能还是上一个窗格的。
+			f.rememberDir(f.folderOfFresh(src))
+			f.handleDialog(root)
 		}
-		f.handleDialog(root)
 
 	default:
 		f.mu.Lock()
 		f.lastActive = root
 		f.mu.Unlock()
 	}
+}
+
+// pollActiveSource 处理"前台窗口没变，但文件管理器内部已经动了"。
+//
+// tessoa 是 Rust + wgpu 自绘的单窗口应用：切窗格、切布局、在同一个窗格里进目录，
+// GetForegroundWindow 一直都是同一个 hwnd —— 只按"前台变化"判断的话，
+// 它的目录会永远停在第一次看到的值（实测：4 窗格布局下焦点挪到左下角，
+// 跟随器完全不知道。切换布局时更是如此）。
+//
+// 它的标题里带着活动目录名（"1tools — normal — tessoa (管理员)"），
+// 于是拿标题当变更信号：标题一动才起进程问完整路径，常态零开销。
+func (f *DialogFollow) pollActiveSource(root, src uintptr) {
+	if src == 0 || root != src || sourceKind(src) != SourceTessoa || !f.sourceEnabled(SourceTessoa) {
+		return
+	}
+	f.mu.Lock()
+	if time.Since(f.lastTitleAt) < tessoaTitleInterval {
+		f.mu.Unlock()
+		return
+	}
+	f.lastTitleAt = time.Now()
+	last := f.lastTitle
+	f.mu.Unlock()
+
+	title := WindowTextTimeout(src)
+	if title == last {
+		return
+	}
+	f.mu.Lock()
+	f.lastTitle = title
+	f.mu.Unlock()
+	f.rememberDir(f.folderOf(src))
+}
+
+// noteTitle 记下某个窗口的当前标题，供 pollActiveSource 比对。
+func (f *DialogFollow) noteTitle(hwnd uintptr) {
+	title := WindowTextTimeout(hwnd)
+	f.mu.Lock()
+	f.lastTitle = title
+	f.lastTitleAt = time.Now()
+	f.mu.Unlock()
 }
 
 // rememberDir 目录真变了才升版本号。
@@ -257,25 +328,26 @@ func (f *DialogFollow) rememberDir(dir string) {
 }
 
 // handleDialog 是 tracker 的核心规则：
-//   - 第一次见到 → 只登记版本，不导航；
-//   - 再见到、且版本变过 → 把 lastDir 送过去。
+//   - 框第一次出现 → 直接把 lastDir 送过去；
+//     之前是"第一次只登记、等版本再变一次才送"，结果是打开框基本不跟随
+//     （版本在框出现那一刻就已经是最新的，等它再变一次纯属碰运气）；
+//   - 之后它再出现、而版本号变过（期间文件管理器换过目录）→ 再送一次；
+//   - 版本没变就一动不动，免得把用户手动在框里选的目录拽回去。
 func (f *DialogFollow) handleDialog(hwnd uintptr) {
 	f.mu.Lock()
 	seen, ok := f.seen[hwnd]
 	version, dir := f.version, f.lastDir
-	if !ok {
-		f.seen[hwnd] = version
-		f.mu.Unlock()
-		f.logf("跟随: 第一次见到对话框 %#x，只登记（版本 %d）", hwnd, version)
-		return
-	}
-	if seen == version || dir == "" {
-		f.mu.Unlock()
-		return
-	}
 	f.seen[hwnd] = version
 	f.mu.Unlock()
-	f.logf("跟随: 对话框 %#x 版本 %d→%d，送到 %q", hwnd, seen, version, dir)
+
+	if dir == "" || (ok && seen == version) {
+		return
+	}
+	if ok {
+		f.logf("跟随: 对话框 %#x 版本 %d→%d，送到 %q", hwnd, seen, version, dir)
+	} else {
+		f.logf("跟随: 对话框 %#x 第一次出现（版本 %d），送到 %q", hwnd, version, dir)
+	}
 
 	// 跨进程写 + 回车，慢且可能被外壳拖着，扔到后台去，别卡住轮询。
 	go func() {

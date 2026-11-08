@@ -39,6 +39,16 @@ func SourceLabel(kind string) string {
 	return kind
 }
 
+// sourceFolderFresh 和 sourceFolder 一样，但要求"现在重新读一次"、不吃缓存。
+// 只有 tessoa 有区别：它一次查询要起一个进程，平时靠缓存省着，
+// 而对话框出现的那一刻必须给到焦点窗格的最新目录。
+func sourceFolderFresh(kind string, hwnd uintptr) string {
+	if kind == SourceTessoa {
+		return TessoaFolderFresh(hwnd)
+	}
+	return sourceFolder(kind, hwnd)
+}
+
 // sourceKind 判断这个窗口是哪一种目录来源；都不是就返回空串。
 func sourceKind(hwnd uintptr) string {
 	switch {
