@@ -12,11 +12,12 @@ const (
 	SourceOpus     = "opus"
 	SourceXyplorer = "xyplorer"
 	SourceXplorer2 = "xplorer2"
+	SourceTessoa   = "tessoa"
 )
 
 // SourceNames 是全部来源，按设置界面里的展示顺序。
 func SourceNames() []string {
-	return []string{SourceExplorer, SourceTotalCmd, SourceOpus, SourceXyplorer, SourceXplorer2}
+	return []string{SourceExplorer, SourceTotalCmd, SourceOpus, SourceXyplorer, SourceXplorer2, SourceTessoa}
 }
 
 // SourceLabel 是给界面 / 日志用的名字。
@@ -32,6 +33,8 @@ func SourceLabel(kind string) string {
 		return "XYplorer"
 	case SourceXplorer2:
 		return "xplorer2"
+	case SourceTessoa:
+		return "tessoa"
 	}
 	return kind
 }
@@ -49,6 +52,8 @@ func sourceKind(hwnd uintptr) string {
 		return SourceXyplorer
 	case IsXplorer2(hwnd):
 		return SourceXplorer2
+	case IsTessoa(hwnd):
+		return SourceTessoa
 	}
 	return ""
 }
@@ -66,6 +71,8 @@ func sourceFolder(kind string, hwnd uintptr) string {
 		return XyplorerFolder(hwnd)
 	case SourceXplorer2:
 		return Xplorer2Folder(hwnd)
+	case SourceTessoa:
+		return TessoaFolder(hwnd)
 	}
 	return ""
 }

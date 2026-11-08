@@ -27,6 +27,18 @@ const (
 
 // processExeName 返回窗口所属进程的 exe 名（小写、去扩展名）。查不到返回空串。
 func processExeName(hwnd uintptr) string {
+	p := processExePath(hwnd)
+	if p == "" {
+		return ""
+	}
+	name := filepath.Base(p)
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	return strings.ToLower(name)
+}
+
+// processExePath 返回窗口所属进程的 exe 完整路径。查不到返回空串。
+// tessoa 那条采集器要用它——它得靠这个路径再调一次自己的 --print-cwd。
+func processExePath(hwnd uintptr) string {
 	if hwnd == 0 {
 		return ""
 	}
@@ -48,9 +60,7 @@ func processExeName(hwnd uintptr) string {
 	if r == 0 || size == 0 {
 		return ""
 	}
-	name := filepath.Base(windows.UTF16ToString(buf[:size]))
-	name = strings.TrimSuffix(name, filepath.Ext(name))
-	return strings.ToLower(name)
+	return windows.UTF16ToString(buf[:size])
 }
 
 // IsDirectoryOpus 判断是不是 Directory Opus 的 lister 主窗口。

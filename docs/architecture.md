@@ -319,15 +319,20 @@ Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由�
    （`WM_COPYDATA` + UTF-16 脚本，脚本自己 `copydata` 回投答案，见 8.1.4）。
 5. **xplorer2** —— 已实现（`xplorer2.go`）。没有远程接口，只能读地址栏 `ComboBox`
    的 `WM_GETTEXT`，且必须只看可见的那个（见 8.1.5）。
-6. **OneCommander / Files** —— **不做**。两者都只能走 UI Automation（类名由 WPF /
+6. **tessoa** —— 已实现（`tessoa.go`）。它是 Rust + wgpu **自绘**的跨平台文件管理器
+   （tessoa.cn，本机实测 v0.30.2），窗口里没有任何标准控件：类名是自建的 `Window Class`，
+   UIA 树用 ControlViewWalker 和 RawViewWalker 走下来**都只有顶层一个节点**，
+   地址栏那套读法完全用不上。改走它自己提供的命令行 RPC：`tessoa.exe --print-cwd`
+   会把查询转给主实例、打印当前活动窗格的目录后立即退出（见 8.1.6）。
+7. **OneCommander / Files** —— **不做**。两者都只能走 UI Automation（类名由 WPF /
    WinAppSDK 运行时生成，含 guid 或全机共用，进程名 + UIA 是唯一可靠路径）。
    Go 里手搓 IUIAutomation 的代价与本机收益不成比例，且这两种用户都没装。
-7. **Double Commander** —— 未做。Lertaro 没有它的 collector，没有可靠读法可抄。
+8. **Double Commander** —— 未做。Lertaro 没有它的 collector，没有可靠读法可抄。
 
 统一出口是 `internal/win/sources.go` 的 `sourceKind(hwnd)` + `sourceFolder(kind, hwnd)`，
 跟随器侧再包一层 `(*DialogFollow).isPathSource` / `folderOf`（见第 8 节），
 新增一种来源只要在 `SourceNames` / `sourceKind` / `sourceFolder` 三处加一行。
-五种来源都能在设置里单独关掉（`config.pathSources`，见第 11 节）。
+六种来源都能在设置里单独关掉（`config.pathSources`，见第 11 节）。
 
 ## 8. 打开/保存对话框跟随文件管理器（已实现，对应 Lertaro `IFileDialogAdapter` + `IActivePathCollector`）
 
@@ -337,7 +342,7 @@ Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由�
 > 切回那个「另存为」框，**它的路径自己变成「下载」**。
 
 三块拼起来：每隔 200ms 看一眼前台窗口（`internal/win/follow.go`）、
-前台是可提供目录的程序（五种来源，见第 7 节）就读出它的当前目录、
+前台是可提供目录的程序（六种来源，见第 7 节）就读出它的当前目录、
 前台是文件对话框就按版本号决定要不要跳过去。
 
 ### 8.1 记住文件管理器的目录
@@ -491,6 +496,63 @@ XYplorer 没有 TC 那样的查询命令，它暴露的是"跑一段 XYplorer �
 > 装了这几样的人如果读出来不对，`tools/folderprobe` 会打印容器 / `ComboBox` /
 > 地址栏原文，照着改就行。
 
+#### 8.1.6 tessoa（`TessoaFolder`）
+
+**已在本机真机验证**（v0.30.2，管理员权限运行）。tessoa 是 GPU 自绘的，
+所以第一步先确认常规手段用不了：
+
+- 窗口类名是自建的 `Window Class`（不是 `CabinetWClass` 那类系统类），
+  按其类名认人不可靠，只能按进程名认；
+- 窗口里没有 `Breadcrumb Parent` / `ToolbarWindow32`；
+- 它**确实**加载了 `uiautomationcore.dll`，但 `AutomationElement.FromHandle`
+  之后用 `ControlViewWalker`、`RawViewWalker` 两种视图走，都只有顶层 Window 一个节点
+  （自绘 UI 没建无障碍树）。所以 UIA 这条路也是死的。
+
+它自己给了命令行 RPC。二进制里能看到这条命令族的名字：
+`open / open-window / reveal-window / dev-extension / open-url / query-cwd`，
+命令行参数是 `--print-cwd`（还有 `--print-cwd=` 的带参形式）。实测：
+
+```
+D:\1tools\tessoa.exe --print-cwd        →  打印当前活动窗格的目录后 exit 0
+D:\1tools\tessoa.exe --open D:\work\baozi → 日志里 "已转发给主实例（pid=7016）→ 本进程退出"
+```
+
+也就是说 `--print-cwd` 问的是**已经在跑的那个实例**，不是"新进程自己算出来的目录"：
+实测 `--open` 换目录之后立刻再 `--print-cwd`，返回值跟着变了（`D:\` → `D:\work\baozi`）。
+
+代价与缓存：
+
+| 场景 | 单次 | 说明 |
+|---|---|---|
+| 热态 | **16 ms** | 0.1MB 进程启动 + 管道往返，实测 6 次 16/16/16/16/16/16 |
+| 冷态 | **43 ms** | 文件不在系统缓存里时 |
+
+跟随器只在两处会调它：前台切到 tessoa 那一下（`poll` 里前台变了才往下走），
+以及文件对话框弹出时对"上一次活动的那个来源"现场重读一次。所以平均开销可以忽略。
+`tessoaCacheTTL = 400ms` 让这两次挨得很近的调用共用一个结果，省掉一次进程启动。
+
+三个必须处理的坑：
+
+1. **自更新会让进程镜像改名**。tessoa 更新时先把正在运行的 exe 改名成 `tessoa.old.exe`，
+   再写入新的 `tessoa.exe` —— 进程还活着，但它现在的镜像名是 **`tessoa.old`**。
+   实测本机 pid 7016 就是 `D:\1tools\tessoa.old.exe`。所以：
+   - `IsTessoa` 的判据是 `tessoa` 本身或 `tessoa.*`（排除插件进程 `tessoa-av` / `tessoa-office`）；
+   - 发查询时**优先用窗口所在目录里的新 `tessoa.exe`**（它启动时认得同一个主实例锁，
+     会转发过去而不是再开一个窗口），新 exe 不在才退回进程自己的镜像。
+2. **没有实例可转发时会自己开窗口**。也就是说如果 tessoa 已经被关掉而我们还在问，
+   等于替用户把软件打开了。所以查询前先 `IsWindow(root)` 确认窗口还在；
+   拿不到窗口句柄直接返回空。
+3. **欢迎页没有真实目录**。tessoa 停在 `@Welcome` 标签时 `--print-cwd` 给的是盘根
+   （本机是 `D:\`）。它仍然是个合法目录，跟随器照用；这种情况下不要指望它跟着切。
+
+多开实例的边界：`--print-cwd` 总会找"主实例"，所以用户同时开了两个 tessoa 时，
+读到的是主实例的目录，可能与当前前台那个窗口不一致。这是它 CLI 的语义决定的，
+我们不做额外猜测（猜错会把对话框拽到用户没在看的目录）。
+
+读回来的输出还要过一遍 `tessoaParse`：挡空行、多行、带引号、带 `\\?\` 前缀；
+**并且必须是真实存在的目录**才认。盘根 `D:\` 先按原样试，试不过才去掉尾部分隔符 ——
+否则 `D:\` 会被削成 `D:`，那是"当前盘当前目录"，不是盘根。
+
 ### 8.2 什么时候跳（照抄 `FileDialogNavigationTracker.cs`）
 
 状态只有两样：`lastDir`（最近一次文件管理器待过的目录）和 `version`（目录变一次 +1），
@@ -498,7 +560,7 @@ XYplorer 没有 TC 那样的查询命令，它暴露的是"跑一段 XYplorer �
 
 | 情形 | 动作 |
 |---|---|
-| 前台是文件管理器（五种来源之一） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
+| 前台是文件管理器（六种来源之一） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
 | **对话框重新成为前台，且上一次活动的是那个文件管理器窗口** | **现场重读**它的目录（不等轮询缓存），再按下面的版本规则决定跳不跳 |
 | 前台是文件管理器，目录与 `lastDir` 不同 | `lastDir = dir`，`version++` |
 | 对话框**第一次**成为前台 | 只记 `seen[hwnd] = version`，**不导航** |
@@ -516,7 +578,7 @@ XYplorer 没有 TC 那样的查询命令，它暴露的是"跑一段 XYplorer �
 读到的永远是最新的；而且只记住 hwnd、不缓存内容。反过来，上一次活动的若不是
 文件管理器（比如中间切过浏览器），就不重读，避免把人拽回旧目录。
 
-`lastExplorer` 已改名 `lastSource`：现在"目录来源"有五种，判断"上一次活动的是不是
+`lastExplorer` 已改名 `lastSource`：现在"目录来源"有六种，判断"上一次活动的是不是
 同一个来源窗口"和"能不能现读"都走 `(*DialogFollow).isPathSource()` /
 `folderOf()` 两个分派点（它们是方法不是包级函数了，因为要先按设置过滤来源）。
 
@@ -766,6 +828,13 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
   一个都没装）。窗口类名、协议、字段全按 Lertaro 的 collector 写；能验证的只有
   "没装时不会被误判、读不到时返回空不崩"。
 - OneCommander 与 Files 不做：两者都要 UI Automation 才拿得到路径（见 §7 第 6 条）。
+- tessoa 的目录来源是"问主实例"（`--print-cwd`），所以同时开两个 tessoa 时读到的是
+  主实例的目录，可能不是当前前台那个窗口；每次查询还要起一个它的进程（热态 16ms），
+  只在切到它和对话框弹出时各问一次，不在后台轮询。
+- tessoa 停在欢迎页（`@Welcome`）时 `--print-cwd` 给的是盘根，这时跟随会跳到那个盘根。
+- tessoa 若以**更高权限**运行（管理员）而 Baozi 是普通权限，`--print-cwd` 的转发可能被
+  跨权限挡住：读不到就返回空、跟随器按"没读到"处理，不会乱跳也不会崩。两者权限一致时
+  （都用普通权限，或都用管理员）没有这个问题。
 - Directory Opus 的两个高级判法没做：本地化路径逐段还原（`LocalizedPathResolver`）、
   双栏按几何距离猜哪一栏是活动的。双栏判不出时宁可不动。
 - 索引是快照：文件增删要等服务重建（≤2 分钟）或 `rescanMinutes` 到期才反映。
@@ -793,7 +862,7 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 | 分区 | 控件 | 写回字段 |
 |---|---|---|
 | 唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
-| 文件对话框跟随 | 开关（总）、两行 `Checkbox`（五种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2） | `dialogFollow` / `pathSources.*` |
+| 文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
 | 排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.thumbnails` |
 | 索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
 | 自定义命令 | `TextArea`，每行 `关键字 \| 显示名 \| 程序 \| 参数` | `commands` |

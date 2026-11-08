@@ -48,6 +48,7 @@ type settingsWindow struct {
 	srcOpus     bool
 	srcXyplorer bool
 	srcXplorer2 bool
+	srcTessoa   bool
 
 	commands string
 
@@ -112,6 +113,7 @@ func (s *settingsWindow) load() {
 	s.srcOpus = cfg.PathSourceEnabled(win.SourceOpus)
 	s.srcXyplorer = cfg.PathSourceEnabled(win.SourceXyplorer)
 	s.srcXplorer2 = cfg.PathSourceEnabled(win.SourceXplorer2)
+	s.srcTessoa = cfg.PathSourceEnabled(win.SourceTessoa)
 
 	lines := make([]string, 0, len(cfg.Commands))
 	for _, c := range cfg.Commands {
@@ -202,8 +204,11 @@ func (s *settingsWindow) followSection(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, "").Width(70)
 			ui.Checkbox(c, &s.srcXyplorer, "XYplorer")
 			ui.Checkbox(c, &s.srcXplorer2, "xplorer2")
+			ui.Checkbox(c, &s.srcTessoa, "tessoa")
 		})
 		ui.Text(c, "只勾真正装了的即可，没装的多一次「窗口类名」判断而已。"+
+			"tessoa 是自绘窗口、读不到地址栏，走它自带的 `tessoa.exe --print-cwd`"+
+			"（每次查询要起一个它自己的进程，实测热态 16ms）。"+
 			"OneCommander 与 Files 要靠 UI Automation 取路径，暂不支持。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
@@ -343,6 +348,7 @@ func (s *settingsWindow) save() {
 		Opus:     boolPtr(s.srcOpus),
 		Xyplorer: boolPtr(s.srcXyplorer),
 		Xplorer2: boolPtr(s.srcXplorer2),
+		Tessoa:   boolPtr(s.srcTessoa),
 	}
 
 	if err := config.Save(&cfg, s.app.cfgPath); err != nil {

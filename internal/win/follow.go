@@ -4,7 +4,7 @@
 // `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs`：
 //
 //  1. 记住"最近一次文件管理器所在的目录"（lastDir），目录一变就把版本号 +1；
-//     目录来源目前接了五种（见 sources.go 的 Source*）：
+//     目录来源目前接了六种（见 sources.go 的 Source*）：
 //     - 资源管理器（CabinetWClass，读地址栏面包屑 + 已知文件夹名字还原）
 //     - Total Commander（TTOTAL_CMD，WM_COPYDATA 远程控制协议，totalcmd.go）
 //     - Directory Opus（dopus.lister，文件显示容器的地址栏，opus.go）
@@ -61,7 +61,7 @@ func IsExplorer(root uintptr) bool {
 }
 
 // isPathSource 判断这个窗口能不能提供"当前目录"。
-// 五种来源见 sources.go；每种都可以在设置里单独关掉（关掉后连读都不读）。
+// 六种来源见 sources.go；每种都可以在设置里单独关掉（关掉后连读都不读）。
 func (f *DialogFollow) isPathSource(hwnd uintptr) bool {
 	kind := sourceKind(hwnd)
 	return kind != "" && f.sourceEnabled(kind)

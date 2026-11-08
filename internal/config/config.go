@@ -36,6 +36,8 @@ type PathSources struct {
 	Opus     *bool `json:"opus,omitempty"`
 	Xyplorer *bool `json:"xyplorer,omitempty"`
 	Xplorer2 *bool `json:"xplorer2,omitempty"`
+	// Tessoa 走它自己的 `--print-cwd`（自绘窗口读不到地址栏），详见 internal/win/tessoa.go。
+	Tessoa *bool `json:"tessoa,omitempty"`
 }
 
 // DialogFollowOn 表示"文件对话框跟随"是否开启：配置里没写就是开（和产品默认一致）。
@@ -66,6 +68,8 @@ func (c *Config) PathSourceEnabled(kind string) bool {
 		v = p.Xyplorer
 	case "xplorer2":
 		v = p.Xplorer2
+	case "tessoa":
+		v = p.Tessoa
 	default:
 		return true
 	}

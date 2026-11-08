@@ -19,7 +19,7 @@ Windows 上的快速启动器：**双击 Ctrl 唤出**，搜文件、搜应用�
 | — | 图形化设置，不用手改 JSON | 已实现 |
 | — | Listary 式自定义命令（`term`、`code` …） | 已实现 |
 | — | Pane 式界面：首页图标网格（已固定 / 最近使用）、底栏键帽提示、`Ctrl+K` 固定、`Ctrl+Enter` 开文件夹、`Ctrl+Shift+C` 复制目录 |
-| 5 | 读取文件管理器当前目录 | 已实现五种来源：资源管理器（地址栏面包屑 + 已知文件夹本地化名还原）、Total Commander（`WM_COPYDATA` 远程协议）、Directory Opus、XYplorer、xplorer2；每种都能在设置里单独关掉 |
+| 5 | 读取文件管理器当前目录 | 已实现六种来源：资源管理器（地址栏面包屑 + 已知文件夹本地化名还原）、Total Commander（`WM_COPYDATA` 远程协议）、Directory Opus、XYplorer、xplorer2，以及自绘的 tessoa（走它自带的 `--print-cwd`）；每种都能在设置里单独关掉 |
 | 6 | 打开 / 保存框跟随：文件管理器换目录后，切回那个框，路径自动变过去 | 已实现（照 Lertaro 的 `FileDialogNavigationTracker`），见 `docs/architecture.md` §8 |
 | — | 开机自动启动（登录后静默待在托盘，不弹面板） | 已实现，设置里可开关 |
 | — | 快速索引服务（直接读 NTFS USN Journal，174 万条 17 秒） | 已实现，设置里一键装/卸 |
@@ -154,7 +154,7 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 | Baozi 设置 | 面板底栏「设置」/ 托盘「设置…」 | 所有配置项，改完即时生效 |
 | Baozi 文件互传 | 面板底栏「文件互传」/ 托盘「文件互传…」 | 生成一条带有效期的局域网链接（默认 1 小时），手机浏览器**直接下载**共享内容 |
 
-设置界面的分区：**唤出**（双击 Ctrl 开关、间隔、备用组合键、全屏抑制、开机自动启动）、**文件对话框跟随**（总开关 + 五种目录来源逐项开关）、**排序**（三条权重滑杆、类型优先级、最多结果数、图片/视频缩略图开关）、**索引**（根目录、排除目录、包含隐藏文件、重建间隔、立即重建）、**自定义命令**（每行 `关键字 | 显示名 | 程序 | 参数`，2/3/4 段都能解析）。
+设置界面的分区：**唤出**（双击 Ctrl 开关、间隔、备用组合键、全屏抑制、开机自动启动）、**文件对话框跟随**（总开关 + 六种目录来源逐项开关）、**排序**（三条权重滑杆、类型优先级、最多结果数、图片/视频缩略图开关）、**索引**（根目录、排除目录、包含隐藏文件、重建间隔、立即重建）、**自定义命令**（每行 `关键字 | 显示名 | 程序 | 参数`，2/3/4 段都能解析）。
 点「保存并应用」后会：写盘 → 组合键重新注册 → 重启钩子进程（它读的是同一份 config.json）→ 根目录变了就重建索引。不必退出软件。
 
 ## 文件互传怎么用
@@ -272,7 +272,7 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 2. 打开资源管理器，把目录切到「下载」；
 3. 切回那个「另存为」框 —— **它的路径自己变成了「下载」**。
 
-目录来源支持五种，都能在设置里单独关掉（`settings` → 「文件对话框跟随」）：
+目录来源支持六种，都能在设置里单独关掉（`settings` → 「文件对话框跟随」）：
 
 | 来源 | 怎么读 |
 |---|---|
@@ -281,6 +281,7 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 | Directory Opus | `dopus.lister` → `dopus.filedisplaycontainer` → `dopus.ctl.treepath` 的 window text |
 | XYplorer | `WM_COPYDATA`（`0x00400001`）发 UTF-16 脚本，脚本自己 `copydata` 回投 `<curpath>` |
 | xplorer2 | `ATL:ExplorerFrame` 里**可见**那个 `ComboBox` 的 `WM_GETTEXT` |
+| tessoa | 自绘窗口读不到地址栏（UIA 只有顶层一个节点），走它自带的 `tessoa.exe --print-cwd` |
 
 规则照 [Lertaro](https://github.com/lertaro/lertaro) 的
 `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs` 原样搬（每种来源的读法
@@ -319,6 +320,16 @@ XYplorer 是同一个形状（脚本自己回投），所以收发那一套在 `
 不会把普通窗口误判成来源；读不到时返回空，不导航也不崩。装了的人读得不对，
 `tools/folderprobe` 会把容器 / `ComboBox` / 地址栏原文打出来。
 OneCommander 与 Files 没做：两者都要 UI Automation 才拿得到路径。
+
+**tessoa 是真机验证过的**（v0.30.2）：它是 Rust + wgpu 自绘的，窗口里没有标准控件，
+`ControlViewWalker` / `RawViewWalker` 走 UIA 树都只有顶层一个节点，所以改用它自己的
+`tessoa.exe --print-cwd`——这个进程把查询转给正在跑的主实例、打印当前活动窗格的目录后
+立刻退出（实测热态 16ms、冷态 43ms），跟随器只在切到它和对话框弹出时各问一次。
+两个坑已经处理：它自更新后**正在运行的进程镜像会改名成 `tessoa.old.exe`**（所以判定按
+`tessoa.*`，发查询优先用同目录的新 `tessoa.exe`）；没有实例可转发时它**会自己开一个窗口**，
+所以先确认窗口还在才问。
+还有一个已知边界：tessoa 以管理员运行、Baozi 是普通权限时，`--print-cwd` 的跨权限转发
+可能被挡住——读不到就读不到，跟随器当"没读到"处理，不会乱跳。
 
 动别人的窗口这件事只有一条铁律：**不 `AttachThreadInput`**，不抢前台——它会把两个线程的
 输入队列绑死，Go 的线程还会被 runtime 换走，结果就是对方的窗口永久无响应

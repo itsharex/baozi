@@ -67,10 +67,10 @@ func TestSettingsViewRenders(t *testing.T) {
 			t.Fatalf("设置界面缺少 %q", want)
 		}
 	}
-	// 文件对话框跟随那一块：总开关 + 五种目录来源，一个都不能少。
+	// 文件对话框跟随那一块：总开关 + 六种目录来源，一个都不能少。
 	for _, want := range []string{
 		"文件对话框跟随", "启用跟随",
-		"资源管理器", "Total Commander", "Directory Opus", "XYplorer", "xplorer2",
+		"资源管理器", "Total Commander", "Directory Opus", "XYplorer", "xplorer2", "tessoa",
 	} {
 		if !tester.HasText(want) {
 			t.Fatalf("设置界面缺少来源开关 %q", want)
