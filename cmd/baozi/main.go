@@ -115,6 +115,13 @@ type application struct {
 
 	status string // 索引/钩子状态，显示在底栏
 
+	// regexOn 是搜索框右边那个 ".*" 按钮的状态：开着时查询按正则解释。
+	// 正则模式下只做精确匹配 —— 不走拼音、不走模糊子序列、不做准确度分档。
+	// 不落盘：这是这次打开面板期间的一个模式，重启回到普通搜索。
+	regexOn bool
+	// regexErr 是上一次正则的语法错误，显示在结果区上方（空表示没问题）。
+	regexErr string
+
 	// quitting 为 true 表示正在真正退出：窗口的 OnClose 不再拦关闭。
 	// mygo 的 Quit 是逐个关窗口，任何窗口 PreventDefault 都会让整个 Quit 作废。
 	quitting atomic.Bool
@@ -254,12 +261,18 @@ func (a *application) view(c *ui.Context) {
 	}
 
 	ui.Column(c).Fill().Children(func() {
-		// 顶栏：放大镜 + 大字输入 + 右端品牌胶囊（Pane 右上角那个 "Pane" 标）。
+		// 顶栏：放大镜 + 大字输入 + 正则开关 + 右端品牌胶囊（Pane 右上角那个 "Pane" 标）。
 		ui.Row(c).Padding(16, 20).Gap(14).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, searchIcon).FontSize(20).TextColor(t.TextMuted)
-			if ui.TextInputBase(c, &a.query).Bind(&a.input).Grow(1).FontSize(20).
-				Placeholder("搜索应用、文件，或输入命令").Label("搜索").
-				OnSubmit(a.open).Changed() {
+			ph := "搜索应用、文件，或输入命令"
+			if a.regexOn {
+				ph = "正则匹配文件名，如 ^2026.*\\.log$"
+			}
+			changed := ui.TextInputBase(c, &a.query).Bind(&a.input).Grow(1).FontSize(20).
+				Placeholder(ph).Label("搜索").
+				OnSubmit(a.open).Changed()
+			a.regexButton(c)
+			if changed {
 				a.refilter()
 			}
 			ui.Text(c, "Baozi").FontSize(11).TextColor(t.TextMuted).
@@ -274,6 +287,36 @@ func (a *application) view(c *ui.Context) {
 		ui.Divider(c)
 		a.footer(c)
 	})
+}
+
+// regexButton 是搜索框右边那个 ".*" 切换按钮：点一下进正则模式，再点回普通搜索。
+// 开着时整块用 Accent 底标出来 —— 正则模式和普通搜索结果差得很远，
+// 状态必须一眼可辨，否则用户会以为"搜索坏了"。
+func (a *application) regexButton(c *ui.Context) {
+	t := c.Theme()
+	b := ui.Button(c, ".*").FontSize(12).Padding(3, 9).Radius(7).
+		Tooltip("正则模式：只按正则精确匹配文件名，不走拼音与模糊")
+	if a.regexOn {
+		b.TextColor(t.Text).Background(t.Accent.Alpha(0.28)).
+			BorderWidth(1).BorderColor(t.Accent.Alpha(0.6))
+	} else {
+		b.TextColor(t.TextMuted).Background(t.Surface)
+	}
+	if !b.Clicked() {
+		return
+	}
+	a.regexOn = !a.regexOn
+	a.regexErr = ""
+	if a.regexOn {
+		a.setStatus("正则模式：只精确匹配文件名")
+	} else {
+		a.setStatus("已回到普通搜索")
+	}
+	// 鼠标点过按钮之后焦点可能从输入框跑掉，用户接着就要敲正则——把焦点还回去。
+	if a.panel != nil {
+		a.panel.Update(func() { a.input.Focus() })
+	}
+	a.refilter()
 }
 
 // homeGrid 是空查询时的首页：「最近使用」在上、「已固定」在下两段网格卡片。
@@ -441,7 +484,15 @@ func (a *application) resultList(c *ui.Context) {
 	a.list.Label = func(i int) string { return a.results[i].Name }
 	list := ui.List(c, &a.list, len(a.results), func(i int) { a.row(c, i) }).Grow(1).Padding(8).Children(func() {
 		if len(a.results) == 0 {
-			ui.Text(c, "没有匹配项").TextColor(t.TextMuted).Padding(18)
+			switch {
+			case a.regexOn && a.regexErr != "":
+				// 正则写错了要指出来，否则"搜不到"像是功能没生效
+				ui.Text(c, "正则无效："+a.regexErr).TextColor(t.TextMuted).Padding(18)
+			case a.regexOn:
+				ui.Text(c, "没有文件名命中这个正则").TextColor(t.TextMuted).Padding(18)
+			default:
+				ui.Text(c, "没有匹配项").TextColor(t.TextMuted).Padding(18)
+			}
 		}
 	})
 	if list.Submitted() {
@@ -730,6 +781,11 @@ func kindOf(k history.Kind) search.Kind {
 
 // searchAll 把命令、已安装应用、索引条目放在一起打分排序。
 func (a *application) searchAll(q string) []search.Result {
+	// 正则模式是另一条路：不拼音、不模糊、不打分档。这里一分流，下面所有
+	// "token / 子序列 / 拼音" 的逻辑对它就完全不参与。
+	if a.regexOn {
+		return a.searchRegex(q)
+	}
 	lowQ := strings.ToLower(q)
 	tokens := strings.Fields(lowQ)
 	weights := search.Weights(a.cfg.Search.Weights)
@@ -837,6 +893,132 @@ func (a *application) searchAll(q string) []search.Result {
 		}
 	}
 	return a.finish(results)
+}
+
+// maxRegexHits 是正则模式收集结果的上限。模糊搜索那边是 5000（子串预筛本身就很窄），
+// 正则命中面更宽（`\.log$` 就是八千多条），收得太少会在排序之前就把该在前面的丢掉。
+const maxRegexHits = 20000
+
+// searchRegex 是正则模式的搜索：把整串查询当 Go 正则，只做**精确匹配**。
+// 不叠拼音、不叠模糊子序列、不做准确度分档 —— 用户写了模式，命中与否他说了算，
+// 准确度一律 1.0，排序只剩频次与类型这两项。
+//
+// 只匹配**文件名**。普通模式靠"查询里有没有 \ 或 /"来决定要不要匹配路径，
+// 正则里的反斜杠到处都是（`\.log$`），那个判断在这里不成立；想按路径找就自己写
+// 目录部分的模式。代价是路径匹配（PathOf 顺父链还原，很贵）在这条路上完全不发生。
+func (a *application) searchRegex(q string) []search.Result {
+	rx, err := search.CompileRegex(q)
+	if err != nil {
+		// 语法错误必须显式说：否则用户看到空结果会以为"正则没生效"。
+		a.setRegexErr(q, err.Error())
+		return nil
+	}
+	a.setRegexErr(q, "")
+
+	weights := search.Weights(a.cfg.Search.Weights)
+	acc := search.RegexAccuracy
+	results := make([]search.Result, 0, 256)
+
+	// 1) 自定义命令：按名字匹配。普通模式那套"关键字前缀"在正则里没有意义。
+	for _, cmd := range a.cfg.Commands {
+		name := []byte(cmd.Name)
+		if !rx.Maybe(name) || !rx.Match(name) {
+			continue
+		}
+		results = append(results, search.Result{
+			Item: search.Item{
+				Name:    cmd.Name,
+				Path:    cmd.Exec,
+				Hint:    "命令：" + cmd.Exec,
+				Kind:    search.KindCommand,
+				Command: cmd.Exec,
+				Args:    append([]string{}, cmd.Args...),
+			},
+			TypeScore: 1,
+			Accuracy:  acc,
+			Score:     search.Combine(weights, 0.5, 1, acc),
+		})
+	}
+
+	// 2) 已安装应用：只认名字。拼音首字母 / 全拼在这条路上一次都不查。
+	if apps := a.apps.Load(); apps != nil {
+		for i, app := range *apps {
+			name := []byte(app.Name)
+			if !rx.Maybe(name) || !rx.Match(name) {
+				continue
+			}
+			freq := a.hist.Score(app.Path)
+			ts := search.TypeScore(".exe", search.KindApp, a.cfg.Search.TypeOrder)
+			results = append(results, search.Result{
+				Item: search.Item{
+					Name:     app.Name,
+					Path:     app.Path,
+					Ext:      ".exe",
+					Kind:     search.KindApp,
+					Hint:     "应用",
+					AppIndex: i,
+				},
+				Frequency: freq,
+				TypeScore: ts,
+				Accuracy:  acc,
+				Score:     search.Combine(weights, freq, ts, acc),
+			})
+		}
+	}
+
+	// 3) 索引条目
+	tab := a.cat.Load()
+	if tab == nil || tab.Len() == 0 {
+		return a.finish(results)
+	}
+	matched := 0
+	for i := 0; i < tab.Len(); i++ {
+		// 全量扫一条不筛的正则要几百毫秒，用户早换关键字了就别把这遍跑完：
+		// refilter 每敲一个键都会起一个 goroutine，旧的不退出就会互相抢 CPU。
+		if i&2047 == 0 && strings.TrimSpace(a.query) != q {
+			return nil
+		}
+		name := tab.NameBytes(i)
+		if !rx.Maybe(name) || !rx.Match(name) {
+			continue
+		}
+		path := tab.PathOf(int32(i))
+		ext := tab.Ext(i)
+		freq := a.hist.Score(path)
+		ts := search.TypeScore(ext, toSearchKind(tab.Nodes[i].Kind), a.cfg.Search.TypeOrder)
+		results = append(results, search.Result{
+			Item: search.Item{
+				Name: tab.Name(i),
+				Path: path,
+				Ext:  ext,
+				Kind: toSearchKind(tab.Nodes[i].Kind),
+				Hint: tab.Dir(int32(i)),
+			},
+			Frequency: freq,
+			TypeScore: ts,
+			Accuracy:  acc,
+			Score:     search.Combine(weights, freq, ts, acc),
+		})
+		matched++
+		if matched >= maxRegexHits {
+			break
+		}
+	}
+	return a.finish(results)
+}
+
+// setRegexErr 记住（或清空）上一次正则的语法错误。
+// 和 refilter 一样校验查询没变：搜索在后台 goroutine 里跑，回来时用户可能已经改了输入。
+func (a *application) setRegexErr(q, msg string) {
+	if a.panel == nil {
+		a.regexErr = msg
+		return
+	}
+	a.panel.Update(func() {
+		if strings.TrimSpace(a.query) == q {
+			a.regexErr = msg
+		}
+	})
 }
 
 func (a *application) truncate(results []search.Result) []search.Result {
