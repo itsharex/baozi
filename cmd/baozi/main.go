@@ -69,6 +69,9 @@ type appEntry struct {
 	mygo.InstalledApp
 	initials string // "豆包工作" → "dbgz"，空串表示名字是纯 ASCII
 	full     string // "豆包工作" → "doubaogongzuo"
+	// alias 是从 ID 抽出来的产品名（Microsoft.WindowsCalculator → "Microsoft WindowsCalculator"）。
+	// 它代替 Path 参与匹配，理由见 search.AppAlias。
+	alias string
 }
 
 type application struct {
@@ -1038,10 +1041,16 @@ func (a *application) searchAll(q string) []search.Result {
 		}
 	}
 
-	// 2) 已安装应用：名字、拼音首字母、拼音全拼三路都试
+	// 2) 已安装应用：名字（含拼音）一路，产品名一路，取分高的那个。
+	// 不把 Path 交给匹配器——理由见 search.AppAlias。
 	if apps := a.apps.Load(); apps != nil {
 		for i, app := range *apps {
-			acc, ok := search.AccuracyPy(q, app.Name, app.Path, app.initials, app.full)
+			acc, ok := search.AccuracyPy(q, app.Name, "", app.initials, app.full)
+			if app.alias != "" {
+				if alt, ok2 := search.AccuracyPy(q, app.alias, "", "", ""); ok2 && alt > acc {
+					acc, ok = alt, true
+				}
+			}
 			if !ok {
 				continue
 			}
@@ -1606,6 +1615,7 @@ func (a *application) ready() {
 				InstalledApp: app,
 				initials:     pinyin.Initials(app.Name),
 				full:         pinyin.Full(app.Name),
+				alias:        search.AppAlias(app.ID),
 			})
 		}
 		a.apps.Store(&entries)

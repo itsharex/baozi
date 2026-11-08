@@ -156,10 +156,19 @@ Score = (0.5*Freq + 0.3*Type + 0.2*Acc) / (0.5+0.3+0.2)
 | 拼音全拼以查询开头 | 0.88 |
 | 文件名包含查询 | 0.78 |
 | 拼音全拼包含查询 | 0.70 |
-| 目录路径包含查询 | 0.62 |
+| 目录路径包含查询 | 0.62（只在查询里带 `\` 或 `/` 时生效；应用不传路径，见下） |
 | 字符按顺序散落（`vsc` → Visual Studio Code） | 0.35–0.52（按连续度） |
 | 拼音首字母散落命中 | 0.45 |
 | 多关键词 | 取各 token 最小值（AND 语义）；拼音只在单关键词时启用 |
+
+**应用的 Path 不参与匹配**：开始菜单应用的 Path 是 `shell:AppsFolder\<AUMID>` 或磁盘路径，
+而 0.62 这一档是"整条路径包含查询"，会把路径中间任意子串都算命中 —— 实测搜 `cal` 时，
+`C:\Users\…\AppData\Local\nvm\nvm.exe` 里的 `Local` 含 `cal`（Lo-cal），于是 nvm、Python 3.11/3.12/3.14
+全冒出来（还带着应用类型权重排在最前），真正的计算器反被挤到第四。
+现在应用只走两路：显示名（含拼音）+ `search.AppAlias(ID)` 抽出来的产品名
+（`Microsoft.WindowsCalculator_8wekyb3d8bbwe!App` → `Microsoft WindowsCalculator`，
+`…\nvm\nvm.exe` → `nvm`），取分高的那个；`{GUID}` 这种自动生成的 AUMID 直接返回空，不参与匹配。
+改完搜 `cal`：只有「计算器」，nvm 与 Python 全部消失。
 
 同分比较顺序：总分 → Acc → Freq → 名字更短 → 字典序（`search.Less`）。
 
