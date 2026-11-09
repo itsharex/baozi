@@ -246,9 +246,9 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
       "keepOpen": false            // true = 执行后不收起面板（开终端这类窗口用）
     },
     {
-      "keyword": "休眠",
-      "aliases": ["sleep", "睡眠"],
-      "name": "休眠 / 睡眠（可跟分钟后）",
+      "keyword": "睡眠",
+      "aliases": ["sleep"],
+      "name": "睡眠（可跟分钟后）",
       "exec": "D:\\1tools\\scripts\\shutdown-after.ps1",
       "args": ["-Sleep", "%1"]
     }
@@ -271,8 +271,9 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 规则就一条：**`args` 里有任意占位符就只按模板替换，不再追加用户词；一个都没有才把后面敲的词追加到末尾**。所以
 `关机 30` → `powershell.exe … -File …\shutdown-after.ps1 30`；而 `term` 这种没写占位符的命令，`term D:\work` 照样是加参数。`{dir}` 也可以写进 `dir`，让命令直接在文件管理器当前目录里跑（例如 `explorer` 加 `%1` 就能打开当前目录的某个文件）。
 
-**休眠**（`休眠` / `sleep` / `睡眠`）：不带分钟立即睡眠/待机，`休眠 30` 是 30 分钟后睡眠，`取消关机` 也能把它撤掉。
-注意"真休眠"（`shutdown /h`，写盘掉电不丢内存）不是每台机器都有：从 VHD 启动的系统通常被禁用休眠（`powercfg /a` 会写"内部系统组件已禁用休眠"，`HibernateEnabled=0`），这种情况只能用睡眠/待机（S3，内存保持）。想要真休眠得让系统支持它，然后把命令参数换成 `-Hibernate`。
+**睡眠**（`睡眠` / `sleep`）：不带分钟立即睡眠（待机 S3，内存保持、屏幕关、键鼠唤醒），`睡眠 30` 是 30 分钟后睡，`取消关机` 也能把它撤掉。
+
+不提供真休眠（`shutdown /h`，写盘掉电不丢内存）：这台机器从 VHD 启动，系统把休眠禁用了（`powercfg /a` 会写"内部系统组件已禁用休眠"，注册表 `HibernateEnabled=0`），做了也用不了，所以脚本里干脆没有这条路。
 
 ## 快捷键
 
