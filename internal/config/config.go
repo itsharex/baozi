@@ -138,14 +138,46 @@ type History struct {
 	MaxItems int  `json:"maxItems"`
 }
 
-// Command 是 Listary 式的自定义命令：输入 keyword 空格后，回车执行。
+// Command 是 Listary 式的自定义命令：输入激活词（空格后跟参数），回车执行。
+//
+// 参数里的占位符在运行时替换（见 cmd/baozi 的 expandArgs）：
+//
+//	%1 … %9   查询里空格分出的第 1～9 个词
+//	%*        全部词
+//	{dir}     当前跟随到的文件管理器目录
+//
+// 一个占位符都没写时走老行为：查询里多出的词按顺序追加到 Args 末尾。
 type Command struct {
+	// Keyword 是主激活词；Aliases 是同一命令的其它叫法。
+	// 搜索时命中任意一个都算（"关机" / "shut" / "shutdown" 指向同一个脚本）。
 	Keyword string   `json:"keyword"`
+	Aliases []string `json:"aliases,omitempty"`
 	Name    string   `json:"name"`
 	Exec    string   `json:"exec"`
 	Args    []string `json:"args"`
+	// Dir 是工作目录，空则继承 Baozi 自己的。同样支持 {dir}。
+	Dir string `json:"dir,omitempty"`
 	// KeepOpen 执行后不隐藏面板（例如打开一个命令行窗口）。
 	KeepOpen bool `json:"keepOpen"`
+}
+
+// Keywords 返回这条命令的全部激活词（主词在前，别名按顺序），去空去重。
+func (c Command) Keywords() []string {
+	out := make([]string, 0, 1+len(c.Aliases))
+	seen := make(map[string]bool, 1+len(c.Aliases))
+	for _, k := range append([]string{c.Keyword}, c.Aliases...) {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		low := strings.ToLower(k)
+		if seen[low] {
+			continue
+		}
+		seen[low] = true
+		out = append(out, k)
+	}
+	return out
 }
 
 // Default 给出一份能直接跑的配置：索引所有固定磁盘，排除系统噪声目录。

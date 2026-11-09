@@ -1014,31 +1014,29 @@ func (a *application) searchAll(q string) []search.Result {
 
 	results := make([]search.Result, 0, 256)
 
-	// 1) 自定义命令：关键字前缀命中优先（Listary 式）
+	// 1) 自定义命令：激活词（主词或别名）整词命中优先（Listary 式）
 	for _, cmd := range a.cfg.Commands {
-		kw := strings.ToLower(cmd.Keyword)
-		if kw == "" {
+		words, ok := commandWords(cmd, q)
+		if !ok {
 			continue
 		}
-		if lowQ == kw || strings.HasPrefix(lowQ, kw+" ") {
-			args := cmd.Args
-			if rest := strings.TrimSpace(q[len(cmd.Keyword):]); rest != "" {
-				args = append(append([]string{}, args...), strings.Fields(rest)...)
-			}
-			results = append(results, search.Result{
-				Item: search.Item{
-					Name:    cmd.Name,
-					Path:    cmd.Exec,
-					Hint:    "命令：" + cmd.Exec + " " + strings.Join(args, " "),
-					Kind:    search.KindCommand,
-					Command: cmd.Exec,
-					Args:    args,
-				},
-				TypeScore: 1,
-				Accuracy:  1,
-				Score:     search.Combine(weights, 0.5, 1, 1),
-			})
-		}
+		dir := a.lastFollowDir()
+		args := expandArgs(cmd.Args, words, dir)
+		results = append(results, search.Result{
+			Item: search.Item{
+				Name:     cmd.Name,
+				Path:     cmd.Exec,
+				Hint:     "命令：" + cmd.Exec + " " + strings.Join(args, " "),
+				Kind:     search.KindCommand,
+				Command:  cmd.Exec,
+				Args:     args,
+				Dir:      expandTemplate(cmd.Dir, words, dir),
+				KeepOpen: cmd.KeepOpen,
+			},
+			TypeScore: 1,
+			Accuracy:  1,
+			Score:     search.Combine(weights, 0.5, 1, 1),
+		})
 	}
 
 	// 2) 已安装应用：名字（含拼音）一路，产品名一路，取分高的那个。
@@ -1147,20 +1145,23 @@ func (a *application) searchRegex(q string) []search.Result {
 	acc := search.RegexAccuracy
 	results := make([]search.Result, 0, 256)
 
-	// 1) 自定义命令：按名字匹配。普通模式那套"关键字前缀"在正则里没有意义。
+	// 1) 自定义命令：按名字匹配。普通模式那套"激活词"在正则里没有意义。
 	for _, cmd := range a.cfg.Commands {
 		name := []byte(cmd.Name)
 		if !rx.Maybe(name) || !rx.Match(name) {
 			continue
 		}
+		dir := a.lastFollowDir()
 		results = append(results, search.Result{
 			Item: search.Item{
-				Name:    cmd.Name,
-				Path:    cmd.Exec,
-				Hint:    "命令：" + cmd.Exec,
-				Kind:    search.KindCommand,
-				Command: cmd.Exec,
-				Args:    append([]string{}, cmd.Args...),
+				Name:     cmd.Name,
+				Path:     cmd.Exec,
+				Hint:     "命令：" + cmd.Exec,
+				Kind:     search.KindCommand,
+				Command:  cmd.Exec,
+				Args:     expandArgs(cmd.Args, nil, dir),
+				Dir:      expandTemplate(cmd.Dir, nil, dir),
+				KeepOpen: cmd.KeepOpen,
 			},
 			TypeScore: 1,
 			Accuracy:  acc,
@@ -1367,7 +1368,10 @@ func (a *application) open() {
 		a.hist.TouchEntry(entry)
 		return
 	}
-	a.panel.Hide()
+	// 命令可以要求"执行后别收面板"（KeepOpen）：面板先收再跑，是默认行为。
+	if !(r.Kind == search.KindCommand && r.KeepOpen) {
+		a.panel.Hide()
+	}
 
 	// 历史要带着"这是什么"一起记，否则重启后还原不出正确的名字和图标。
 	log.Printf("open: %s (%s)", r.Name, r.Path)
@@ -1375,8 +1379,11 @@ func (a *application) open() {
 	if r.Kind == search.KindCommand {
 		cmd := exec.Command(r.Command, r.Args...)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: false}
+		if r.Dir != "" {
+			cmd.Dir = r.Dir
+		}
 		if err := cmd.Start(); err != nil {
-			log.Printf("运行命令 %s: %v", r.Command, err)
+			log.Printf("运行命令 %s %v（工作目录 %q）: %v", r.Command, r.Args, r.Dir, err)
 			return
 		}
 		a.hist.TouchEntry(entry)
@@ -1908,6 +1915,15 @@ func (a *application) startHook() {
 }
 
 // syncFollow 按当前配置启停跟随器，并刷新"哪些来源开着"的快照。
+// lastFollowDir 返回跟随器记住的文件管理器目录，供命令里的 {dir} 用。
+// 跟随没开（或还没读到目录）时是空串——占位符就替换成空，不留一个假的路径。
+func (a *application) lastFollowDir() string {
+	if a.follow == nil {
+		return ""
+	}
+	return a.follow.LastDir()
+}
+
 // 设置页保存后调它：总开关一改就真的停/起，来源勾选改了下次轮询立刻生效。
 func (a *application) syncFollow() {
 	a.refreshPathSources()

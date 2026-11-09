@@ -26,6 +26,10 @@ type Item struct {
 	// Command 非空时表示这是一条自定义命令。
 	Command string
 	Args    []string
+	// Dir 是自定义命令的工作目录（空则继承本进程）。
+	Dir string
+	// KeepOpen 让命令执行后不收起面板（开终端这类窗口时用）。
+	KeepOpen bool
 	// AppIndex 指向已安装应用列表的下标，-1 表示不是应用。
 	AppIndex int
 }

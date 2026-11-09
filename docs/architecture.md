@@ -881,15 +881,29 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 
 ## 11. 图形化设置与热更新
 
-第二个 mygo 窗口（880×760，`VibrancyGlass`，可滚动），分区与 `config` 结构一一对应：
+第二个 mygo 窗口（920×820，`VibrancyGlass`），顶栏下按 `ui.Tabs` 分成两个页签：
 
-| 分区 | 控件 | 写回字段 |
+| 页签 / 分区 | 控件 | 写回字段 |
 |---|---|---|
-| 唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
-| 文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
-| 排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.thumbnails` |
-| 索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
-| 自定义命令 | `TextArea`，每行 `关键字 \| 显示名 \| 程序 \| 参数` | `commands` |
+| 常规·唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
+| 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
+| 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.thumbnails` |
+| 常规·索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
+| 自定义命令 | 左列 `ui.List`（每条两行：显示名 + 全部激活词）＋ 新建/删除；右列表单：`TextInput`×3（激活词 / 显示名 / 程序）、`TextArea`（参数，一行一个）、`TextInput`（工作目录）、`Checkbox`（执行后不收起）、「将执行：」实时预览 | `commands`（结构化，不再是竖线文本） |
+
+命令页的编辑口径（为什么这么设计）：
+
+- **左边只负责选，右边才改内容**。以前一整个 `TextArea` 让人手拼 `关键字 | 显示名 | 程序 | 参数`，
+  分隔符错一个整行就废，而且看不出哪条是哪条；现在一条命令就是一屏表单，用户只填不拼。
+- **激活词一栏写多个**（逗号/顿号/竖线/空格都算分隔），第一个是主词、其余进 `aliases`；
+  这样「关机 / shut / shutdown」是一条命令的三个叫法，不再是配置里三条重复的副本。
+- **参数一行一个**，不用再考虑逗号分隔（旧格式里参数里出现逗号就没法写）。
+- **`{dir}` / `%1…%9` / `%*`** 在 `cmd/baozi/command.go` 展开：有占位符 → 只按模板替换；
+  没有占位符 → 回落老行为（把用户多敲的词追加到末尾），所以老命令的用法一点没变。
+- 新建后没填程序/激活词的空壳**不落盘**（`save()` 里跳过），否则配置里会积一堆跑不起来的条目。
+- 激活词被两条命令共用的，页顶给一行 `Warning` 提示（不拦保存）。
+- 编辑器里"正在改的那条"用 `cmdSync` 记住上次同步自哪条：只有选中项真的换了才把文本搬进输入框，
+  否则每帧都会把用户正在敲的字覆盖掉。
 
 「目录来源」是逐项写的 `true`/`false`（不是省略），否则用户关掉某一项之后，
 下次读配置会因为"缺省即开"又给它打开。运行时的取法：

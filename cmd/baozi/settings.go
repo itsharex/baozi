@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"unicode"
 
 	"baozi/internal/config"
 	"baozi/internal/win"
@@ -50,7 +51,15 @@ type settingsWindow struct {
 	srcXplorer2 bool
 	srcTessoa   bool
 
-	commands string
+	// 自定义命令：结构化编辑（左列选中哪条，右列就改哪条）。
+	// tab 0 = 常规，1 = 自定义命令。
+	tab      int
+	cmds     []config.Command
+	cmdSel   int
+	cmdList  ui.ListState
+	cmdAlias string // 编辑器里的"激活词"，逗号分隔
+	cmdArgs  string // 编辑器里的"参数"，一行一个
+	cmdSync  int    // 编辑器上次从哪一条同步来的，-1 表示要重新同步
 
 	message string
 }
@@ -62,11 +71,11 @@ func newSettingsWindow(a *application) *settingsWindow {
 		// 必须 Hidden：窗口创建即显示，不带这一项的话 Baozi 一启动就弹一个设置窗口，
 		// 它会占着任务栏、抢前台，还会让"点任务栏再双击 Ctrl"唤出的面板拿不到焦点。
 		Hidden:       true,
-		Width:        880,
-		Height:       760,
+		Width:        920,
+		Height:       820,
 		Vibrancy:     mygo.VibrancyGlass,
-		MinWidth:     760,
-		MinHeight:    520,
+		MinWidth:     800,
+		MinHeight:    560,
 		Content:      ui.View(s.view),
 		CornerRadius: 0,
 	})
@@ -115,13 +124,16 @@ func (s *settingsWindow) load() {
 	s.srcXplorer2 = cfg.PathSourceEnabled(win.SourceXplorer2)
 	s.srcTessoa = cfg.PathSourceEnabled(win.SourceTessoa)
 
-	lines := make([]string, 0, len(cfg.Commands))
-	for _, c := range cfg.Commands {
-		lines = append(lines, strings.Join([]string{
-			c.Keyword, c.Name, c.Exec, strings.Join(c.Args, ","),
-		}, " | "))
+	// 自定义命令：编辑器直接改结构化的清单，不再让用户拼竖线。
+	s.cmds = append([]config.Command(nil), cfg.Commands...)
+	s.cmdSel = 0
+	if len(s.cmds) == 0 {
+		s.cmdSel = -1
 	}
-	s.commands = strings.Join(lines, "\n")
+	s.cmdList.Selected = &s.cmdSel
+	s.cmdSync = -1
+	s.cmdAlias, s.cmdArgs = "", ""
+
 	s.message = ""
 }
 
@@ -137,23 +149,29 @@ func (s *settingsWindow) view(c *ui.Context) {
 
 	ui.Column(c).Fill().Children(func() {
 		// 顶栏
-		ui.Row(c).Padding(20, 24, 12, 24).Gap(10).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Padding(20, 24, 8, 24).Gap(10).AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "Baozi 设置").FontSize(20).Bold()
 				ui.Text(c, "改动保存后立即生效；配置文件在 "+s.app.cfgPath).FontSize(11).TextColor(t.TextMuted)
 			})
 		})
+		ui.Row(c).Padding(0, 24, 8, 24).Children(func() {
+			ui.Tabs(c, &s.tab, "常规", "自定义命令")
+		})
 		ui.Divider(c)
 
-		ui.Scroll(c).Grow(1).Children(func() {
-			ui.Column(c).Padding(24, 24).Gap(22).Children(func() {
-				s.hotkeySection(c, t)
-				s.followSection(c, t)
-				s.rankSection(c, t)
-				s.indexSection(c, t)
-				s.commandSection(c, t)
+		if s.tab == 1 {
+			s.commandsPage(c, t)
+		} else {
+			ui.Scroll(c).Grow(1).Children(func() {
+				ui.Column(c).Padding(24, 24).Gap(22).Children(func() {
+					s.hotkeySection(c, t)
+					s.followSection(c, t)
+					s.rankSection(c, t)
+					s.indexSection(c, t)
+				})
 			})
-		})
+		}
 
 		ui.Divider(c)
 		ui.Row(c).Padding(12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
@@ -287,11 +305,188 @@ func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
 	})
 }
 
-func (s *settingsWindow) commandSection(c *ui.Context, t *ui.Theme) {
-	ui.Column(c).Gap(10).Children(func() {
-		sectionTitle(c, t, "自定义命令", "每行一条：关键字 | 显示名 | 程序 | 参数（参数逗号分隔，可省略）")
-		ui.TextArea(c, &s.commands).Height(120).FontSize(12)
-		ui.Text(c, "例：term | Windows Terminal | wt.exe    ·    code | VS Code | code").FontSize(11).TextColor(t.TextMuted)
+// commandsPage 是「自定义命令」页：左列一排名单，右列编辑选中的那条。
+// 左边只负责选，右边才改内容 —— 这样一屏里能同时看到"有哪些命令"和"这条长什么样"。
+func (s *settingsWindow) commandsPage(c *ui.Context, t *ui.Theme) {
+	s.syncCommandEditor()
+
+	if dup := s.duplicateKeywords(); len(dup) > 0 {
+		ui.Row(c).Padding(8, 18).Children(func() {
+			ui.Text(c, "激活词重复："+strings.Join(dup, "、")+" —— 这几条会同时出现在结果里，容易点错。").
+				FontSize(11).TextColor(t.Warning)
+		})
+	}
+
+	ui.Row(c).Grow(1).Children(func() {
+		// 左列：清单
+		ui.Column(c).Width(250).FillHeight().Children(func() {
+			ui.Row(c).Padding(16, 16, 6, 12).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "命令").FontSize(13).Bold()
+				ui.Text(c, fmt.Sprintf("%d 条", len(s.cmds))).FontSize(11).TextColor(t.TextMuted)
+			})
+			ui.Column(c).Grow(1).Padding(6, 8).Children(func() {
+				if len(s.cmds) == 0 {
+					ui.Text(c, "还没有命令，点下面「新建」").FontSize(12).TextColor(t.TextMuted)
+					return
+				}
+				lst := ui.List(c, &s.cmdList, len(s.cmds), func(i int) {
+					ui.Column(c).Padding(6, 10).Gap(2).Children(func() {
+						ui.Text(c, s.cmds[i].Name).FontSize(13).SingleLine()
+						ui.Text(c, strings.Join(s.cmds[i].Keywords(), " · ")).FontSize(11).TextColor(t.TextMuted).SingleLine()
+					})
+				}).Grow(1)
+				if lst.Changed() {
+					// 换了选中的那条：下一个帧把右列的编辑框搬过去。
+					s.cmdSync = -1
+				}
+			})
+			ui.Row(c).Padding(8, 10).Gap(8).Children(func() {
+				if ui.Button(c, "新建").Clicked() {
+					s.newCommand()
+				}
+				if ui.Button(c, "删除").Clicked() {
+					s.deleteCommand()
+				}
+			})
+		})
+
+		// 分隔
+		ui.Column(c).Width(1).FillHeight().Background(t.Border)
+
+		// 右列：表单
+		ui.Column(c).Grow(1).Children(func() {
+			if len(s.cmds) == 0 || s.cmdSel < 0 || s.cmdSel >= len(s.cmds) {
+				ui.Column(c).Grow(1).Children(func() {
+					ui.Text(c, "左边选一条命令，或者点「新建」加一条。").FontSize(13).TextColor(t.TextMuted)
+				})
+				return
+			}
+			cmd := &s.cmds[s.cmdSel]
+			ui.Scroll(c).Grow(1).Children(func() {
+				ui.Column(c).Padding(22, 18).Gap(14).Children(func() {
+					formField(c, t, "激活词", "在搜索框里敲它就出这条命令；可写多个，逗号分隔（空格后面的内容会作为参数）")
+					ui.TextInput(c, &s.cmdAlias).Placeholder("关机, shut, shutdown")
+
+					formField(c, t, "显示名", "结果列表里显示的名字")
+					ui.TextInput(c, &cmd.Name).Placeholder("定时关机")
+
+					formField(c, t, "程序", "可执行文件；只写文件名就按 PATH 找，建议写绝对路径")
+					ui.TextInput(c, &cmd.Exec).Placeholder(`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`)
+
+					formField(c, t, "参数", "一行一个。支持占位符：%1…%9（第几个词）、%*（全部词）、{dir}（当前跟随到的目录）")
+					ui.TextArea(c, &s.cmdArgs).Height(110).FontSize(12)
+
+					formField(c, t, "工作目录", "留空则继承 Baozi 自己的目录；也支持 {dir}")
+					ui.TextInput(c, &cmd.Dir).Placeholder(`D:\1tools  或  {dir}`)
+
+					ui.Checkbox(c, &cmd.KeepOpen, "执行后不收起面板（开终端这类窗口时勾上）")
+
+					// 实时预览这条到底会执行成什么，省得反复试。
+					preview := strings.TrimSpace(cmd.Exec + " " + strings.Join(splitLines(s.cmdArgs), " "))
+					ui.Text(c, "将执行："+preview).FontSize(11).TextColor(t.TextMuted).SingleLine()
+
+					if strings.Contains(s.cmdArgs, "%") && !hasAnyNumberPlaceholder(s.cmdArgs) {
+						ui.Text(c, "提示：参数里有 % 但没写 %1…%9 或 %*，那个 % 会被原样传给程序。").FontSize(11).TextColor(t.Warning)
+					}
+				})
+			})
+		})
+	})
+}
+
+// duplicateKeywords 找出被两条以上命令共用的激活词（只在界面上提示，不拦保存）。
+func (s *settingsWindow) duplicateKeywords() []string {
+	seen := make(map[string]int, 16)
+	var dup []string
+	for _, cmd := range s.cmds {
+		for _, k := range cmd.Keywords() {
+			low := strings.ToLower(k)
+			seen[low]++
+			if seen[low] == 2 {
+				dup = append(dup, k)
+			}
+		}
+	}
+	return dup
+}
+
+// formField 是右列每一栏的小标题 + 说明。
+func formField(c *ui.Context, t *ui.Theme, label, desc string) {
+	ui.Column(c).Gap(4).Children(func() {
+		ui.Text(c, label).FontSize(12).Bold()
+		ui.Text(c, desc).FontSize(11).TextColor(t.TextMuted)
+	})
+}
+
+func hasAnyNumberPlaceholder(s string) bool {
+	for i := byte('1'); i <= '9'; i++ {
+		if strings.Contains(s, "%"+string(i)) {
+			return true
+		}
+	}
+	return false
+}
+
+// syncCommandEditor 把选中那条的"文本型"字段搬进编辑框。
+// 只在这一条换了的时候搬，否则每帧都会把用户正在敲的字覆盖掉。
+func (s *settingsWindow) syncCommandEditor() {
+	if len(s.cmds) == 0 {
+		s.cmdSel = -1
+		s.cmdSync = -1
+		s.cmdAlias, s.cmdArgs = "", ""
+		return
+	}
+	if s.cmdSel < 0 || s.cmdSel >= len(s.cmds) {
+		s.cmdSel = 0
+	}
+	if s.cmdSync == s.cmdSel {
+		return
+	}
+	c := s.cmds[s.cmdSel]
+	s.cmdAlias = strings.Join(c.Keywords(), ", ")
+	s.cmdArgs = strings.Join(c.Args, "\n")
+	s.cmdSync = s.cmdSel
+}
+
+// commitCommandEditor 把编辑框里的文本写回选中的那条（保存、新建、删除、切条目前都先调）。
+func (s *settingsWindow) commitCommandEditor() {
+	if len(s.cmds) == 0 || s.cmdSel < 0 || s.cmdSel >= len(s.cmds) {
+		return
+	}
+	cmd := &s.cmds[s.cmdSel]
+	cmd.Args = splitLines(s.cmdArgs)
+	kws := splitKeywords(s.cmdAlias)
+	if len(kws) == 0 {
+		cmd.Keyword, cmd.Aliases = "", nil
+		return
+	}
+	cmd.Keyword, cmd.Aliases = kws[0], kws[1:]
+}
+
+func (s *settingsWindow) newCommand() {
+	s.commitCommandEditor()
+	s.cmds = append(s.cmds, config.Command{Name: "新命令"})
+	s.cmdSel = len(s.cmds) - 1
+	s.cmdSync = -1
+}
+
+func (s *settingsWindow) deleteCommand() {
+	if len(s.cmds) == 0 || s.cmdSel < 0 {
+		return
+	}
+	s.cmds = append(s.cmds[:s.cmdSel], s.cmds[s.cmdSel+1:]...)
+	if len(s.cmds) == 0 {
+		s.cmdSel = -1
+	} else if s.cmdSel >= len(s.cmds) {
+		s.cmdSel = len(s.cmds) - 1
+	}
+	s.cmdSync = -1
+}
+
+// splitKeywords 拆"激活词"那一栏：逗号、竖线、顿号、空格都算分隔。
+func splitKeywords(text string) []string {
+	return strings.FieldsFunc(text, func(r rune) bool {
+		return r == ',' || r == '，' || r == '|' || r == '、' || unicode.IsSpace(r)
 	})
 }
 
@@ -336,7 +531,33 @@ func (s *settingsWindow) save() {
 	cfg.Index.IncludeHidden = s.includeHidden
 	cfg.Index.RescanMinutes = int(s.rescanMinutes)
 
-	cfg.Commands = parseCommands(s.commands)
+	// 自定义命令：先把编辑器里的文本写回，再归一化 —— 激活词去重、
+	// 空壳条目（新建后没填程序的）不落盘，免得配置里留一堆跑不起来的命令。
+	s.commitCommandEditor()
+	cmds := make([]config.Command, 0, len(s.cmds))
+	for _, c := range s.cmds {
+		kws := config.Command{Keyword: c.Keyword, Aliases: c.Aliases}.Keywords()
+		c.Keyword, c.Aliases = "", nil
+		if len(kws) > 0 {
+			c.Keyword, c.Aliases = kws[0], kws[1:]
+		}
+		c.Name = strings.TrimSpace(c.Name)
+		c.Exec = strings.TrimSpace(c.Exec)
+		c.Dir = strings.TrimSpace(c.Dir)
+		if c.Exec == "" || len(kws) == 0 {
+			continue
+		}
+		if c.Name == "" {
+			c.Name = c.Exec
+		}
+		cmds = append(cmds, c)
+	}
+	cfg.Commands = cmds
+	s.cmds = append([]config.Command(nil), cmds...)
+	if s.cmdSel >= len(s.cmds) {
+		s.cmdSel = len(s.cmds) - 1
+	}
+	s.cmdSync = -1
 
 	// 文件对话框跟随：总开关 + 各来源。写具体布尔值（不是省略），
 	// 这样用户一旦手动关掉某个来源，下次读配置不会被"缺省即开"又打开。
@@ -454,7 +675,7 @@ func splitLines(s string) []string {
 }
 
 // parseCommands 解析 "关键字 | 名称 | 程序 | 参数"。
-// 只写两段时视为 "关键字 | 程序"，名称取程序名。
+// 界面已经换成结构化编辑，这个解析只留给旧文本格式的兼容/排查用。
 func parseCommands(text string) []config.Command {
 	out := make([]config.Command, 0, 16)
 	for _, line := range splitLines(text) {
