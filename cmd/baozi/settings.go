@@ -370,8 +370,8 @@ func (s *settingsWindow) commandsPage(c *ui.Context, t *ui.Theme) {
 					formField(c, t, "显示名", "结果列表里显示的名字")
 					ui.TextInput(c, &cmd.Name).Placeholder("定时关机")
 
-					formField(c, t, "程序", "可执行文件；只写文件名就按 PATH 找，建议写绝对路径")
-					ui.TextInput(c, &cmd.Exec).Placeholder(`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`)
+					formField(c, t, "程序", "可执行文件；只写文件名就按 PATH 找。也可以直接填 .ps1 / .bat，会自动带上解释器")
+					ui.TextInput(c, &cmd.Exec).Placeholder(`D:\1tools\scripts\shutdown-after.ps1`)
 
 					formField(c, t, "参数", "一行一个。支持占位符：%1…%9（第几个词）、%*（全部词）、{dir}（当前跟随到的目录）")
 					ui.TextArea(c, &s.cmdArgs).Height(110).FontSize(12)
@@ -381,9 +381,10 @@ func (s *settingsWindow) commandsPage(c *ui.Context, t *ui.Theme) {
 
 					ui.Checkbox(c, &cmd.KeepOpen, "执行后不收起面板（开终端这类窗口时勾上）")
 
-					// 实时预览这条到底会执行成什么，省得反复试。
-					preview := strings.TrimSpace(cmd.Exec + " " + strings.Join(splitLines(s.cmdArgs), " "))
-					ui.Text(c, "将执行："+preview).FontSize(11).TextColor(t.TextMuted).SingleLine()
+					// 实时预览这条到底会执行成什么（含脚本自动包的解释器），省得反复试。
+					prog, pargs := launchSpec(cmd.Exec, splitLines(s.cmdArgs))
+					preview := strings.TrimSpace(prog + " " + strings.Join(pargs, " "))
+					ui.Text(c, "将执行："+preview).FontSize(11).TextColor(t.TextMuted)
 
 					if strings.Contains(s.cmdArgs, "%") && !hasAnyNumberPlaceholder(s.cmdArgs) {
 						ui.Text(c, "提示：参数里有 % 但没写 %1…%9 或 %*，那个 % 会被原样传给程序。").FontSize(11).TextColor(t.Warning)

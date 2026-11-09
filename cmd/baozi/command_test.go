@@ -98,6 +98,32 @@ func TestCommandResultUsesPlaceholders(t *testing.T) {
 	}
 }
 
+// 程序那栏直接填脚本时自动包解释器，省掉 powershell -NoProfile -File … 这一长串。
+func TestLaunchSpecWrapsScripts(t *testing.T) {
+	prog, args := launchSpec(`D:\1tools\scripts\shutdown-after.ps1`, []string{"30"})
+	if prog != "powershell.exe" {
+		t.Fatalf(".ps1 应该由 powershell 跑，实际 %q", prog)
+	}
+	want := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File",
+		`D:\1tools\scripts\shutdown-after.ps1`, "30"}
+	if strings.Join(args, "|") != strings.Join(want, "|") {
+		t.Fatalf(".ps1 包装错误：%v", args)
+	}
+
+	prog, args = launchSpec(`D:\x\y.BAT`, []string{"a"})
+	if prog != "cmd.exe" {
+		t.Fatalf(".bat 应该由 cmd 跑，实际 %q", prog)
+	}
+	if strings.Join(args, "|") != `/c|D:\x\y.BAT|a` {
+		t.Fatalf(".bat 包装错误：%v", args)
+	}
+
+	prog, args = launchSpec("code", []string{"."})
+	if prog != "code" || strings.Join(args, "|") != "." {
+		t.Fatalf("普通程序不该被包装：%q %v", prog, args)
+	}
+}
+
 func firstCommand(rs []search.Result) *search.Result {
 	for i := range rs {
 		if rs[i].Kind == search.KindCommand {

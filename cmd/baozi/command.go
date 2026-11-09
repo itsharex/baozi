@@ -105,3 +105,21 @@ func expandArgs(args []string, words []string, dir string) []string {
 	out = append(out, words...)
 	return out
 }
+
+// launchSpec 把"程序"那一栏翻译成真正要启动的 exe 和参数。
+//
+// 直接填脚本路径时自动包一层解释器 —— 这是自定义命令里最容易被劝退的一步：
+// 想跑个 .ps1 得自己拼 powershell.exe -NoProfile -ExecutionPolicy Bypass
+// -WindowStyle Hidden -File …，一长串。填 D:\x\y.ps1 就不用管了。
+// 认不出来的扩展名原样交给 exec（.exe / .cmd 在 PATH 里的短名都走这条路）。
+func launchSpec(program string, args []string) (string, []string) {
+	low := strings.ToLower(strings.TrimSpace(program))
+	switch {
+	case strings.HasSuffix(low, ".ps1"):
+		base := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", program}
+		return "powershell.exe", append(base, args...)
+	case strings.HasSuffix(low, ".bat"), strings.HasSuffix(low, ".cmd"):
+		return "cmd.exe", append([]string{"/c", program}, args...)
+	}
+	return program, args
+}

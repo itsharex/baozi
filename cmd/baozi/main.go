@@ -1377,13 +1377,14 @@ func (a *application) open() {
 	log.Printf("open: %s (%s)", r.Name, r.Path)
 
 	if r.Kind == search.KindCommand {
-		cmd := exec.Command(r.Command, r.Args...)
+		prog, args := launchSpec(r.Command, r.Args)
+		cmd := exec.Command(prog, args...)
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: false}
 		if r.Dir != "" {
 			cmd.Dir = r.Dir
 		}
 		if err := cmd.Start(); err != nil {
-			log.Printf("运行命令 %s %v（工作目录 %q）: %v", r.Command, r.Args, r.Dir, err)
+			log.Printf("运行命令 %s %v（工作目录 %q）: %v", prog, args, r.Dir, err)
 			return
 		}
 		a.hist.TouchEntry(entry)
