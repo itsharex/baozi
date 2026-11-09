@@ -904,6 +904,11 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 - 激活词被两条命令共用的，页顶给一行 `Warning` 提示（不拦保存）。
 - 编辑器里"正在改的那条"用 `cmdSync` 记住上次同步自哪条：只有选中项真的换了才把文本搬进输入框，
   否则每帧都会把用户正在敲的字覆盖掉。
+- **程序栏填 `.ps1` / `.bat` 自动带解释器**（`launchSpec`）：`.ps1` → `powershell.exe
+  -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File <脚本>`，`.bat/.cmd` → `cmd.exe /c`。
+  解释器用 `systemExe` 拼 `%SystemRoot%\System32\…` 的绝对路径，不走 PATH——Baozi 可能由 Run 键
+  或托盘拉起，环境变量未必和手动开的终端一致，找不到解释器的表现就是"点了没反应"。
+  设置页的「将执行：」用同一个 `launchSpec`，看到的和真正跑的一致。
 
 「目录来源」是逐项写的 `true`/`false`（不是省略），否则用户关掉某一项之后，
 下次读配置会因为"缺省即开"又给它打开。运行时的取法：

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 
 	"baozi/internal/config"
@@ -117,9 +119,25 @@ func launchSpec(program string, args []string) (string, []string) {
 	switch {
 	case strings.HasSuffix(low, ".ps1"):
 		base := []string{"-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", program}
-		return "powershell.exe", append(base, args...)
+		return systemExe(filepath.Join("WindowsPowerShell", "v1.0", "powershell.exe")), append(base, args...)
 	case strings.HasSuffix(low, ".bat"), strings.HasSuffix(low, ".cmd"):
-		return "cmd.exe", append([]string{"/c", program}, args...)
+		return systemExe("cmd.exe"), append([]string{"/c", program}, args...)
 	}
 	return program, args
+}
+
+// systemExe 拼系统目录下的 exe 绝对路径。
+// 不直接用裸名交给 PATH：Baozi 可能由 Run 键自启、从托盘拉起，环境变量未必和
+// 手动开的终端一样；这条找不到解释器，命令就"点了没反应"。
+// 拼出来的文件不存在（极老/精简系统）才退回裸名。
+func systemExe(sub string) string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	p := filepath.Join(root, "System32", sub)
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return filepath.Base(sub)
 }
