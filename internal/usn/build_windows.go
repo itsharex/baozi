@@ -3,6 +3,8 @@
 package usn
 
 import (
+	"log"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -11,6 +13,10 @@ import (
 	"baozi/internal/index"
 	"baozi/internal/pinyin"
 )
+
+// idxProfile 由 BAOZI_IDXPROFILE=1 打开：每条卷的枚举/排序/建表分段打一行耗时。
+// 平时关着——重建本身就在跟 CPU 计较，不该再为打点付钱。
+var idxProfile = os.Getenv("BAOZI_IDXPROFILE") != ""
 
 // 卷上的 NTFS 元数据文件（$MFT、$RmMetadata、$Txf…）不是用户能点的东西，
 // 而且它们的父链指向卷根之外，留着只会污染结果。
@@ -84,6 +90,7 @@ func BuildAll(vols []*Volume, cfg config.Index, progress func(scanned int)) (*in
 
 func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []string, hasPathRules bool, progress func(int)) (Progress, error) {
 	// 1) 全量枚举，先收进扁平数组（每卷 100 万条起步）。
+	tEnum := time.Now()
 	recs := make([]rec, 0, 1<<20)
 	j, err := vol.Journal()
 	if err != nil {
@@ -103,15 +110,23 @@ func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []st
 	if err != nil {
 		return Progress{}, err
 	}
+	if idxProfile {
+		log.Printf("建索引分段 %s: 枚举 %v，%d 条", vol.Letter(), time.Since(tEnum).Round(time.Millisecond), len(recs))
+	}
 
 	// 2) 按父编号排序，DFS 时用二分找子集——比给每个目录建一个 map 省得多
 	//    （147 万目录各带一个 slice header 就要 35 MB）。
+	tSort := time.Now()
 	sort.Slice(recs, func(i, j int) bool {
 		if recs[i].parent != recs[j].parent {
 			return recs[i].parent < recs[j].parent
 		}
 		return recs[i].frn < recs[j].frn
 	})
+	if idxProfile {
+		log.Printf("建索引分段 %s: 排序 %v", vol.Letter(), time.Since(tSort).Round(time.Millisecond))
+	}
+	tWalk := time.Now()
 
 	// 3) 卷根节点
 	rootName := vol.Letter() + `:\`
@@ -121,11 +136,24 @@ func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []st
 	}
 	rootPath := []byte(vol.Letter() + `:`)
 
+	// 配置根就是这个卷的整盘（"C:\"），DFS 已从卷根出发，没必要每条再判一次。
+	wholeVolume := false
+	for _, r := range rootPrefixes {
+		if len(r) == 2 && r[1] == ':' && strings.EqualFold(r[:1], vol.Letter()) {
+			wholeVolume = true
+			break
+		}
+	}
+
 	// 4) DFS：从卷根往下走，边走边累积路径。
 	//    只有"父节点已经在索引里"的条目才可能被收录——父目录被排除/删掉的子树整棵不可达，
 	//    这和 WalkDir 的行为一致。
-	var walk func(parentFRN uint64, parentID int32, dirPath []byte)
-	walk = func(parentFRN uint64, parentID int32, dirPath []byte) {
+	//
+	//    路径用一条共享缓冲按层 append/回退，不再每条 make 一个切片：
+	//    174 万条每次都分配一次，光这一项就够 DFS 建表慢一截。
+	pathBuf := append([]byte(nil), rootPath...)
+	var walk func(parentFRN uint64, parentID int32)
+	walk = func(parentFRN uint64, parentID int32) {
 		lo := sort.Search(len(recs), func(i int) bool { return recs[i].parent >= parentFRN })
 		for i := lo; i < len(recs) && recs[i].parent == parentFRN; i++ {
 			r := &recs[i]
@@ -143,15 +171,17 @@ func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []st
 				continue
 			}
 
-			childPath := make([]byte, 0, len(dirPath)+1+len(r.name))
-			childPath = append(childPath, dirPath...)
-			childPath = append(childPath, '\\')
-			childPath = append(childPath, r.name...)
-			if hasPathRules && index.ExcludedPathOnly(cfg.Excludes, string(childPath)) {
+			base := len(pathBuf)
+			pathBuf = append(pathBuf, '\\')
+			pathBuf = append(pathBuf, r.name...)
+			if hasPathRules && index.ExcludedPathOnly(cfg.Excludes, string(pathBuf)) {
+				pathBuf = pathBuf[:base]
 				continue
 			}
 			// 只收起在配置根目录之下的条目（roots 通常是整盘，配子目录时这里起作用）。
-			if !underAny(childPath, rootPrefixes) {
+			// 整盘根时从卷根出发的每条都必然在根下，跳过逐条转小写+前缀比较。
+			if !wholeVolume && !underAny(pathBuf, rootPrefixes) {
+				pathBuf = pathBuf[:base]
 				continue
 			}
 
@@ -164,14 +194,18 @@ func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []st
 				b.SetPy(id, py)
 			}
 			if isDir {
-				walk(r.frn, id, childPath)
+				walk(r.frn, id)
 			}
+			pathBuf = pathBuf[:base]
 			if progress != nil && b.Len()%20000 == 0 {
 				progress(b.Len())
 			}
 		}
 	}
-	walk(RootFRN, rootID, rootPath)
+	walk(RootFRN, rootID)
+	if idxProfile {
+		log.Printf("建索引分段 %s: DFS 建表 %v，%d 项", vol.Letter(), time.Since(tWalk).Round(time.Millisecond), b.Len())
+	}
 
 	return Progress{
 		Letter:    vol.Letter(),

@@ -185,15 +185,21 @@ func (v *Volume) enumUntil(highUsn int64, fn func(*Record) bool) error {
 	}
 }
 
-// Read 从 startUsn 开始读增量记录。wait<=0 时立即返回（只拿已经落盘的记录）。
+// Read 从 startUsn 开始读增量记录。wait<=0 时读一次就返回（只拿已经落盘的记录）。
 // 返回读到的下一位点与条数。
+//
+// wait 走内核等待这条路不放心的两个原因（都实测过）：
+//   - READ_USN_JOURNAL_DATA 的 Timeout 单位是 100 纳秒，但卷上没变化时它并不一定按
+//     Timeout 回来，观测到过挂满 4 分 47 秒、甚至整轮循环再也不动（进程 CPU 0）；
+//   - 两卷串行等，一张卷静默就会把另一张卷的变化一起拖住。
+//
+// 所以 wait<=0 时把 BytesToWaitFor 也置 0：内核立即返回现有记录，等待由调用方
+// 自己 sleep 来做——超时行为完全可控，也不会卡死。
 func (v *Volume) Read(startUsn int64, journalID uint64, wait time.Duration, fn func(*Record) bool) (int64, int, error) {
-	secs := uint64(0)
+	var timeout100ns, bytesToWaitFor uint64
 	if wait > 0 {
-		secs = uint64(wait / time.Second)
-		if secs == 0 {
-			secs = 1
-		}
+		timeout100ns = uint64(wait / (100 * time.Nanosecond))
+		bytesToWaitFor = 1
 	}
 	in := readReq{
 		StartUsn: startUsn,
@@ -201,8 +207,8 @@ func (v *Volume) Read(startUsn int64, journalID uint64, wait time.Duration, fn f
 		// 避免同一个文件在一次写入里出几十条中间记录。
 		ReasonMask:        0xFFFFFFFF,
 		ReturnOnlyOnClose: 1,
-		Timeout:           secs,
-		BytesToWaitFor:    1,
+		Timeout:           timeout100ns,
+		BytesToWaitFor:    bytesToWaitFor,
 		UsnJournalID:      journalID,
 	}
 	buf := make([]byte, readBufSize)

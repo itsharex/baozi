@@ -35,6 +35,25 @@ import (
 
 const serviceName = "BaoziIndex"
 
+const (
+	// rebuildBatch：攒够这么多条变化才值得整表重扫。一次重扫约 15 秒（两盘 174 万条），
+	// 单条摊 80ms；阈值给低了就会变成"天天在重建"，CPU 常年几个点。
+	rebuildBatch = 500
+	// rebuildCooldown：两次重建之间的最小间隔。删/装大批文件时变化会连续涌来，
+	// 冷却让它们攒成一轮，避免背靠背满载。
+	rebuildCooldown = 60 * time.Second
+	// rebuildIdle：有变化但不多时，安静这么久就扫一次。
+	// 删掉一批文件往往只产生几百条记录，等不到条数阈值，靠这个尽快反映。
+	rebuildIdle = 30 * time.Second
+	// rebuildMaxAge：这台机器每几秒就有零星文件变化，"安静 30 秒"经常满足不了，
+	// 所以补一条上限：不管攒了多少，离上次重建超过这么久就扫一次。
+	// 它同时是重建频率的闸门——一次 15 秒摊到 5 分钟，平均占用从 8% 降到 0.3% 上下。
+	rebuildMaxAge = 5 * time.Minute
+	// readPollInterval：多久读一次增量。文件变化最多延迟这么久被看见，
+	// 空闲时这里只花一次系统调用，不占 CPU。
+	readPollInterval = 2 * time.Second
+)
+
 func main() {
 	var (
 		dataDir   string
@@ -241,6 +260,10 @@ func runOnce() {
 // 逐条增删会产生碎片和 tombstone；而全量重建只要 6 秒（两盘），
 // 比维护"可变索引"的复杂度低得多，也不会出现两份数据对不上。
 func runIndexLoop(ctx context.Context) {
+	// 后台活：整表重建会连着吃十几秒 CPU。降到 Below Normal 让前台程序优先，
+	// 重建慢个两三秒无所谓，但不能在用户敲字/编译的时候抢核。
+	_ = windows.SetPriorityClass(windows.CurrentProcess(), windows.BELOW_NORMAL_PRIORITY_CLASS)
+
 	cfg, _, err := config.Load()
 	if err != nil {
 		log.Printf("读配置失败: %v", err)
@@ -263,6 +286,7 @@ func runIndexLoop(ctx context.Context) {
 	dataDir, _ := config.Dir()
 	state := loadState(dataDir)
 	lastChange := time.Now()
+	lastRebuild := time.Now()
 	lastCfg := time.Now()
 	pending := 0
 
@@ -289,10 +313,11 @@ func runIndexLoop(ctx context.Context) {
 			state = loadState(dataDir)
 			continue
 		}
-		// 每卷读一小段增量（5 秒一档，循环起来大约 10 秒一轮，心跳仍按分钟写）
+		// 每卷读一小段增量，不等内核（见 usn.Read 的注释：内核等待会整轮卡死）。
+		// 没变化就这轮啥也不做，sleep 一小会儿再看。
 		var changed int
 		for _, v := range vols {
-			next, n, err := v.Read(state.nextUsn(v.Letter()), state.journalID(v.Letter()), 5*time.Second,
+			next, n, err := v.Read(state.nextUsn(v.Letter()), state.journalID(v.Letter()), 0,
 				func(r *usn.Record) bool { return true })
 			if err != nil {
 				log.Printf("读增量 %s: %v", v.Letter(), err)
@@ -306,18 +331,30 @@ func runIndexLoop(ctx context.Context) {
 			log.Printf("增量 %d 条（累计等待 %d）", changed, pending)
 			lastChange = time.Now()
 		}
+		// 每轮都喘一口：文件变化最多延迟这么久被看见，空闲时这里只是 sleep。
+		// 不放在 else 里——持续有变化时会变成忙转，CPU 反而更难看。
+		time.Sleep(readPollInterval)
 
 		writeHeartbeat(dataDir)
 
-		// 节流：积累够多、或者距上次变更够久才重扫。
-		// 一次全量 16 秒（两盘 174 万条），瓶颈不在枚举而在"什么时候值得扫一遍"：
-		// 装个软件一次几百条，应该很快反映；偶尔改个文件也没必要每分钟重扫。
-		if pending >= 200 || (pending > 0 && time.Since(lastChange) >= 2*time.Minute) {
+		// 节流：为什么要有这么多条——重建一次 15 秒、占满一个核。
+		// 原来只要攒够 200 条就重建，一天实测 1500 多次、吃掉 7 小时 CPU，
+		// 任务管理器里就是常年 8%。现在的规矩是：
+		//   1) 攒够 rebuildBatch 条才值得扫；
+		//   2) 或者有变化、且已经安静 rebuildIdle（删一批文件只产生几百条记录，靠这个尽快反映）；
+		//   3) 或者有变化、且离上次重建过了 rebuildMaxAge（这台机器每几秒就有零星变化，
+		//      安静的前提经常不成立，用时间上限保证索引不会旧太久）；
+		// 三条都还要过 rebuildCooldown，避免删/装大批文件时背靠背满载。
+		if (pending >= rebuildBatch ||
+			(pending > 0 && time.Since(lastChange) >= rebuildIdle) ||
+			(pending > 0 && time.Since(lastRebuild) >= rebuildMaxAge)) &&
+			time.Since(lastRebuild) >= rebuildCooldown {
 			log.Printf("重建索引（等待了 %d 条变化）", pending)
 			if err := rebuild(vols, cfg, false); err != nil {
 				log.Printf("重建失败: %v", err)
 			}
 			pending = 0
+			lastRebuild = time.Now()
 			state = loadState(dataDir) // 重建后位点被刷新
 		}
 		// 配置每 5 分钟重新读一次（根目录/排除规则变了要尽快生效，而且不会造成重建环）
@@ -399,8 +436,12 @@ func rebuild(vols []*usn.Volume, cfg *config.Config, first bool) error {
 		return err
 	}
 	binPath := filepath.Join(dataDir, "index.bin")
+	tSave := time.Now()
 	if err := index.Save(binPath, tab, cfg.Index.Roots); err != nil {
 		return fmt.Errorf("保存索引: %w", err)
+	}
+	if os.Getenv("BAOZI_IDXPROFILE") != "" {
+		log.Printf("建索引分段: 落盘 %v", time.Since(tSave).Round(time.Millisecond))
 	}
 	total := tab.Len()
 	log.Printf("索引已更新: %d 项，耗时 %v", total, time.Since(start).Round(100*time.Millisecond))

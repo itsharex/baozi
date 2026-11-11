@@ -44,9 +44,21 @@ func HasHan(s string) bool {
 	return false
 }
 
+// hasHan 是 HasHan 的快路径：先按字节扫一遍，整串都是 ASCII 就直接判否。
+// 建索引要过 174 万个文件名，其中绝大多数是英文/数字，这一层能免掉
+// 逐 rune 的 unicode 判定。
+func hasHan(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return HasHan(s)
+		}
+	}
+	return false
+}
+
 // Initials 返回首字母串；不含汉字时返回空串（调用方按 ASCII 匹配即可）。
 func Initials(s string) string {
-	if !HasHan(s) {
+	if !hasHan(s) {
 		return ""
 	}
 	if v, ok := muInitial.Load(s); ok {
@@ -59,7 +71,7 @@ func Initials(s string) string {
 
 // Full 返回全拼串；不含汉字时返回空串。
 func Full(s string) string {
-	if !HasHan(s) {
+	if !hasHan(s) {
 		return ""
 	}
 	if v, ok := muFull.Load(s); ok {
