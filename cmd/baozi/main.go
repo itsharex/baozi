@@ -91,6 +91,16 @@ type application struct {
 	cat  atomic.Pointer[index.Table]
 	apps atomic.Pointer[[]appEntry]
 
+	// 增量同步状态（只由 refreshIndex 读写，用 idxMu 串行化）。
+	// idxMtime 是已载入的那份 index.bin 的修改时间；idxBase 是它的代次标识；
+	// idxSeq 是已经叠到服务写出的第几批；idxOps 是这一代里已经叠了多少条指令
+	// —— 服务每次都整份重写 delta 的 ops，所以进度必须按"条"记，不能按"批"。
+	idxMu    sync.Mutex
+	idxMtime time.Time
+	idxBase  uint64
+	idxSeq   uint64
+	idxOps   int
+
 	query   string
 	results []search.Result
 	chosen  int
@@ -1088,6 +1098,11 @@ func (a *application) searchAll(q string) []search.Result {
 		} else if !tab.Hits(i, tokens) && !pyContains(tab.PyOf(i), tokens) {
 			// 拼音查询（dbgz）在名字里当然找不到字面，得靠预存的拼音首字母串放行
 			continue
+		} else if tab.Dead(int32(i)) {
+			// 墓碑/被删目录的子条目。放在预筛之后才划算：全表上溯一遍要多花
+			// 几十毫秒，而这里每条查询只有几十个候选。
+			// （按路径查的那条分支走 PathOf，它自带同样的判定）
+			continue
 		}
 		name := tab.Name(i)
 		acc, ok := search.AccuracyPy(q, name, path, tab.PyOf(i), "")
@@ -1209,6 +1224,11 @@ func (a *application) searchRegex(q string) []search.Result {
 		}
 		name := tab.NameBytes(i)
 		if !rx.Maybe(name) || !rx.Match(name) {
+			continue
+		}
+		// 命中之后再判墓碑：正则能命中几千条，上溯这几千次约 1ms，
+		// 放在预筛之前就对 179 万条都做了。
+		if tab.Dead(int32(i)) {
 			continue
 		}
 		path := tab.PathOf(int32(i))
@@ -1545,6 +1565,10 @@ func (a *application) show() {
 	w, h := a.panel.Size()
 	a.panel.SetPosition(d.WorkArea.X+(d.WorkArea.Width-w)/2, d.WorkArea.Y+(d.WorkArea.Height-h)/3)
 	a.query = ""
+	// 唤出前把索引追一次：这是"刚存的文件马上能搜到"的关键一步。
+	// 没变化时只是两次 stat（微秒级）；有变化才复制快照叠增量（约 15ms），
+	// 而这点时间藏在面板动画里，感知不到。
+	a.refreshIndex(true)
 	a.refilter()
 	a.panel.Show()
 	// Show 内部只调 SetForegroundWindow，从任务栏/别的窗口切回来时会被前台锁拒绝，
@@ -1734,6 +1758,13 @@ func (a *application) bootIndex() {
 	}
 	if err == nil && n > 0 {
 		a.idxReplace(tab)
+		// 记下这份快照的"代次"，好让增量知道能不能往上叠
+		if info, e := os.Stat(a.indexFile()); e == nil {
+			a.idxMtime = info.ModTime()
+		}
+		a.idxBase = readStateBase(a.dataDir)
+		a.idxSeq = 0
+		a.idxOps = 0
 		if alive {
 			a.setStatus(fmt.Sprintf("%d 项 · USN 索引", n))
 			log.Printf("索引: 服务模式，%d 项（来自 %s）", n, a.indexFile())
@@ -1775,6 +1806,11 @@ func (a *application) bootIndex() {
 	// 无论服务当前在不在跑都挂上监听：用户随时可能在设置里把它打开，
 	// 打开后心跳一出现，这里就自动接管（自己扫的时候它会按心跳门控跳过）。
 	a.watchIndexFile()
+	// 启动时立刻追一次增量：index.bin 可能是几小时前写的，
+	// 服务攒下来的新条目都在 index.delta 里（这一步只叠指令，不重新读盘）。
+	if alive {
+		go a.refreshIndex(false)
+	}
 }
 
 // rootsChanged 判断索引快照覆盖的根目录是否与当前配置一致。

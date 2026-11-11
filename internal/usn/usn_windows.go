@@ -22,6 +22,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"baozi/internal/index"
 )
 
 const (
@@ -44,6 +46,15 @@ const (
 	AttrReparsePoint = 0x0400
 )
 
+// Reason 位：只挑增量维护用得上的几个。
+// 数据写入/属性变更这类位在索引里没有意义（索引只关心"在不在、叫什么"）。
+const (
+	ReasonCreate    uint32 = 0x00000100
+	ReasonDelete    uint32 = 0x00000200
+	ReasonRenameOld uint32 = 0x00001000
+	ReasonRenameNew uint32 = 0x00002000
+)
+
 // Record 是 USN_RECORD_V2 的一条（我们只认 V2，卷上绝大多数记录都是它）。
 type Record struct {
 	FRN       uint64
@@ -56,6 +67,44 @@ type Record struct {
 
 // IsDir 判断这条记录是不是目录。
 func (r *Record) IsDir() bool { return r.Attrs&AttrDirectory != 0 }
+
+// volKey 把卷内唯一的 FRN 加上卷标识，变成全局唯一。
+//
+// 为什么必须加：NTFS 的 FRN 只在**卷内**唯一，而两盘的卷根 FRN 都是 5。
+// 原来只按 FRN 找条目，C 盘根下新建的一个文件会认成"父在 D 盘根"，
+// 搜出来路径就成了 D:\xxx。
+//
+// 用法：高 16 位放盘符（A=0…Z=25），低 48 位是 FRN 本体（frnMask 正好也是 48 位）。
+func volKey(letter string, frn uint64) uint64 {
+	if len(letter) == 0 {
+		return frn & frnMask
+	}
+	c := letter[0]
+	if c >= 'a' && c <= 'z' {
+		c -= 'a' - 'A'
+	}
+	if c < 'A' || c > 'Z' {
+		return frn & frnMask
+	}
+	return uint64(c-'A')<<48 | frn&frnMask
+}
+
+// Change 把一条 USN 记录翻译成索引层能用的变化描述。
+// letter 是这个卷的盘符，用来把卷内 FRN 提升成全局唯一的键。
+func (r *Record) Change(letter string) index.Change {
+	return index.Change{
+		FRN:       volKey(letter, r.FRN),
+		ParentFRN: volKey(letter, r.ParentFRN),
+		Name:      r.Name,
+		IsDir:     r.IsDir(),
+		IsHidden:  r.Attrs&AttrHidden != 0,
+		IsReparse: r.Attrs&AttrReparsePoint != 0,
+		Delete:    r.Reason&ReasonDelete != 0,
+		Create:    r.Reason&ReasonCreate != 0,
+		RenameNew: r.Reason&ReasonRenameNew != 0,
+		RenameOld: r.Reason&ReasonRenameOld != 0,
+	}
+}
 
 // Journal 是卷上 USN Journal 的当前位置与身份。
 type Journal struct {

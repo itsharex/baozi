@@ -36,22 +36,23 @@ import (
 const serviceName = "BaoziIndex"
 
 const (
-	// rebuildBatch：攒够这么多条变化才值得整表重扫。一次重扫约 15 秒（两盘 174 万条），
-	// 单条摊 80ms；阈值给低了就会变成"天天在重建"，CPU 常年几个点。
-	rebuildBatch = 500
-	// rebuildCooldown：两次重建之间的最小间隔。删/装大批文件时变化会连续涌来，
-	// 冷却让它们攒成一轮，避免背靠背满载。
-	rebuildCooldown = 60 * time.Second
-	// rebuildIdle：有变化但不多时，安静这么久就扫一次。
-	// 删掉一批文件往往只产生几百条记录，等不到条数阈值，靠这个尽快反映。
-	rebuildIdle = 30 * time.Second
-	// rebuildMaxAge：这台机器每几秒就有零星文件变化，"安静 30 秒"经常满足不了，
-	// 所以补一条上限：不管攒了多少，离上次重建超过这么久就扫一次。
-	// 它同时是重建频率的闸门——一次 15 秒摊到 5 分钟，平均占用从 8% 降到 0.3% 上下。
-	rebuildMaxAge = 5 * time.Minute
-	// readPollInterval：多久读一次增量。文件变化最多延迟这么久被看见，
-	// 空闲时这里只花一次系统调用，不占 CPU。
+	// readPollInterval：多久读一次增量。文件变化最多延迟这么久被看见。
+	// 空闲时这里只花一次系统调用（加上一次 2 秒的 sleep），不占 CPU。
 	readPollInterval = 2 * time.Second
+	// deltaFlushInterval：多久把攒下的增量写给主进程。
+	// 主进程那边自己还有轮询节奏，这里 5 秒足够做到"敲完文件马上能搜到"，
+	// 又不会把磁盘写忙。
+	deltaFlushInterval = 5 * time.Second
+	// compactDead / compactNames：攒到这个程度就做一次全量把它收掉。
+	// 墓碑会让搜索多跳几次指针，arena 垃圾是纯浪费内存，两个都要有上限。
+	compactDead  = 20000
+	compactNames = 8 << 20
+	// compactOps：一个 delta 最多攒这么多条指令。delta 是要被主进程整份读、
+	// 整份重放的，不能无限长（否则每次合并都是几十毫秒）。
+	compactOps = 5000
+	// fullRebuildMaxAge：兜底。增量路径万一漏记/错记，定期全量能把它纠正回来；
+	// 顺便重写 index.bin，把历史增量彻底清成一代。
+	fullRebuildMaxAge = 6 * time.Hour
 )
 
 func main() {
@@ -249,16 +250,43 @@ func runOnce() {
 		fail("打开卷: %v", err)
 	}
 	defer closeVolumes(vols)
-	if err := rebuild(vols, cfg, true); err != nil {
+	dataDir, derr := config.Dir()
+	if derr != nil {
+		fail("数据目录: %v", derr)
+	}
+	if _, _, err := rebuild(vols, cfg, dataDir, true); err != nil {
 		fail("建索引: %v", err)
 	}
 }
 
-// runIndexLoop 是服务的核心：首轮全量建索引，之后靠 USN 增量判断"什么时候该重建"。
+// ruleFor 把配置里的收录规则，加上"数据目录本身必须排除"这一条。
 //
-// 为什么增量只当触发器、不做逐条改表：索引是 arena + 定长记录的快照，
-// 逐条增删会产生碎片和 tombstone；而全量重建只要 6 秒（两盘），
-// 比维护"可变索引"的复杂度低得多，也不会出现两份数据对不上。
+// 为什么必须加：服务每 5 秒写一次 index.delta（还有 .tmp 改名、heartbeat、
+// progress），每个动作都有 USN 记录。不排除数据目录，它就会把自己的写入
+// 当成"用户动了文件"再索引一遍，自己喂自己。
+//
+// 配置里的默认规则已经带了 %LOCALAPPDATA%\Baozi，但用户可以把数据目录
+// 指到别处（--data-dir），所以这里再按绝对路径补一道。
+func ruleFor(cfg *config.Config, dataDir string) (config.Index, index.Rule) {
+	ic := cfg.Index
+	ic.Excludes = append(append([]string{}, ic.Excludes...), dataDir)
+	return ic, index.Rule{Excludes: ic.Excludes, IncludeHidden: ic.IncludeHidden}
+}
+
+// runIndexLoop 是服务的核心：首轮全量建索引，之后**每一条 USN 记录都直接改内存表**。
+//
+// 这条路径以前是"增量只当触发器"——因为索引是定长记录 + arena + 父节点存下标的
+// 快照，逐条增删会破坏下标。结果就是每攒一批变化就整表重扫一次（15 秒 × 一天 1500 次
+// = 7 小时 CPU，任务管理器里常年 8%）。
+//
+// 现在改法（和 Everything 一样的思路）：
+//   - 新增条目 append 到末尾，已有下标一个都不动；
+//   - 删除只标墓碑，槽位留着——删目录时子条目不产生 USN 记录，父子链必须留着
+//     才能让那几千个子条目跟着失效；
+//   - 全量只在"墓碑/垃圾攒够"和"兜底定期"时发生。
+//
+// 每次变化都会攒成一条 DeltaOp 写进 index.delta，主进程拿它把自己的快照同步过去，
+// 于是索引整体不再有"5 分钟才更新一次"的窗口。
 func runIndexLoop(ctx context.Context) {
 	// 后台活：整表重建会连着吃十几秒 CPU。降到 Below Normal 让前台程序优先，
 	// 重建慢个两三秒无所谓，但不能在用户敲字/编译的时候抢核。
@@ -278,17 +306,47 @@ func runIndexLoop(ctx context.Context) {
 	defer func() { closeVolumes(vols) }()
 	log.Printf("索引服务就绪，卷 %v", letters(vols))
 
-	// 首轮
-	if err := rebuild(vols, cfg, true); err != nil {
+	dataDir, _ := config.Dir()
+
+	// 首轮：建全量、落盘、同时拿到 FRN 映射（之后按 FRN 找条目全靠它）
+	live, base, err := rebuild(vols, cfg, dataDir, true)
+	if err != nil {
 		log.Printf("首轮建索引失败: %v", err)
+		return
+	}
+	st := loadState(dataDir)
+	st.Base = base
+
+	_, rule := ruleFor(cfg, dataDir)
+	ops := make([]index.DeltaOp, 0, 1024)
+	var seq uint64
+	lastFlush := time.Now()
+	lastFull := time.Now()
+	lastCfg := time.Now()
+
+	// flush 把攒下的增量写盘。主进程读它把自己的快照追平。
+	flush := func() {
+		if len(ops) == 0 {
+			return
+		}
+		seq++
+		d := &index.Delta{Base: base, Seq: seq, Ops: ops}
+		if err := index.WriteDelta(deltaPath(dataDir), d); err != nil {
+			log.Printf("写增量失败: %v", err)
+			seq--
+			return
+		}
+		lastFlush = time.Now()
+		// 位点也跟着推进：服务崩了重启，从这里接着读，不用倒回去重放几百万条
+		writeState(dataDir, st.Volumes, live.Table().Len(), base)
 	}
 
-	dataDir, _ := config.Dir()
-	state := loadState(dataDir)
-	lastChange := time.Now()
-	lastRebuild := time.Now()
-	lastCfg := time.Now()
-	pending := 0
+	// reset 把增量状态清成新一代（全量重建之后 delta 作废，下标基准变了）
+	reset := func() {
+		ops = ops[:0]
+		seq = 0
+		lastFlush = time.Now()
+	}
 
 	for {
 		if ctx.Err() != nil {
@@ -300,64 +358,76 @@ func runIndexLoop(ctx context.Context) {
 			_ = os.Remove(filepath.Join(dataDir, "index.rebuild"))
 			log.Printf("收到重建请求")
 			// 重建前重新读配置：用户点这个按钮往往就是刚改完排除规则
-			if c, _, err := config.Load(); err == nil {
+			if c, _, e := config.Load(); e == nil {
 				cfg = c
-				if vols, err = reopenIfNeeded(vols, cfg.Index.Roots); err != nil {
-					log.Printf("重开卷失败: %v", err)
+				if vols, e = reopenIfNeeded(vols, cfg.Index.Roots); e != nil {
+					log.Printf("重开卷失败: %v", e)
 				}
 			}
-			if err := rebuild(vols, cfg, false); err != nil {
-				log.Printf("重建失败: %v", err)
+			_, rule = ruleFor(cfg, dataDir)
+			if nl, nb, e := rebuild(vols, cfg, dataDir, false); e != nil {
+				log.Printf("重建失败: %v", e)
+			} else {
+				live, base = nl, nb
 			}
-			pending = 0
-			state = loadState(dataDir)
+			st = loadState(dataDir)
+			st.Base = base
+			reset()
+			lastFull = time.Now()
 			continue
 		}
+
 		// 每卷读一小段增量，不等内核（见 usn.Read 的注释：内核等待会整轮卡死）。
-		// 没变化就这轮啥也不做，sleep 一小会儿再看。
-		var changed int
+		// 读到就立刻应用——这就是"实时"的全部。
+		applied := 0
 		for _, v := range vols {
-			next, n, err := v.Read(state.nextUsn(v.Letter()), state.journalID(v.Letter()), 0,
-				func(r *usn.Record) bool { return true })
+			next, _, err := v.Read(st.nextUsn(v.Letter()), st.journalID(v.Letter()), 0,
+				func(r *usn.Record) bool {
+					if op, ok := live.Apply(r.Change(v.Letter()), rule); ok {
+						ops = append(ops, op)
+						applied++
+					}
+					return true
+				})
 			if err != nil {
 				log.Printf("读增量 %s: %v", v.Letter(), err)
 				continue
 			}
-			state.setNext(v.Letter(), next)
-			changed += n
+			st.setNext(v.Letter(), next)
 		}
-		pending += changed
-		if changed > 0 {
-			log.Printf("增量 %d 条（累计等待 %d）", changed, pending)
-			lastChange = time.Now()
+		if applied > 0 && time.Since(lastFlush) >= deltaFlushInterval {
+			log.Printf("增量 %d 条已应用（本代累计 %d 条）", applied, len(ops))
+			flush()
 		}
-		// 每轮都喘一口：文件变化最多延迟这么久被看见，空闲时这里只是 sleep。
-		// 不放在 else 里——持续有变化时会变成忙转，CPU 反而更难看。
-		time.Sleep(readPollInterval)
 
+		// 收拾的必要性：墓碑让搜索多跳指针，arena 追加是纯占内存，
+		// 增量条数太多则主进程每次合并都会变慢。任何一条到线就整表重扫一次。
+		needCompact := live.Compact(compactDead, compactNames) || len(ops) >= compactOps
+		if needCompact {
+			log.Printf("整理索引（墓碑 %d、名字追加 %d 字节、增量 %d 条）",
+				live.Dead(), live.NamesOverhead(), len(ops))
+		} else if time.Since(lastFull) >= fullRebuildMaxAge {
+			log.Printf("定期全量重建（兜底，距上次 %v）", time.Since(lastFull).Round(time.Minute))
+			needCompact = true
+		}
+		if needCompact {
+			if nl, nb, e := rebuild(vols, cfg, dataDir, false); e != nil {
+				log.Printf("重建失败: %v", e)
+			} else {
+				live, base = nl, nb
+				st = loadState(dataDir)
+				st.Base = base
+				reset()
+				lastFull = time.Now()
+			}
+		}
+
+		// 每轮都喘一口：文件变化最多延迟这么久被看见，空闲时这里只是 sleep。
+		// 不放在别处——持续有变化时会变成忙转，CPU 反而更难看。
+		time.Sleep(readPollInterval)
 		writeHeartbeat(dataDir)
 
-		// 节流：为什么要有这么多条——重建一次 15 秒、占满一个核。
-		// 原来只要攒够 200 条就重建，一天实测 1500 多次、吃掉 7 小时 CPU，
-		// 任务管理器里就是常年 8%。现在的规矩是：
-		//   1) 攒够 rebuildBatch 条才值得扫；
-		//   2) 或者有变化、且已经安静 rebuildIdle（删一批文件只产生几百条记录，靠这个尽快反映）；
-		//   3) 或者有变化、且离上次重建过了 rebuildMaxAge（这台机器每几秒就有零星变化，
-		//      安静的前提经常不成立，用时间上限保证索引不会旧太久）；
-		// 三条都还要过 rebuildCooldown，避免删/装大批文件时背靠背满载。
-		if (pending >= rebuildBatch ||
-			(pending > 0 && time.Since(lastChange) >= rebuildIdle) ||
-			(pending > 0 && time.Since(lastRebuild) >= rebuildMaxAge)) &&
-			time.Since(lastRebuild) >= rebuildCooldown {
-			log.Printf("重建索引（等待了 %d 条变化）", pending)
-			if err := rebuild(vols, cfg, false); err != nil {
-				log.Printf("重建失败: %v", err)
-			}
-			pending = 0
-			lastRebuild = time.Now()
-			state = loadState(dataDir) // 重建后位点被刷新
-		}
-		// 配置每 5 分钟重新读一次（根目录/排除规则变了要尽快生效，而且不会造成重建环）
+		// 配置每 5 分钟重新读一次（根目录/排除规则变了要尽快生效）
 		if time.Since(lastCfg) >= 5*time.Minute {
 			lastCfg = time.Now()
 			if c, _, err := config.Load(); err == nil {
@@ -367,13 +437,19 @@ func runIndexLoop(ctx context.Context) {
 					if vols, err = reopenIfNeeded(vols, cfg.Index.Roots); err != nil {
 						log.Printf("重开卷失败: %v", err)
 					}
-					if err := rebuild(vols, cfg, false); err != nil {
-						log.Printf("重建失败: %v", err)
+					_, rule = ruleFor(cfg, dataDir)
+					if nl, nb, e := rebuild(vols, cfg, dataDir, false); e != nil {
+						log.Printf("重建失败: %v", e)
+					} else {
+						live, base = nl, nb
+						st = loadState(dataDir)
+						st.Base = base
+						reset()
+						lastFull = time.Now()
 					}
-					pending = 0
-					state = loadState(dataDir)
 				} else {
 					cfg = c
+					_, rule = ruleFor(cfg, dataDir)
 				}
 			}
 		}
@@ -419,40 +495,44 @@ func reopenIfNeeded(vols []*usn.Volume, roots []string) ([]*usn.Volume, error) {
 	return fresh, nil
 }
 
-// rebuild 全量枚举 → 落盘 → 写位点。
-func rebuild(vols []*usn.Volume, cfg *config.Config, first bool) error {
+// rebuild 全量枚举 → 落盘 → 写位点 → 返回**可继续增量维护的活表**。
+//
+// 和以前不同的是它现在把表留在内存里（以前 save 完就 tab=nil + FreeOSMemory，
+// 只把 index.bin 当唯一真相）。留下它是增量的前提：新条目直接 append 上去，
+// 搜到的就是最新状态，不必等下一次重扫。
+func rebuild(vols []*usn.Volume, cfg *config.Config, dataDir string, first bool) (*index.Mutable, uint64, error) {
 	start := time.Now()
-	tab, prog, err := usn.BuildAll(vols, cfg.Index, func(n int) {
+	ic, _ := ruleFor(cfg, dataDir)
+	tab, frn, prog, err := usn.BuildAll(vols, ic, func(n int) {
 		// 建的过程中每 10 万项打一行，别把日志刷成几千行
 		if n%100000 < 20000 {
 			log.Printf("建索引中… %d 项", n)
 		}
 	})
 	if err != nil {
-		return err
+		return nil, 0, err
 	}
-	dataDir, err := config.Dir()
-	if err != nil {
-		return err
-	}
-	binPath := filepath.Join(dataDir, "index.bin")
 	tSave := time.Now()
-	if err := index.Save(binPath, tab, cfg.Index.Roots); err != nil {
-		return fmt.Errorf("保存索引: %w", err)
+	if err := index.Save(filepath.Join(dataDir, "index.bin"), tab, cfg.Index.Roots); err != nil {
+		return nil, 0, fmt.Errorf("保存索引: %w", err)
 	}
 	if os.Getenv("BAOZI_IDXPROFILE") != "" {
 		log.Printf("建索引分段: 落盘 %v", time.Since(tSave).Round(time.Millisecond))
 	}
 	total := tab.Len()
+	// 这一代的标识：主进程靠它判断"我载入的 bin 和这份 delta 是不是同一代"。
+	// 用纳秒时间戳，单调且不会和上一代撞。
+	base := uint64(time.Now().UnixNano())
 	log.Printf("索引已更新: %d 项，耗时 %v", total, time.Since(start).Round(100*time.Millisecond))
-	writeState(dataDir, prog, total)
+	writeState(dataDir, prog, total, base)
+	// 新的一代：旧 delta 的 Base 已经不匹配，直接清掉（主进程看到空 delta 会重新载入 bin）
+	if err := index.WriteDelta(deltaPath(dataDir), &index.Delta{Base: base}); err != nil {
+		log.Printf("清空增量失败: %v", err)
+	}
 
-	// 快照已经写盘了，服务不需要持有它。
-	// 不显式回收的话，构建期的 recs/排序/arena 会一直挂在 working set 上——
-	// 实测能留下 550 MB，而服务平时只需要十几 MB。
-	tab = nil
+	// 构建期的 recs/排序/arena 临时候选有几百 MB，表本身是活的不会被回收。
 	debug.FreeOSMemory()
-	return nil
+	return index.NewMutable(tab, frn), base, nil
 }
 
 // ---------------------------------------------------------------- 卷与状态文件
@@ -509,10 +589,14 @@ type state struct {
 	Volumes   []usn.Progress `json:"volumes"`
 	Total     int            `json:"total"`
 	Heartbeat time.Time      `json:"heartbeat"`
+	// Base 是当前 index.bin 这一代的标识。主进程拿它和 delta 的 Base 比对，
+	// 对不上（说明 bin 已经换代）就重新整份载入，而不是往上叠增量。
+	Base uint64 `json:"base"`
 }
 
 func statePath(dataDir string) string     { return filepath.Join(dataDir, "index.progress.json") }
 func heartbeatPath(dataDir string) string { return filepath.Join(dataDir, "index.heartbeat") }
+func deltaPath(dataDir string) string     { return filepath.Join(dataDir, "index.delta") }
 
 func loadState(dataDir string) *state {
 	s := &state{}
@@ -552,8 +636,8 @@ func (s *state) setNext(letter string, next int64) {
 	s.Volumes = append(s.Volumes, usn.Progress{Letter: letter, NextUsn: next})
 }
 
-func writeState(dataDir string, prog []usn.Progress, total int) {
-	s := &state{Volumes: prog, Total: total, Heartbeat: time.Now()}
+func writeState(dataDir string, prog []usn.Progress, total int, base uint64) {
+	s := &state{Volumes: prog, Total: total, Heartbeat: time.Now(), Base: base}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return

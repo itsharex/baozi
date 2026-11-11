@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -21,11 +22,17 @@ import (
 const (
 	// 心跳多久算失效。服务每分钟写一次，3 分钟给了两轮容错（比如它在重建索引时卡住）。
 	serviceHeartbeatTTL = 3 * time.Minute
-	// 主进程盯索引文件的间隔。服务最多 10 分钟才重建一次，30 秒足够及时。
+	// 主进程后台追增量的间隔。服务那边 5 秒攒一批写盘。
+	// 这里给 30 秒而不是更短，是因为"叠增量"要先复制一份 75MB 的快照
+	// （copy-on-write，见 Table.Clone）——这台机器每两秒就有人动文件，
+	// 10 秒一轮会一直复制，内存峰值翻倍、GC 也跟着忙。
+	// 真正的及时性靠面板唤出时那一次 refresh（见 application.show），
+	// 也就是"用户看得见的那一刻，索引一定是最新的"。
 	indexWatchInterval = 30 * time.Second
 )
 
 func (a *application) heartbeatFile() string { return filepath.Join(a.dataDir, "index.heartbeat") }
+func (a *application) deltaFile() string     { return filepath.Join(a.dataDir, "index.delta") }
 
 // serviceAlive 判断索引服务是否在跑（心跳文件够新）。
 // 注意不能拿"服务是否安装"来判断：装了但停了（比如用户手动停掉）也得回退到自己扫。
@@ -37,49 +44,116 @@ func (a *application) serviceAlive() bool {
 	return time.Since(info.ModTime()) < serviceHeartbeatTTL
 }
 
-// watchIndexFile 盯住服务写出来的索引快照，变了就整体换掉。
+// watchIndexFile 定时把索引追到服务的最新状态。
 //
-// 换快照而不是增量改：搜索读的是 atomic.Pointer 里的整张表，
-// 替换一次是原子的，正在进行的搜索不受影响；旧表被 GC 掉，内存自然回落。
+// 两层：index.bin 换代就整份重载（服务每次全量重建都换一代），
+// 没换代就把 index.delta 里新增的那些指令叠上去（copy-on-write，约 15ms）。
+// 没变化时连复制都不做，只是每次 stat 两个文件。
 func (a *application) watchIndexFile() {
 	go func() {
-		var last time.Time
 		if info, err := os.Stat(a.indexFile()); err == nil {
-			last = info.ModTime()
+			a.idxMtime = info.ModTime()
 		}
-		path := a.indexFile()
 		ticker := time.NewTicker(indexWatchInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			if a.quitting.Load() || a.uninstalling.Load() {
 				return
 			}
-			// 服务没在跑的时候不盯：这时候 index.bin 是我自己 rescan 写的，
-			// 再加载一遍纯属浪费（刚扫完的表已经在内存里）。
-			if !a.serviceAlive() {
-				continue
-			}
-			info, err := os.Stat(path)
-			if err != nil || info.ModTime().Equal(last) {
-				continue
-			}
-			last = info.ModTime()
-
-			tab, _, err := index.Load(path)
-			if err != nil {
-				log.Printf("重载索引: %v", err)
-				continue
-			}
-			if tab.Len() == 0 {
-				continue
-			}
-			a.idxReplace(tab)
-			a.setStatus(fmt.Sprintf("%d 项 · 索引服务已更新", tab.Len()))
-			log.Printf("索引: 服务已更新快照，重载 %d 项", tab.Len())
-			// 重载会临时堆出解压缓冲，还回去
-			releaseMemory()
+			a.refreshIndex(false)
 		}
 	}()
+}
+
+// refreshIndex 把内存快照追平服务的状态。quiet=true 时不写状态栏/log（面板唤出时用）。
+func (a *application) refreshIndex(quiet bool) {
+	// 服务没在跑的时候不追：这时候 index.bin 是我自己 rescan 写的，
+	// 再加载一遍纯属浪费（刚扫完的表已经在内存里）。
+	if !a.serviceAlive() {
+		return
+	}
+	a.idxMu.Lock()
+	defer a.idxMu.Unlock()
+
+	// 1) 快照换代：整份重载（19MB，约 90ms）
+	if info, err := os.Stat(a.indexFile()); err == nil && !info.ModTime().Equal(a.idxMtime) {
+		tab, _, err := index.Load(a.indexFile())
+		if err != nil {
+			log.Printf("重载索引: %v", err)
+			return
+		}
+		if tab.Len() == 0 {
+			return
+		}
+		a.idxMtime = info.ModTime()
+		a.idxBase = readStateBase(a.dataDir)
+		a.idxSeq = 0
+		a.idxOps = 0
+		a.idxReplace(tab)
+		if !quiet {
+			a.setStatus(fmt.Sprintf("%d 项 · 索引服务已更新", tab.Len()))
+			log.Printf("索引: 服务已更新快照，重载 %d 项", tab.Len())
+		}
+		// 重载会临时堆出解压缓冲，还回去
+		releaseMemory()
+	}
+
+	// 2) 增量：把这次新增的指令叠上去。
+	//
+	// 注意 delta.Ops 是**这一代累积的全部** op（服务每次都整份重写），
+	// Seq 只是"第几批"，两者不是一回事：不能拿 Seq 当 Ops 的下标用，
+	// 否则上一批 20 条、这一批 3 条时，下标会从第 20 条开始取、把应用过的
+	// 又叠一遍（ApplyOps 的下标校验会整批拒绝，然后索引永远追不上）。
+	d, err := index.ReadDelta(a.deltaFile())
+	if err != nil || d == nil {
+		return
+	}
+	if d.Base != a.idxBase {
+		// 不是同一代（bin 还没换到这一代），等下一次重载
+		return
+	}
+	from := a.idxOps
+	if d.Seq < a.idxSeq || from > len(d.Ops) {
+		// 服务那边重置过（理论上 base 会一起变，这里兜个底）
+		from, a.idxOps = 0, 0
+	}
+	if from >= len(d.Ops) {
+		a.idxSeq = d.Seq
+		return
+	}
+	cur := a.cat.Load()
+	if cur == nil {
+		return
+	}
+	ops := d.Ops[from:]
+	next := cur.Clone()
+	if _, ok := next.ApplyOps(ops); !ok {
+		// 下标对不上：本地这份已经和服务错开了，只能等 bin 换代重来
+		a.idxOps = 0
+		a.idxSeq = 0
+		return
+	}
+	a.idxReplace(next)
+	a.idxOps = len(d.Ops)
+	a.idxSeq = d.Seq
+	if !quiet {
+		a.setStatus(fmt.Sprintf("%d 项 · 已同步 %d 条变化", next.Len(), len(ops)))
+		log.Printf("索引: 已同步 %d 条变化，%d 项（累计 %d 条 / %d 批）", len(ops), next.Len(), a.idxOps, d.Seq)
+	}
+}
+
+// readStateBase 读服务写的这一代标识（index.progress.json 的 base）。
+// 读不到就返回 0——那样 delta 会因为 Base 对不上而被跳过，不会错位。
+func readStateBase(dataDir string) uint64 {
+	var st struct {
+		Base uint64 `json:"base"`
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, "index.progress.json"))
+	if err != nil {
+		return 0
+	}
+	_ = json.Unmarshal(data, &st)
+	return st.Base
 }
 
 // indexServiceExe 找同目录下的 baozi-index.exe。

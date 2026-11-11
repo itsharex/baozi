@@ -45,12 +45,10 @@ type Progress struct {
 	BuiltAt   time.Time `json:"builtAt"`
 }
 
-// BuildAll 枚举多个卷，合成一张索引快照。
-//
-// 与 WalkDir 的区别：不遍历目录，直接读 $MFT 记录（实测 C 盘 103 万条 3 秒），
-// 代价是大小与修改时间拿不到（USN 记录里没有这两项），所以 size/mod 一律为 0。
-// 搜索排序只看名字/类型/频次，不依赖它们。
-func BuildAll(vols []*Volume, cfg config.Index, progress func(scanned int)) (*index.Table, []Progress, error) {
+// BuildAll 枚举多个卷，合成一张索引快照，同时给出 FRN → 条目下标 的映射。
+// 映射是给"之后按 USN 增量维护这张表"用的：没有它，一条记录过来不知道要改哪个条目。
+// 全量枚举本来就握着每条记录的 FRN，顺手建起来不比单独扫一遍贵。
+func BuildAll(vols []*Volume, cfg config.Index, progress func(scanned int)) (*index.Table, *index.FRNMap, []Progress, error) {
 	hint := 0
 	for range vols {
 		hint += 1 << 20
@@ -78,14 +76,14 @@ func BuildAll(vols []*Volume, cfg config.Index, progress func(scanned int)) (*in
 	for _, vol := range vols {
 		p, err := buildOne(b, vol, cfg, rootPrefixes, hasPathRules, progress)
 		if err != nil {
-			return nil, out, err
+			return nil, nil, out, err
 		}
 		out = append(out, p)
 	}
 	if progress != nil {
 		progress(b.Len())
 	}
-	return b.Table(), out, nil
+	return b.Table(), b.FRNs(), out, nil
 }
 
 func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []string, hasPathRules bool, progress func(int)) (Progress, error) {
@@ -130,7 +128,7 @@ func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []st
 
 	// 3) 卷根节点
 	rootName := vol.Letter() + `:\`
-	rootID := b.Add(rootName, -1, index.KindDir, 0, 0)
+	rootID := b.AddFRN(rootName, -1, index.KindDir, 0, 0, volKey(vol.Letter(), RootFRN))
 	if py := pinyin.Initials(rootName); py != "" {
 		b.SetPy(rootID, py)
 	}
@@ -189,7 +187,7 @@ func buildOne(b *index.Builder, vol *Volume, cfg config.Index, rootPrefixes []st
 			if isDir {
 				kind = index.KindDir
 			}
-			id := b.Add(r.name, parentID, kind, 0, 0)
+			id := b.AddFRN(r.name, parentID, kind, 0, 0, volKey(vol.Letter(), r.frn))
 			if py := pinyin.Initials(r.name); py != "" {
 				b.SetPy(id, py)
 			}

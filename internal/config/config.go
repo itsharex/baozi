@@ -330,6 +330,11 @@ func defaultExcludes() []string {
 		// "最近使用"的快捷方式集合：Baozi 自己就记历史，索引它只是把 .lnk 塞满结果。
 		"AppData\\Roaming\\Microsoft\\Windows\\Recent",
 		"AppData\\Roaming\\Tencent",
+		// Baozi 自己的数据目录。这一条在增量模式下是**必须**的：
+		// 服务每 5 秒写一次 index.delta（还有 .tmp 改名），每次都产生 USN 记录，
+		// 不排除的话它就把自己的写入当成"用户动了文件"，再索引一遍、
+		// 再攒成增量、再写盘——自己喂自己，永远停不下来。
+		"AppData\\Local\\Baozi",
 	}
 }
 

@@ -21,6 +21,13 @@ type Kind uint8
 const (
 	KindFile Kind = iota
 	KindDir
+	// KindDeleted 是墓碑：条目已经被删掉，但槽位不能抹掉——Parent 存的是数组下标，
+	// 抹掉会让所有后继下标错位。搜索时看到它就丢弃（连同它下面的子树，
+	// 见 Table.Dead）。
+	//
+	// 为什么不能真删：NTFS 删一个目录时，USN 里只有目录本身一条记录，里面那几千个
+	// 文件不会有记录。所以"父被删"必须能被子条目看见，父子链就得留着。
+	KindDeleted
 )
 
 // ModBase 是 ModSec 的基准时间（2020-01-01T00:00:00Z）。
@@ -59,6 +66,29 @@ func PackPy(off uint32, n uint16) uint64 { return uint64(off)<<16 | uint64(n) }
 
 // UnpackPy 拆开 PackPy 的打包值。
 func UnpackPy(v uint64) (off uint32, n uint16) { return uint32(v >> 16), uint16(v & 0xffff) }
+
+// Clone 复制一份**可写**的表，用来把增量叠上去。
+//
+// 为什么不原地改：搜索是在没有锁的情况下遍历当前快照的（179 万条，走几十毫秒），
+// 一旦它身后有人在 append Nodes/Names，切片长度和底层数组都会变，正在遍历的那个
+// goroutine 就会读到越界数据。复制一份、改完再原子换指针，搜索侧完全不用管锁。
+//
+// 代价：76MB 复制 ≈ 15ms。只在增量真的来了才付（没变化时连 mtime 都不用比）。
+func (t *Table) Clone() *Table {
+	if t == nil {
+		return nil
+	}
+	nodes := make([]Node, len(t.Nodes), len(t.Nodes)+1024)
+	copy(nodes, t.Nodes)
+	names := make([]byte, len(t.Names), len(t.Names)+(1<<20))
+	copy(names, t.Names)
+	py := make(map[int32]uint64, len(t.Py)+16)
+	for k, v := range t.Py {
+		py[k] = v
+	}
+	// raw 只读，可以共享（Clone 出来的表只往 append 出来的新容量里写）
+	return &Table{Nodes: nodes, Names: names, Py: py, raw: t.raw}
+}
 
 // Len 返回条目数。
 func (t *Table) Len() int {
@@ -149,6 +179,9 @@ func (t *Table) PathOf(i int32) string {
 	parts := make([]string, 0, 12)
 	for cur := i; cur >= 0 && int(cur) < len(t.Nodes); {
 		n := &t.Nodes[cur]
+		if n.Kind == KindDeleted { // 已删除的条目不该再拼出路径
+			return ""
+		}
 		if n.Parent < 0 { // 根节点自身就是 "C:\"
 			parts = append(parts, strings.TrimRight(t.Name(int(cur)), `\/`))
 			break
@@ -164,6 +197,24 @@ func (t *Table) PathOf(i int32) string {
 		b.WriteString(parts[i])
 	}
 	return b.String()
+}
+
+// Dead 判断条目是不是已经失效：自己或它的某个祖先被标了墓碑。
+// 只在**已经命中预筛的候选**上调用——全表都上溯会白白多花几十毫秒，
+// 而命中集通常只有几十条。
+func (t *Table) Dead(i int32) bool {
+	if t == nil || i < 0 || int(i) >= len(t.Nodes) {
+		return true
+	}
+	// 深度上限：正常路径不会超过几十层，超了说明数据本身有问题，当失效处理。
+	for cur, depth := i, 0; cur >= 0 && int(cur) < len(t.Nodes) && depth < 256; depth++ {
+		n := &t.Nodes[cur]
+		if n.Kind == KindDeleted {
+			return true
+		}
+		cur = n.Parent
+	}
+	return false
 }
 
 // Dir 返回条目的父目录路径，用于结果行的提示文字。
