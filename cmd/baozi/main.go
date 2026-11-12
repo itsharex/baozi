@@ -634,26 +634,28 @@ func (a *application) card(c *ui.Context, i int) {
 	if dragging {
 		bg = t.Accent.Alpha(0.22)
 	}
-	col := ui.Column(c).Width(cardWidth).Padding(4, 4).Gap(6).AlignItems(ui.Center).
+	col := ui.Column(c).Width(cardWidth).Padding(6, 4).Gap(6).AlignItems(ui.Center).Radius(12).
+		Background(bg).
 		OnClick(func() {
 			a.chosen = i
 			a.open()
 		}).
 		ContextMenu(func(m *ui.Menu) { a.itemMenu(m, i) }).
 		Children(func() {
-			// 底色块只包住图标（比图标各大 4 像素），不铺满整张卡：照用户给的启动器截图，
-			// 选中那块是贴着图标的一圈圆角底，名字在黑底上、不参与高亮。
+			// 底色块铺满整张卡（图标 + 名字都在里面），只是**不描边**：照用户给的启动器
+			// 截图，选中那张是一整块圆角底，名字也在块里。之前把底色只留给图标、名字晾在
+			// 外面，悬停时看着像"标题没被选中"。
 			//
-			// 盒子固定高度是为了让位图和线框的图标顶边、名字基线都对得齐（线框 SVG 的
+			// 图标盒固定高度是为了让位图和线框的图标顶边、名字基线都对得齐（线框 SVG 的
 			// 图形只占 24 网格的 18/24，不套盒子会小一圈、上下错开）。
-			ui.Row(c).Width(a.cardIcon() + 8).Height(a.cardIcon() + 4).Radius(12).Background(bg).
+			ui.Row(c).Width(a.cardIcon() + 8).Height(a.cardIcon()).
 				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				// 图标直接铺在块上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
+				// 图标直接铺在卡上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
 				// 辨识度，套个小方块只会把它压小、还多出一圈底色（见 cardIcon）。
 				a.resultIcon(c, r, a.cardIcon())
 			})
 			// 名字最多两行：一行放得下就只占一行，超了才往下续第二行。
-			ui.Text(c, wrapName(r.Name, cardWidth-10, 2)).FontSize(12).TextColor(t.Text).
+			ui.Text(c, wrapName(r.Name, cardWidth-12, 2)).FontSize(12).TextColor(t.Text).
 				TextAlign(ui.Center).MaxLines(2).LineHeight(1.2).Tooltip(r.Name)
 		})
 	// 鼠标停在哪张卡上，就等于选中哪张（Enter / 右键 / 底栏都作用在它身上）。
