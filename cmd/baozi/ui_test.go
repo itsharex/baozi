@@ -868,6 +868,32 @@ func TestShareP2PViewRenders(t *testing.T) {
 	dumpPreview(t, tester)
 }
 
+// 只收到一段文本的完成态：必须铺开、能复制，而不是只报一句"什么也没收到"。
+func TestShareP2PTextResultShot(t *testing.T) {
+	a := testApp(t)
+	s := &shareWindow{app: a, tab: 1}
+	a.cfg.Share.Signal = ""
+	s.signalInput = s.signalBase()
+	s.net = &netShare{
+		win:     s,
+		role:    "receiver",
+		stage:   p2pDone,
+		note:    "收到一段文本，可以直接复制走了",
+		via:     "直连",
+		gotText: "第一行：贴一条命令\n第二行：curl -fsSL https://example.com/x.sh | sh",
+	}
+
+	tester := ui.NewTester(s.view, 760, 720)
+	tester.Frame()
+	// TextArea 里那几行正文 HasText 抓不到（只读文本域不算文本节点），这里只钉结构与按钮。
+	for _, want := range []string{"收到的文本", "复制文本", "个字符", "再来一次"} {
+		if !tester.HasText(want) {
+			t.Fatalf("文本完成态缺少 %q", want)
+		}
+	}
+	dumpPreview(t, tester)
+}
+
 // 局域网页也能顺带发一段文本：停了共享的状态下必须有那个输入框，
 // 否则用户只会想到"把话存成 txt 再发"。
 func TestShareLocalTextInputShot(t *testing.T) {
