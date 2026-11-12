@@ -157,6 +157,11 @@ const (
 	MinPanelHeight     = 260
 	MaxPanelWidth      = 2400
 	MaxPanelHeight     = 1600
+
+	// DefaultSignal 是跨网互传的信令地址：Cloudflare Worker 的自有域名。
+	// workers.dev 那个默认域名在大陆会被 SNI 阻断（TCP 能连、TLS 握手就被掐），
+	// 所以绑了 1jia.life 下的子域名。换服务时在互传窗口里改，会记进配置。
+	DefaultSignal = "https://signal.1jia.life"
 )
 
 // PanelSize 返回配置里生效的面板宽高，越界或没配置时用默认值。

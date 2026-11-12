@@ -312,6 +312,37 @@ Go 侧一期**没有**照搬这套，落地的是"浏览器下载型"，理由�
 与 dashbeam 的差距（明确没做）：无 QUIC、无 NAT 打洞、无公网中继、无分块哈希与断点续传、无端到端加密
 （明文 HTTP + 一次性令牌，仅限可信局域网）。Windows 防火墙首次放行需用户点一次确认。
 
+## 6b. 跨网直传（WebRTC，已实现）
+
+局域网那套只在同一网段有用。跨网另起一条：`internal/p2p` + `signal/`（一个 Cloudflare Worker）。
+
+**分工**：局域网走 HTTP（对端零安装、浏览器下载）；跨网走 WebRTC（两端都要装 Baozi、要打洞）。
+两条路并存，互传窗口里用页签切换。
+
+**信令**：`signal/src/index.ts` 是一个 Worker + 一个 `Room` Durable Object。
+短码就是房间名，`idFromName(code)` 保证同一个码落进同一个实例，两端各挂一条 WebSocket，
+DO 只做纯转发（自己只发 `peer_joined` / `peer_left`）。免费计划限制是 **只能用 SQLite 后端的 DO**，
+所以 `wrangler.toml` 的 migration 必须是 `new_sqlite_classes = ["Room"]`。
+
+**为什么不用 workers.dev**：`*.workers.dev` 在大陆被 SNI 阻断（TCP 通、TLS 握手失败）。
+绑自有域名（`signal.1jia.life`）走 Anycast 就正常，这是实测出来的，不是猜的。
+
+**为什么不做 trickle ICE**：双方把候选收全了再塞进 SDP 一次性发过去，信令上只剩
+`offer` / `answer` 两条消息。多等一两秒，换掉"候选先到、描述后到"的乱序处理——
+那类 bug 只在特定网络下偶发，非常难查。
+
+**传输协议**：三种帧。
+1. 文本 `{"type":"manifest","items":[{"path","size"}]}`；
+2. 二进制 `[4 字节文件序号][32KB 数据]`——靠 SCTP 的有序可靠省掉偏移和逐块确认；
+3. 文本 `{"type":"done"}`。
+
+没有校验和：链路层已经管到字节级，再加一层只是自我安慰。
+发送端按 `dc.BufferedAmount()` 做反压（超过 1MB 就等），接收端按序号写盘。
+**路径必须清洗**（`cleanRel`）：对端构造 `../` 或 `C:` 都跳不出目标目录，重名自动加 `(1)`。
+
+**没做的**：TURN 中继。`Options.TURN` 留了口子，Cloudflare Realtime TURN 免费额度 1TB/月，
+需要在账号里生成短期凭证。对称 NAT 现在会直接报"两端网络都没打通"。
+
 ## 7. 读取文件管理器当前目录（对应 Lertaro `IActivePathCollector`）
 
 只读、不接管对方搜索。按目标进程分路：

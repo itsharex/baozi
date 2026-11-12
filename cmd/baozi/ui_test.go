@@ -700,8 +700,8 @@ func TestHoverTargetKeepsKeyboardChoice(t *testing.T) {
 func TestShareP2PViewRenders(t *testing.T) {
 	a := testApp(t)
 	s := &shareWindow{app: a, tab: 1}
-	a.cfg.Share.Signal = "https://baozi-signal.baozi.workers.dev"
-	s.signalInput = a.cfg.Share.Signal
+	a.cfg.Share.Signal = ""
+	s.signalInput = s.signalBase()
 	s.net = &netShare{win: s}
 	s.net.dir = `D:\Downloads`
 

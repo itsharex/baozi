@@ -2,6 +2,12 @@ name = "baozi-signal"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 
+# workers.dev 那个域名在大陆网络里会被 SNI 阻断（TCP 能连上，TLS 握手就被掐）。
+# 绑自己的域名走 Anycast，通常能通；实测不通时可以再换一个子域名试试。
+routes = [
+  { pattern = "signal.1jia.life", custom_domain = true }
+]
+
 # 免费计划只支持 SQLite 后端的 Durable Object，所以 migration 必须用 new_sqlite_classes。
 [[durable_objects.bindings]]
 name = "ROOM"

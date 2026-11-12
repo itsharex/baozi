@@ -142,7 +142,7 @@ func (s *shareWindow) startSend() {
 		s.win.Update(func() {})
 		return
 	}
-	base := strings.TrimSpace(s.app.cfg.Share.Signal)
+	base := s.signalBase()
 	if base == "" {
 		s.status = "先填信令服务地址（部署 signal 目录里的 Worker）"
 		s.win.Update(func() {})
@@ -177,7 +177,7 @@ func (s *shareWindow) startSend() {
 
 // startRecv 是接收方入口：拿对方的码连进去，把东西落到指定目录。
 func (s *shareWindow) startRecv() {
-	base := strings.TrimSpace(s.app.cfg.Share.Signal)
+	base := s.signalBase()
 	if base == "" {
 		s.status = "先填信令服务地址（部署 signal 目录里的 Worker）"
 		s.win.Update(func() {})
@@ -374,7 +374,7 @@ func (s *shareWindow) p2pTab(c *ui.Context, t *ui.Theme) {
 	n := s.net
 
 	if !s.signalLoaded {
-		s.signalInput = s.app.cfg.Share.Signal
+		s.signalInput = s.signalBase()
 		s.signalLoaded = true
 	}
 
@@ -592,4 +592,13 @@ func sanitizeCode(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// signalBase 是当前该用的信令地址：配置里填过就用它，没填过就用内置默认。
+// 空串只在用户把它删干净之后才可能出现，那时界面上会提示去填。
+func (s *shareWindow) signalBase() string {
+	if v := strings.TrimSpace(s.app.cfg.Share.Signal); v != "" {
+		return v
+	}
+	return config.DefaultSignal
 }
