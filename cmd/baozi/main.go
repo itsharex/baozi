@@ -40,18 +40,24 @@ import (
 )
 
 const (
-	panelWidth  = 720
-	panelHeight = 480
+	// 面板宽高的默认值。实际尺寸在 config.PanelSize() 里（设置页可改，0 = 用这两个），
+	// 保留成常量是因为视图测试和预览需要一块确定的画布。
+	panelWidth  = config.DefaultPanelWidth
+	panelHeight = config.DefaultPanelHeight
 
 	// 结果行左侧图标的尺寸不再写死：默认跟着系统缩放走，也能在设置里指定，
 	// 见 config.BaseIconSize / Config.IconSizeAt 与 application.iconSize。
 	// 之前是固定的 22 DIP，在 125% 缩放的屏上（这台机器就是）显得偏小。
 
-	// panelCols 是首页网格每行的卡片数：720 宽的面板，卡片 84 + 间距 6，一排 7 个。
-	// 方向键按行移动（上下各走一行）。
-	panelCols = 7
-	// cardWidth 是首页卡片宽度。图标最大 64 时仍然放得下（左右各留 6 的内边）。
-	cardWidth = 84
+	// cardWidth 是首页卡片宽度，cardGap 是卡片间距，cardGutter 是网格左右留白。
+	// 一排几张不写死：面板宽度可以改，列数按这三个数算（application.gridCols）。
+	cardWidth  = 84
+	cardGap    = 6
+	cardGutter = 18
+	// panelCols 是默认宽度（720）下一排的卡片数，只给测试与默认布局当基准用；
+	// 真正渲染时一律走 a.gridCols()。
+	panelCols = (panelWidth - 2*cardGutter + cardGap) / (cardWidth + cardGap)
+
 	// maxPinned 是首页「已固定」区最多显示几个。
 	maxPinned = 12
 
@@ -322,13 +328,14 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 	// 设置里把图标调大了，卡片跟着变高，落点判定也得跟着换，否则拖一格会跳两格。
 	// 行高 = 上下 padding 8 + 图标 + 图标与名字的间距 6 + 两行字 28.8 + 行间距 6。
 	rowStep := a.cardIcon() + 49
-	colShift := int(math.Round(float64(dx) / 90))
+	colStep := float32(cardWidth + cardGap)
+	colShift := int(math.Round(float64(dx) / float64(colStep)))
 	rowShift := int(math.Round(float64(dy) / float64(rowStep)))
 	if colShift == 0 && rowShift == 0 {
 		return nil
 	}
 	rel := from - recentTo
-	to := rel + colShift + rowShift*panelCols
+	to := rel + colShift + rowShift*a.gridCols()
 	if to < 0 {
 		to = 0
 	}
@@ -375,10 +382,11 @@ func (a *application) view(c *ui.Context) {
 		// 首页方向键不能走 Shortcut：搜索框有焦点时 TextInput 会把左右键吃掉
 		// （光标在移动、卡片选中却不动），表现就是"首页左右键失效"。
 		// 这里直接读按键按住状态做边沿检测——查询为空时光标动也没意义。
+		cols := a.gridCols()
 		a.keyStep(c, &a.heldLeft, ui.KeyLeft, -1)
 		a.keyStep(c, &a.heldRight, ui.KeyRight, +1)
-		a.keyStep(c, &a.heldUp, ui.KeyUp, -panelCols) // 网格：上下按一行走
-		a.keyStep(c, &a.heldDown, ui.KeyDown, +panelCols)
+		a.keyStep(c, &a.heldUp, ui.KeyUp, -cols) // 网格：上下按一行走
+		a.keyStep(c, &a.heldDown, ui.KeyDown, +cols)
 	} else {
 		if c.Shortcut(0, ui.KeyDown) {
 			a.choose(a.chosen + 1)
@@ -463,16 +471,18 @@ func (a *application) homeGrid(c *ui.Context) {
 		section := func(title string) {
 			ui.Text(c, title).FontSize(11).TextColor(t.TextMuted).Padding(10, 18, 3, 18)
 		}
-		// 不用 Grid：它的列宽是均分的，720 宽下每列 114，卡片 84 居中会左右各空 15，
-		// 看着"占位很大"。这里自己拼行，卡片固定 84、间距 6，一排刚好 7 个。
+		// 不用 Grid：它的列宽是均分的，相同宽度下每列会比卡片宽、卡片居中会左右各空一截，
+		// 看着"占位很大"。这里自己拼行：卡片固定 cardWidth、间距 cardGap，
+		// 一排几个由面板宽度算（gridCols），面板调宽调窄时列数自动跟着变。
+		cols := a.gridCols()
 		cards := func(from, to int) {
-			ui.Column(c).Gap(6).Padding(2, 18).Children(func() {
-				for start := from; start < to; start += panelCols {
-					end := start + panelCols
+			ui.Column(c).Gap(cardGap).Padding(2, cardGutter).Children(func() {
+				for start := from; start < to; start += cols {
+					end := start + cols
 					if end > to {
 						end = to
 					}
-					ui.Row(c).Gap(6).Children(func() {
+					ui.Row(c).Gap(cardGap).Children(func() {
 						for i := start; i < end; i++ {
 							a.card(c, i)
 						}
@@ -716,6 +726,14 @@ func (a *application) iconSize() float32 {
 	return a.cfg.IconSizeAt(a.scale)
 }
 
+// gridCols 是首页网格一排能放几张卡：由当前面板宽度算出，宽度一改列数跟着变。
+// 方向键"上下走一行"用的也是它，所以它和 homeGrid 的排布必须同源。
+func (a *application) gridCols() int {
+	w, _ := a.cfg.PanelSize()
+	n := (w - 2*cardGutter + cardGap) / (cardWidth + cardGap)
+	return max(1, n)
+}
+
 // cardIcon 是首页卡片里图标的边长。卡片 84 宽，图标按"结果行图标 ×2.2"放大
 // ——125% 缩放下结果行是 27.5、卡片就是 60.5，接近启动器那种"图标占满整格"的比例
 // （再大名字就只剩一行了）。上下都夹一下：太小认不出、太大名字没地方放。
@@ -807,7 +825,7 @@ func (a *application) appIcon(r search.Result, px int) *ui.Bitmap {
 	if a.offline {
 		return nil
 	}
-	data, _ := mygo.Shell.FileIcon(r.Path, px)
+	data, _ := mygo.Shell.FileIcon(iconPath(r.Path), px)
 	if trimmed, err := win.TrimIcon(data); err == nil {
 		data = trimmed
 	}
@@ -817,6 +835,25 @@ func (a *application) appIcon(r search.Result, px int) *ui.Bitmap {
 		a.icons[key] = bitmap
 	}
 	return bitmap
+}
+
+// iconPath 把应用条目的 Path 换成"取图标该用的那个路径"。
+//
+// 正常的应用条目 Path 是 shell:AppsFolder\<AUMID>，这个必须原样交给 Shell
+// （当成文件路径按扩展名取会拿到一个不相干的通用图标）。
+// 但历史里真的出现过 shell:AppsFolder\D:\Games\x\PCLauncher.exe 这种写法——
+// 前缀后面跟的是一个真路径。这时剥掉前缀按普通文件取图最靠谱，
+// 否则 Shell 会把它当一个不存在的 AUMID 去解析。
+func iconPath(p string) string {
+	const prefix = `shell:AppsFolder\`
+	if len(p) > len(prefix) && strings.EqualFold(p[:len(prefix)], prefix) {
+		rest := p[len(prefix):]
+		// 盘符开头的才是真路径；其余一律当 AUMID 交给 Shell。
+		if len(rest) >= 3 && rest[1] == ':' && (rest[2] == '\\' || rest[2] == '/') {
+			return rest
+		}
+	}
+	return p
 }
 
 // thumbable 判断这条结果要不要显示内容缩略图：图片、视频、PDF。
@@ -1452,7 +1489,10 @@ func (a *application) open() {
 			}
 		}
 	}
-	if err := mygo.Shell.OpenPath(r.Path); err != nil {
+	// 打开也走 iconPath：应用清单里找不到对应条目时，这条 Path 可能是
+	// "shell:AppsFolder\<真路径>" 的畸形写法，交给 Shell 解析会打不开，
+	// 剥成普通路径反而能正常启动。正常 AUMID 不受影响（iconPath 原样返回）。
+	if err := mygo.Shell.OpenPath(iconPath(r.Path)); err != nil {
 		log.Printf("打开 %s: %v", r.Path, err)
 	}
 }
@@ -1583,6 +1623,21 @@ func historyKind(k search.Kind) history.Kind {
 	return history.KindFile
 }
 
+// applyPanelSize 把配置里的面板尺寸立刻用到窗口上（设置页保存后调用，不用重启）。
+// 面板每次 show 都会按当时的 Size 重新居中，所以这里只要改尺寸；万一面板正开着，
+// 顺手也挪一次，免得改完还挂在旧位置、只往右下长。
+func (a *application) applyPanelSize() {
+	if a.panel == nil {
+		return
+	}
+	w, h := a.cfg.PanelSize()
+	a.panel.SetSize(w, h)
+	if a.panel.IsVisible() {
+		d := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint())
+		a.panel.SetPosition(d.WorkArea.X+(d.WorkArea.Width-w)/2, d.WorkArea.Y+(d.WorkArea.Height-h)/3)
+	}
+}
+
 // show 在鼠标所在显示器居中偏上位置显示面板。
 func (a *application) show() {
 	if a.cfg.Hotkey.DisableInFullscreen && win.ForegroundInfo().Fullscreen {
@@ -1634,6 +1689,9 @@ func (a *application) ready() {
 	// 所以放这里算一次缓存住，视图里不再现问。
 	a.scale = screenScale()
 
+	// 面板宽高来自配置（设置页可改），这里只在启动时读一次；
+	// 设置页保存后会调 applyPanelSize 立刻 SetSize，不用重启。
+	pw, ph := a.cfg.PanelSize()
 	a.panel = mygo.NewWindow(mygo.WindowOptions{
 		Title:         "Baozi",
 		Panel:         true,
@@ -1642,8 +1700,8 @@ func (a *application) ready() {
 		Transparent:   true,
 		Vibrancy:      mygo.VibrancyGlass,
 		CornerRadius:  16,
-		Width:         panelWidth,
-		Height:        panelHeight,
+		Width:         pw,
+		Height:        ph,
 		DisableResize: true,
 		Content:       ui.View(a.view),
 	})

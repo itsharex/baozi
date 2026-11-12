@@ -179,6 +179,9 @@ func TestCardIconPreview(t *testing.T) {
 		`C:\Windows\System32\mstsc.exe`,
 		`C:\Windows\System32\calc.exe`,
 		`C:\Windows\System32\Taskmgr.exe`,
+		// 这张是"白底 tile + 小 logo"那类图标（游戏启动器常见），
+		// 以前 trim 不掉留白，卡片里就成了白框小图标。放进预览当回归样本。
+		`D:\Games\ywzh_launcher\Win64Release\PCLauncher\PCLauncher.exe`,
 	}
 	// 缓存键要跟 appIcon 算出来的一字不差：它把 size*2.2 再乘一次缩放。
 	px := int(float32(int(a.cardIcon()*2.2)) * a.scale)
@@ -204,13 +207,15 @@ func TestCardIconPreview(t *testing.T) {
 		{Item: search.Item{Name: "远程桌面连接", Path: exes[2], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
 		{Item: search.Item{Name: "计算器", Path: exes[3], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
 		{Item: search.Item{Name: "任务管理器", Path: exes[4], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
+		{Item: search.Item{Name: "遗忘之海", Path: exes[5], Ext: ".exe", Kind: search.KindFile, Hint: `D:\Games\ywzh_launcher\Win64Release\PCLauncher`}},
 		{Item: search.Item{Name: "文档", Path: `D:\docs`, Kind: search.KindDir, Hint: `D:\`}},
 		{Item: search.Item{Name: "会议记录.txt", Path: `D:\docs\会议记录.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `D:\docs`}},
 	}
 	a.pinnedCount = len(a.results)
 	a.choose(0)
 
-	tst := ui.NewTester(a.view, panelWidth, panelHeight)
+	pw, ph := a.cfg.PanelSize()
+	tst := ui.NewTester(a.view, pw, ph)
 	tst.Frame()
 	for _, want := range []string{"记事本", "画图", "文档", "会议记录.txt"} {
 		if _, ok := tst.Find(want); !ok {

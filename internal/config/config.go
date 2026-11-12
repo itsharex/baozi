@@ -18,6 +18,7 @@ type Config struct {
 	Index    Index     `json:"index"`
 	History  History   `json:"history"`
 	Share    Share     `json:"share"`
+	Panel    Panel     `json:"panel"`
 	Commands []Command `json:"commands"`
 	// DialogFollow 打开"文件对话框跟着文件管理器走"：另存为框开着时去资源管理器换目录，
 	// 再切回那个框，路径自动变成新目录（Lertaro / Listary 的行为）。
@@ -131,6 +132,40 @@ func (c *Config) IconSizeAt(scale float32) float32 {
 // ThumbnailsOn 报告是否显示缩略图：没配置过默认开。
 func (c *Config) ThumbnailsOn() bool {
 	return c.Search.Thumbnails == nil || *c.Search.Thumbnails
+}
+
+// Panel 控制快速面板的尺寸。"快速面板"是一块固定大小、居中弹出的玻璃面板，
+// 以前宽高写死在 main.go 里（720×480）。屏幕大小和用途差别太大——1080p 上用 720 宽
+// 挺合适，4K 上就显小，光标手写板/竖屏上又太宽——所以放开成配置项。
+type Panel struct {
+	// Width / Height 是逻辑像素（DIP）。0 或没配置表示用默认值。
+	Width  int `json:"width,omitempty"`
+	Height int `json:"height,omitempty"`
+}
+
+// 面板尺寸的默认值与上下限。下限保证能看见至少一行结果 + 顶栏底栏；
+// 上限只是防止填错把面板撑出屏幕（多屏/超大屏用户自己按实际填）。
+const (
+	DefaultPanelWidth  = 720
+	DefaultPanelHeight = 480
+	MinPanelWidth      = 420
+	MinPanelHeight     = 260
+	MaxPanelWidth      = 2400
+	MaxPanelHeight     = 1600
+)
+
+// PanelSize 返回配置里生效的面板宽高，越界或没配置时用默认值。
+func (c *Config) PanelSize() (w, h int) {
+	w, h = c.Panel.Width, c.Panel.Height
+	if w <= 0 {
+		w = DefaultPanelWidth
+	}
+	if h <= 0 {
+		h = DefaultPanelHeight
+	}
+	w = max(MinPanelWidth, min(w, MaxPanelWidth))
+	h = max(MinPanelHeight, min(h, MaxPanelHeight))
+	return w, h
 }
 
 // Weights 三项权重，内部会归一化，不需要凑成 1。

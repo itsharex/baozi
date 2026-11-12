@@ -8,6 +8,30 @@ import (
 )
 
 // 图标尺寸的缺省语义：没配置就跟着系统缩放，配了就照配置（不再乘缩放）。
+// 面板尺寸：没配置走默认 720×480；填了就照填的来，越界夹到上下限。
+// 夹取的目的是"填错也别把面板撑出屏幕或缩成一条缝"。
+func TestPanelSize(t *testing.T) {
+	var c Config
+	if w, h := c.PanelSize(); w != DefaultPanelWidth || h != DefaultPanelHeight {
+		t.Fatalf("默认应为 %d×%d，实际 %d×%d", DefaultPanelWidth, DefaultPanelHeight, w, h)
+	}
+
+	c.Panel.Width, c.Panel.Height = 1200, 900
+	if w, h := c.PanelSize(); w != 1200 || h != 900 {
+		t.Fatalf("填了 1200×900 应原样生效，实际 %d×%d", w, h)
+	}
+
+	c.Panel.Width, c.Panel.Height = 100, 100
+	if w, h := c.PanelSize(); w != MinPanelWidth || h != MinPanelHeight {
+		t.Fatalf("过小应夹到 %d×%d，实际 %d×%d", MinPanelWidth, MinPanelHeight, w, h)
+	}
+
+	c.Panel.Width, c.Panel.Height = 9999, 9999
+	if w, h := c.PanelSize(); w != MaxPanelWidth || h != MaxPanelHeight {
+		t.Fatalf("过大应夹到 %d×%d，实际 %d×%d", MaxPanelWidth, MaxPanelHeight, w, h)
+	}
+}
+
 func TestIconSizeAt(t *testing.T) {
 	var c Config
 	if got := c.IconSizeAt(1); got != BaseIconSize {

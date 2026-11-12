@@ -964,6 +964,7 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 | 页签 / 分区 | 控件 | 写回字段 |
 |---|---|---|
 | 常规·唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
+| 常规·面板尺寸 | 两个 `NumberInput`（宽 420~2400 / 高 260~1600，步长 20）＋ 右侧实时换算「一排 N 列、约 M 行；物理 W×H」 | `panel.width` / `panel.height` |
 | 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
 | 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`NumberInput`（图标大小）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.iconSize` / `search.thumbnails` |
 | 常规·索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
@@ -1058,7 +1059,7 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 
 | Pane 的做法 | Baozi 的落点 |
 |---|---|
-| 首页是图标网格，「最近使用」+「已固定」两段，不是空白也不是纯列表 | `application.homeGrid()`：自己拼行（卡片 84 + 间距 6，一排 7 个，`panelCols`），不用 `ui.Grid`——Grid 均分列宽会让卡片左右各空 15；`pinnedCount` 记录 results 里属于「已固定」的后缀长度 |
+| 首页是图标网格，「最近使用」+「已固定」两段，不是空白也不是纯列表 | `application.homeGrid()`：自己拼行（卡片 84 + 间距 6，一排几个由 `gridCols()` 按面板宽度算，默认 720 → 7），不用 `ui.Grid`——Grid 均分列宽会让卡片左右各空一截；`pinnedCount` 记录 results 里属于「已固定」的后缀长度 |
 | 选中应用 `Ctrl+K` 固定到首页 | `application.togglePin()` + `history.Store.TogglePin()`；标记存 `Entry.Pinned`，`Pinned(n)` 取固定项，`trim()` 优先保留固定项 |
 | 底栏左边写「会做什么」，右边写键位 | `footer()` + `keyCap()`：左边 `打开 抖音` / `已固定 · 记事本`，右边三组键帽 |
 | 选中行是「浅色胶囊 + 细边」 | `row()` 用 `Accent.Alpha(0.16)` 底 + `Accent.Alpha(0.5)` 1px 边；名称 14 粗、路径 11 灰 |
@@ -1076,7 +1077,8 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 （还压在行自己的背景上）。要让「浅色胶囊 + 细边」成立，就把 `Selected` 留空（`a.list.Selected = nil`），
 选中由 `row()` 自己画，滚动仍然靠 `choose()` 里的 `ScrollIntoView`。
 
-**首页方向键按行移动**：网格一行 6 个，`↑`/`↓` 走 `±panelCols`，`←`/`→` 走 `±1`；
+**首页方向键按行移动**：网格一行几个由 `gridCols()` 决定（默认面板 720 宽时是 7），
+`↑`/`↓` 走 `±gridCols()`，`←`/`→` 走 `±1`；
 有查询时回到单列语义（`±1`）。这一条写在 `view()` 的 `home := a.query == ""` 分支里。
 
 **没有抄的部分**：剪贴板历史、鼠标手势、超级面板、AI、批量重命名、定时关机、`Tab` 展开的三栏文件窗口
@@ -1170,6 +1172,55 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 125% 屏上结果行的默认样子；`BAOZI_SCALE=1` 再跑一次即得 100% 的对照。
 卡片网格另有 `TestCardIconPreview`：它用 `win.Thumbnail` 取真实 `.exe` 图标塞进缓存再渲染
 （`appIcon` 现在先查缓存再问 Shell，所以离线也能命中），跑出来的就是真机上首页的样子。
+`BAOZI_PANEL_W` / `BAOZI_PANEL_H` 可以在预览里换面板尺寸，顺便验证列数跟着变。
+
+### 图标为什么曾经是"白框里一个小图标"（`win.TrimIcon`）
+
+用户报过：首页卡片上「遗忘之海」显示成一个方形浅灰细框 + 白底 + 中间一个小 logo，
+而游戏启动器里它是满格的彩色图标。`win.Thumbnail` 拿这个 exe 的图标一验，**位图本身就长这样**。
+
+拆开看那张 200×200 的 PNG：
+
+- 四角 `alpha` 只有 58~64（约 23%~25%），是 Windows tile 图标自带的一圈**淡阴影**；
+- 中间 logo 区 `alpha` 是 255；
+- 两者之间是 `(0,0,0,0)` 的纯透明。
+
+旧的裁边只按 `alpha > 1.6%` 找内容边界。那圈 25% 的淡阴影跨过了门槛，于是 bbox 等于整张图，
+**一个像素都裁不掉**——图形只占中间一小块，显示出来就是"白框小图标"。`flatCut` 单独也救不了：
+阴影不是纯色平板，每行颜色都在渐变。
+
+修法是两级门槛：
+
+1. `alphaCut` 先按 `solidAlpha = 30%`（`0x5000`）找"实心内容"的外接框——这刚好跨过那圈淡阴影；
+2. 实心区找不到（半透明描边图标）才退回老的 1.6% 门槛；
+3. 之后再叠 `flatCut`：从四边往里裁"整行/整列颜色一致"的不透明平板边（真正的白底/灰 tile 边框）。
+   判据是**行内自洽**而不是"等于角落色"，这样"白底 + 浅灰边框"两层能逐层剥掉；
+   两条保护：整张几乎一个颜色（纯色方块图标）就原样返回，裁到剩不到 15% 也当作裁过头退回。
+
+实测 `PCLauncher.exe`：裁前 8149 字节（白框小图）→ 裁后 6549 字节，图形铺满整格。
+单测：`TestTrimIconCentersContent`（透明边 + 居中）、`TestTrimIconTrimsOpaqueTile`（128 的白底+灰框被裁到 logo 大小）、
+`TestTrimIconKeepsSolidSquare`（纯色方块不许被裁小）、`TestTrimIconRejectsBlank`。
+
+配套还有一条：历史里出现过 `shell:AppsFolder\D:\Games\x\PCLauncher.exe` 这种**畸形 Path**
+（前缀后面跟的是真路径，不是 AUMID）。`iconPath()` 会把这类剥成普通路径再取图标，
+其余 `shell:AppsFolder\<AUMID>` 原样交给 Shell——按扩展名当普通文件取只会拿到一个无关的通用图标。
+
+### 面板多大（`panel.width` / `panel.height`）
+
+面板尺寸过去是 `main.go` 里的两个常量（720×480），`WindowOptions.DisableResize: true`。
+4K 屏上嫌小、笔记本竖屏上嫌宽，而且首页一排固定 7 张卡，宽窄都不跟着变。
+
+- `config.Panel{Width, Height}`（json `panel`），0 或缺省 = 默认 720×480；
+- `Config.PanelSize()` 夹到 420~2400 / 260~1600，越界的数存盘前就夹好，配置文件里不会躺一个永远不生效的值；
+- `ready()` 建窗时读一次；设置页「面板尺寸」保存后调 `application.applyPanelSize()`（`SetSize` +
+  可见时按新尺寸重新居中），**不用重启**——`show()` 本来每次唤出都按当时的 `Size()` 重新居中；
+- **列数不再是常量**：`application.gridCols()` = `(宽 - 2*cardGutter + cardGap) / (cardWidth + cardGap)`，
+  720 → 7 列、1200 → 13 列、480 → 5 列。`homeGrid()` 的排布、`pinMoveFor()` 的行列换算、
+  `↑`/`↓` 的步长全部走它，三者必须同源，否则"一排看得到 13 个、方向键却跳 7 格"。
+- `panelCols` 常量只留作"默认宽度下的列数"，给测试和默认布局当基准。
+
+设置页右侧实时算给用户看："一排 7 列、约 10 行；物理 900×600"（物理值乘系统缩放）。
+`TestGridColsFollowsPanelWidth`、`TestPanelSize` 钉住换算与夹取。
 
 ### 已固定区的拖动排序
 
@@ -1181,9 +1232,10 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 - **`Draggable` 的 offset 指针必须跨帧稳定**：`pinDragPts map[int]*ui.Point` 按卡片缓存指针，
   每帧新建一个 `Point` 会把拖动中的卡片拽回原位。结算前要 `*pt = ui.Point{}` 归零，
   否则卡片会粘在拖到的位置；重排后 `pinDragPts` 整表清空，避免旧下标对上新的卡片。
-- **位移怎么换算成落点**：卡片 84 宽 + 行内间距 6 = 一列 90 DIP；卡片高约 83 + 行距 6 = 一行 89 DIP。
-  `round(dx/90)` 加 `round(dy/89)*panelCols` 就是"挪了几格"，再夹到 `[0, pinnedCount-1]`。
-  这两个数字必须和 `card()`、`homeGrid()` 保持一致，改布局时一起改。
+- **位移怎么换算成落点**：一列 = 卡片 84 + 间距 6 = `cardWidth + cardGap`（90 DIP），
+  一行 = `cardIcon() + 49`（图标 + 上下 padding + 间距 + 两行字 + 行距，默认约 89）。
+  `round(dx/90)` 加 `round(dy/行高) * gridCols()` 就是"挪了几格"，再夹到 `[0, pinnedCount-1]`。
+  这几个数字必须和 `card()`、`homeGrid()` 保持一致，改布局时一起改。
 
 `Draggable` 的语义是"元素跟着指针走、松手才停"，所以拖动期间其它卡片不会让位——
 出现的是"被拖的卡片盖住目标位"的观感，松手后整段重排。测试 `TestPinDragReorders` 用

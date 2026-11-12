@@ -44,6 +44,10 @@ type settingsWindow struct {
 	includeHidden bool
 	rescanMinutes float64
 
+	// 面板尺寸（DIP）。以前写死 720×480，4K 屏上嫌小、竖屏上嫌宽。
+	panelW float64
+	panelH float64
+
 	// 文件对话框跟随：总开关 + 每一种目录来源各一个勾选
 	followOn    bool
 	srcExplorer bool
@@ -119,6 +123,11 @@ func (s *settingsWindow) load() {
 	s.includeHidden = cfg.Index.IncludeHidden
 	s.rescanMinutes = float64(cfg.Index.RescanMinutes)
 
+	// 面板尺寸：配置里没填就用默认值，输入框里显示的就是当前生效的尺寸。
+	pw, ph := cfg.PanelSize()
+	s.panelW = float64(pw)
+	s.panelH = float64(ph)
+
 	s.followOn = cfg.DialogFollowOn()
 	s.srcExplorer = cfg.PathSourceEnabled(win.SourceExplorer)
 	s.srcTotalCmd = cfg.PathSourceEnabled(win.SourceTotalCmd)
@@ -169,6 +178,7 @@ func (s *settingsWindow) view(c *ui.Context) {
 			ui.Scroll(c).Grow(1).Children(func() {
 				ui.Column(c).Padding(24, 24).Gap(22).Children(func() {
 					s.hotkeySection(c, t)
+					s.panelSection(c, t)
 					s.followSection(c, t)
 					s.rankSection(c, t)
 					s.indexSection(c, t)
@@ -257,6 +267,41 @@ func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 		ui.Text(c, "缩略图在后台取，取到才替换掉线框图标，不会拖慢唤出。"+
 			"关掉后一律用单色线框图标（系统没有缩略图提供者的文件本来也只有线框）。").FontSize(11).TextColor(t.TextMuted)
 	})
+}
+
+// panelSection 控制快速面板的大小。以前宽高写死在 main.go 里（720×480）：
+// 4K 屏上嫌小、笔记本竖屏上嫌宽，而且首页一排固定 7 张卡，面板宽窄都不跟着变。
+func (s *settingsWindow) panelSection(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Gap(10).Children(func() {
+		sectionTitle(c, t, "面板尺寸", "逻辑像素（DIP）。保存后立刻按新尺寸重新居中，不用重启")
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "宽").FontSize(12).TextColor(t.TextMuted)
+			ui.NumberInput(c, &s.panelW, config.MinPanelWidth, config.MaxPanelWidth, 20).Width(110)
+			ui.Text(c, "高").FontSize(12).TextColor(t.TextMuted)
+			ui.NumberInput(c, &s.panelH, config.MinPanelHeight, config.MaxPanelHeight, 20).Width(110)
+			ui.Text(c, s.panelPreview()).FontSize(11).TextColor(t.TextMuted)
+		})
+		ui.Text(c, "宽度决定首页一排放几列卡片（每列 "+fmt.Sprintf("%d", cardWidth+cardGap)+
+			" 像素），高度决定露出几行结果。屏幕缩放 125% 时，物理像素会再乘 1.25。").
+			FontSize(11).TextColor(t.TextMuted)
+	})
+}
+
+// panelPreview 把当前填的宽高翻译成看得懂的结果，省得用户来回改着试。
+func (s *settingsWindow) panelPreview() string {
+	w := int(s.panelW)
+	cols := (w - 2*cardGutter + cardGap) / (cardWidth + cardGap)
+	cols = max(1, cols)
+	scale := float64(s.app.scale)
+	if scale <= 0 {
+		scale = 1
+	}
+	// 结果行行高约 38（图标 27.5 + 两列文字中较高的那列），顶栏底栏约 100，
+	// 这里只给个大概：能看见几行。
+	rows := int(s.panelH/38 - 2)
+	rows = max(1, rows)
+	return fmt.Sprintf("一排 %d 列、约 %d 行；物理 %.0f×%.0f", cols, rows,
+		s.panelW*scale, s.panelH*scale)
 }
 
 func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
@@ -555,6 +600,14 @@ func (s *settingsWindow) save() {
 	cfg.Index.IncludeHidden = s.includeHidden
 	cfg.Index.RescanMinutes = int(s.rescanMinutes)
 
+	// 面板尺寸：填 0 或超范围时 PanelSize() 会夹到合法值，存的就是夹过之后的数，
+	// 免得配置文件里躺着一个永远不生效的数字。
+	cfg.Panel.Width = int(s.panelW)
+	cfg.Panel.Height = int(s.panelH)
+	s.panelW = float64(max(config.MinPanelWidth, min(cfg.Panel.Width, config.MaxPanelWidth)))
+	s.panelH = float64(max(config.MinPanelHeight, min(cfg.Panel.Height, config.MaxPanelHeight)))
+	cfg.Panel.Width, cfg.Panel.Height = int(s.panelW), int(s.panelH)
+
 	// 自定义命令：先把编辑器里的文本写回，再归一化 —— 激活词去重、
 	// 空壳条目（新建后没填程序的）不落盘，免得配置里留一堆跑不起来的命令。
 	s.commitCommandEditor()
@@ -628,6 +681,8 @@ func (s *settingsWindow) save() {
 	s.app.restartHook()
 	// 跟随器的总开关 / 来源勾选：不重启进程，改完立刻按新配置走。
 	s.app.syncFollow()
+	// 面板尺寸同理：直接 SetSize，不用重启；下次唤出会按新尺寸重新居中。
+	s.app.applyPanelSize()
 
 	rootsDirty := rootsChanged(oldRoots, cfg.Index.Roots)
 	if rootsDirty {

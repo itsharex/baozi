@@ -34,6 +34,18 @@ func testApp(t *testing.T) *application {
 	dir := t.TempDir()
 	cfg := config.Default()
 	cfg.Index.Roots = []string{dir}
+	// BAOZI_PANEL_W / BAOZI_PANEL_H 用来在预览里试"面板调大之后长什么样"，
+	// 顺手也验证了列数、方向键换算都跟着宽度走。不设就是默认 720×480。
+	if v := os.Getenv("BAOZI_PANEL_W"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Panel.Width = n
+		}
+	}
+	if v := os.Getenv("BAOZI_PANEL_H"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Panel.Height = n
+		}
+	}
 	h, err := history.Open(filepath.Join(dir, "history.json"), 50, 0)
 	if err != nil {
 		t.Fatalf("history: %v", err)
@@ -327,6 +339,28 @@ func TestCtrlKPinsFromKeyboard(t *testing.T) {
 }
 
 // 首页方向键按行移动（一行 panelCols 个）。
+// 面板宽度可配置之后，一排几张卡要跟着变——不只是"能不能塞下"，方向键按行移动、
+// 拖动换位也都吃这个数，所以三者必须同源。这里钉住换算本身。
+func TestGridColsFollowsPanelWidth(t *testing.T) {
+	a := &application{cfg: &config.Config{}}
+	if got := a.gridCols(); got != panelCols {
+		t.Fatalf("默认 %d 宽时应为 %d 列，实际 %d", panelWidth, panelCols, got)
+	}
+	a.cfg.Panel.Width = 1200
+	if got := a.gridCols(); got != 13 {
+		t.Fatalf("1200 宽时一排 13 列，实际 %d", got)
+	}
+	a.cfg.Panel.Width = 480
+	if got := a.gridCols(); got != 5 {
+		t.Fatalf("480 宽时一排 5 列，实际 %d", got)
+	}
+	// 再窄也得留一列，否则首页网格会一行都不画（那是彻底的空白）。
+	a.cfg.Panel.Width = config.MinPanelWidth
+	if got := a.gridCols(); got < 1 {
+		t.Fatalf("极窄面板也至少要 1 列，实际 %d", got)
+	}
+}
+
 func TestHomeGridArrowMovesByRow(t *testing.T) {
 	a := testApp(t)
 	for i := 0; i < 10; i++ {
@@ -614,4 +648,27 @@ func TestIconPreviewShot(t *testing.T) {
 		t.Fatal("图标尺寸算成了 0，那样什么都画不出来")
 	}
 	t.Logf("缩放 %v，图标 %.1f", a.scale, a.iconSize())
+}
+
+// iconPath 只剥"shell:AppsFolder\ + 真路径"这种畸形写法；正常 AUMID 必须原样
+// 交给 Shell（按扩展名当文件取图标会拿到一个不相干的通用图标）。
+func TestIconPathStripsFilePrefix(t *testing.T) {
+	aumid := `shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App`
+	if got := iconPath(aumid); got != aumid {
+		t.Fatalf("正常 AUMID 不该被改：%q", got)
+	}
+	bad := `shell:AppsFolder\D:\Games\ywzh_launcher\Win64Release\PCLauncher\PCLauncher.exe`
+	want := `D:\Games\ywzh_launcher\Win64Release\PCLauncher\PCLauncher.exe`
+	if got := iconPath(bad); got != want {
+		t.Fatalf("畸形路径应剥成 %q，实际 %q", want, got)
+	}
+	plain := `C:\Windows\System32\notepad.exe`
+	if got := iconPath(plain); got != plain {
+		t.Fatalf("普通路径不该被改：%q", got)
+	}
+	// 大小写不同也要认（前缀是 Word 拼出来的，别指望大小写稳定）。
+	upper := `SHELL:APPSFOLDER\D:\a\b.exe`
+	if got := iconPath(upper); got != `D:\a\b.exe` {
+		t.Fatalf("前缀大小写不同也应剥掉，实际 %q", got)
+	}
 }
