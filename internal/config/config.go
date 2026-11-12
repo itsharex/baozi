@@ -86,6 +86,11 @@ type Share struct {
 	// TTLMinutes 是分享链接的有效期（分钟），默认 60。到点自动失效——
 	// 分享是一次性的临时通道，不做"只要不停止就一直挂着"。
 	TTLMinutes int `json:"ttlMinutes"`
+	// Signal 是跨网互传的信令服务地址，形如 https://baozi-signal.xxx.workers.dev。
+	// 留空 = 没配跨网，界面上只给局域网那一半。
+	//
+	// 它只在建连时用一次：两端交换各自的 SDP，之后文件走 WebRTC 直连，不经过它。
+	Signal string `json:"signal"`
 }
 
 // Hotkey 控制唤出方式。

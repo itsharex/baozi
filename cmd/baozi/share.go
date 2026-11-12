@@ -32,6 +32,15 @@ type shareWindow struct {
 	// pending 是"还没点开始共享"时先攒着的条目：先挑文件，再生成链接。
 	pending []share.Item
 
+	// tab 是当前那一页：0 = 局域网链接（原来那条路），1 = 跨网直传。
+	tab int
+	// net 是跨网那一半的状态机，见 share_p2p.go。
+	net *netShare
+	// signalInput 是信令地址输入框绑的值；loaded 保证只从配置里灌一次，
+	// 别把用户正在输入的内容冲掉。
+	signalInput  string
+	signalLoaded bool
+
 	status string
 }
 
@@ -194,13 +203,25 @@ func (s *shareWindow) view(c *ui.Context) {
 		ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "文件互传").FontSize(20).Bold()
-				ui.Text(c, "局域网直连，不经过云端；生成一条带有效期的临时链接，到期自动失效").FontSize(11).TextColor(t.TextMuted)
+				if s.tab == 1 {
+					ui.Text(c, "跨网直连（WebRTC）：两端各跑一个 Baozi，用 6 位短码配对，文件不经过任何云盘中转").
+						FontSize(11).TextColor(t.TextMuted)
+				} else {
+					ui.Text(c, "局域网直连，不经过云端；生成一条带有效期的临时链接，到期自动失效").FontSize(11).TextColor(t.TextMuted)
+				}
 			})
+		})
+		ui.Row(c).Padding(0, 24).Children(func() {
+			ui.Tabs(c, &s.tab, "局域网链接", "跨网直传")
 		})
 		ui.Divider(c)
 
 		ui.Scroll(c).Grow(1).Children(func() {
 			ui.Column(c).Padding(24, 24).Gap(18).Children(func() {
+				if s.tab == 1 {
+					s.p2pTab(c, t)
+					return
+				}
 				s.bindRow(c, t)
 				s.ttlRow(c, t)
 				ui.Divider(c)
@@ -229,6 +250,10 @@ func (s *shareWindow) view(c *ui.Context) {
 				go s.pickFolder()
 			}
 			ui.Text(c, s.status).FontSize(11).TextColor(t.TextMuted).Grow(1).SingleLine()
+			// 跨网那条路的启停按钮在页面里，底栏只留"加东西"。
+			if s.tab == 1 {
+				return
+			}
 			switch {
 			case s.session == nil:
 				if ui.PrimaryButton(c, "生成链接").Clicked() {

@@ -694,3 +694,25 @@ func TestHoverTargetKeepsKeyboardChoice(t *testing.T) {
 		t.Fatalf("指针移动应接管为 3，实际 %d", got)
 	}
 }
+
+// 跨网那一页要有自己的样子：两个页签、信令地址、发送/接收两栏。
+// 这里渲染它，并在设置 BAOZI_PREVIEW 时出图，肉眼核对有没有挤在一起。
+func TestShareP2PViewRenders(t *testing.T) {
+	a := testApp(t)
+	s := &shareWindow{app: a, tab: 1}
+	a.cfg.Share.Signal = "https://baozi-signal.baozi.workers.dev"
+	s.signalInput = a.cfg.Share.Signal
+	s.net = &netShare{win: s}
+	s.net.dir = `D:\Downloads`
+
+	tester := ui.NewTester(s.view, 760, 680)
+	tester.Frame()
+	for _, want := range []string{
+		"局域网链接", "跨网直传", "信令服务", "生成短码", "开始接收", "保存到",
+	} {
+		if !tester.HasText(want) {
+			t.Fatalf("跨网页缺少 %q", want)
+		}
+	}
+	dumpPreview(t, tester)
+}
