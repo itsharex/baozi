@@ -16,6 +16,67 @@ import (
 	"time"
 )
 
+// 断点续传：下载走 http.ServeContent，文件请求带 Range 必须回 206 + Content-Range。
+//
+// 这条不是"照着 fsend 抄的"，而是确认我们现在就有：视频/大文件下到一半断网，
+// 浏览器自己会从断点继续要（Range 请求），服务端只要照规矩回 206 就行。
+// 目录是边压边写的 zip 流，天生没法 seek，续传不了 —— 这一条也写在这里，
+// 免得以后有人以为"文件夹也能续"。
+func TestDownloadSupportsRangeResume(t *testing.T) {
+	dir := t.TempDir()
+	// 12 字节，取中间一段最容易看出偏移对不对。
+	src := filepath.Join(dir, "chunk.bin")
+	const content = "0123456789ab"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Start("", 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Stop()
+	// 只加一项：首页会 302 直接跳到下载，Range 请求打到的是同一个处理函数。
+	s.Add(src)
+	client := &http.Client{
+		Transport:     &http.Transport{Proxy: nil},
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	dlURL := s.URL() + "d/chunk.bin"
+
+	req, _ := http.NewRequest("GET", dlURL, nil)
+	req.Header.Set("Range", "bytes=4-7")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET 带 Range: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("带 Range 的下载应回 206，实际 %d", resp.StatusCode)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != content[4:8] {
+		t.Fatalf("续传片段不对：拿到 %q，期望 %q", got, content[4:8])
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "bytes 4-7/12" {
+		t.Fatalf("Content-Range = %q，期望 bytes 4-7/12", cr)
+	}
+
+	// 不带 Range 时服务端要声明支持（浏览器据此判断"能不能续"）。
+	plain, err := client.Do(func() *http.Request {
+		r, _ := http.NewRequest("GET", dlURL, nil)
+		return r
+	}())
+	if err != nil {
+		t.Fatalf("GET 不带 Range: %v", err)
+	}
+	defer plain.Body.Close()
+	if ar := plain.Header.Get("Accept-Ranges"); ar != "bytes" {
+		t.Fatalf("Accept-Ranges = %q，期望 bytes", ar)
+	}
+}
+
 // 这是一条真实往返：起服务 → 加文件 → 首页 → 下载 → 校验。
 //
 // 顺带把"只发不收"钉住：早先首页底部有个上传表单（对方可以把文件塞进本机收件箱），
