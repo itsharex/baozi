@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"baozi/internal/config"
@@ -40,6 +41,10 @@ type shareWindow struct {
 	// 别把用户正在输入的内容冲掉。
 	signalInput  string
 	signalLoaded bool
+
+	// textDraft 是"顺手发一段文本"的输入框。文本跟文件一样是互传的一等公民：
+	// 一条命令、一串地址、一份口令，存成 txt 再让对方去找文件就没意思了。
+	textDraft string
 
 	status string
 }
@@ -173,6 +178,11 @@ func (s *shareWindow) start() {
 	for _, it := range s.pending {
 		sess.Add(it.Path)
 	}
+	// 文本跟文件一起走这条链接：对方打开页面就能看见、能复制，不用下个 txt 再打开。
+	if text := strings.TrimSpace(s.textDraft); text != "" {
+		sess.SetText(text)
+		s.textDraft = ""
+	}
 	s.pending = nil
 	s.qrURL = ""
 	s.qr = nil
@@ -238,6 +248,12 @@ func (s *shareWindow) view(c *ui.Context) {
 			})
 		})
 
+		// 跨网这一页的按钮都在页面里自成一体（发送栏自带添加、接收栏自带开始），
+		// 底栏再摆一份只会让人犹豫点哪边，所以整条收掉。
+		if s.tab == 1 {
+			return
+		}
+
 		// 底部一条就够：左边放"加东西"的入口，中间状态，右边主操作。
 		// 和主面板的底栏同构（Pane 也是底部一条），不再上下叠两层按钮。
 		ui.Divider(c)
@@ -257,8 +273,13 @@ func (s *shareWindow) view(c *ui.Context) {
 			switch {
 			case s.session == nil:
 				if ui.PrimaryButton(c, "生成链接").Clicked() {
-					s.start()
-					s.win.Update(func() {})
+					if len(s.pending) == 0 && strings.TrimSpace(s.textDraft) == "" {
+						s.status = "先加文件，或者在下面写一段文本"
+						s.win.Update(func() {})
+					} else {
+						s.start()
+						s.win.Update(func() {})
+					}
 				}
 			case s.session.Breached():
 				// 输错太多次被自动停掉：换一个访问码重开。
@@ -345,9 +366,14 @@ func (s *shareWindow) bindRow(c *ui.Context, t *ui.Theme) {
 
 func (s *shareWindow) stoppedView(c *ui.Context, t *ui.Theme) {
 	ui.Text(c, "还没有生成分享链接。").FontSize(14)
-	ui.Text(c, "先把要分享的文件或文件夹加进来，再点下面的「生成链接」。"+
-		"链接有效期按上面选的（默认 1 小时），到点自动失效；对方打开就直接下载，文件夹会打包成 zip。").FontSize(12).TextColor(t.TextMuted)
+	ui.Text(c, "先把要分享的文件或文件夹加进来（也可以只写一段文本），再点下面的「生成链接」。"+
+		"链接有效期按上面选的（默认 1 小时），到点自动失效；对方打开就直接下载，文件夹会打包成 zip。").
+		FontSize(12).TextColor(t.TextMuted)
 	s.itemsView(c, t, "待分享")
+	// 只想递一句话的时候，一条链接比"存成 txt 让对方去找文件"直接得多。
+	ui.Text(c, "顺带发一段文本（可以不填）").FontSize(12).TextColor(t.TextMuted)
+	ui.TextArea(c, &s.textDraft).Height(72).FontSize(12).
+		Placeholder("贴一条命令、一个地址、一段口令…… 对方页面里点一下就复制走了")
 }
 
 // remainText 把剩余时间写成 12:34 / 45 秒 这种样子。
@@ -420,6 +446,10 @@ func (s *shareWindow) activeView(c *ui.Context, t *ui.Theme) {
 	})
 
 	s.itemsView(c, t, "正在分享")
+	if text := s.session.Text(); text != "" {
+		ui.Text(c, fmt.Sprintf("还带了一段文本（%d 个字符），对方页面里能直接复制", len([]rune(text)))).
+			FontSize(12).TextColor(t.TextMuted)
+	}
 }
 
 // itemsView 是"要分享的东西"这一块：没开始共享时显示候选，开始后显示正在分享的。

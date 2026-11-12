@@ -506,3 +506,47 @@ func TestStartDefaultAllNICs(t *testing.T) {
 		t.Fatalf("URL 的 IP 不是自动挑选的那个：%s（LANIP=%s）", got, LANIP())
 	}
 }
+
+// 局域网也能递文本：页面里直接摊开 + 复制按钮，而不是让人去下一个 txt。
+func TestLocalShareShowsText(t *testing.T) {
+	s, err := Start("", 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer s.Stop()
+
+	// 正文里带 HTML 尖括号和换行：必须转义，且换行不能丢。
+	const text = "第一行 <&> 尖括号\n第二行 curl -fsSL https://example.com/x.sh | sh"
+	s.SetText(text)
+	if got := s.Text(); got != text {
+		t.Fatalf("Text() 回读不一致: %q", got)
+	}
+
+	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 5 * time.Second}
+	resp, err := client.Get(s.URL())
+	if err != nil {
+		t.Fatalf("GET 首页: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	html := string(body)
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, html)
+	}
+	if strings.Contains(html, "对方还没有选择要分享的文件") {
+		t.Fatal("只发文本时不该提示“还没有选择文件”")
+	}
+	if !strings.Contains(html, `<button id="copytext">复制</button>`) {
+		t.Fatalf("页面缺少复制按钮:\n%s", html)
+	}
+	if !strings.Contains(html, "&lt;&amp;&gt;") {
+		t.Fatalf("文本里的尖括号没被转义:\n%s", html)
+	}
+	if strings.Contains(html, "<&>") {
+		t.Fatalf("未转义的原始尖括号泄漏进 HTML:\n%s", html)
+	}
+	if !strings.Contains(html, "第一行") || !strings.Contains(html, "第二行") {
+		t.Fatalf("文本内容没进页面:\n%s", html)
+	}
+}

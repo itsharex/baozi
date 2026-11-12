@@ -10,6 +10,85 @@ import (
 	"time"
 )
 
+// 只发一段文本也要走得通：文本不落盘，直接从通道上交给界面去显示和复制。
+// "互传"如果只认文件，一条命令、一串地址就得先存成 txt 再让对方翻下载目录。
+func TestLoopbackTransferCarriesText(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	offerer, answerer := newLoopbackPair(t, ctx)
+	defer offerer.Close()
+	defer answerer.Close()
+
+	want := "Baozi 文本互传\ncurl -fsSL https://example.com/x.sh | sh\n中文也不能坏"
+
+	var gotText string
+	var gotPaths []string
+	done := make(chan error, 1)
+	go func() {
+		paths, err := Receive(ctx, answerer.Channel(), t.TempDir(), func(s string) {
+			gotText = s
+		}, nil)
+		gotPaths = paths
+		done <- err
+	}()
+
+	// 让接收端先把 OnMessage 注册好，再开始发。
+	time.Sleep(100 * time.Millisecond)
+
+	if err := Send(ctx, offerer.Channel(), nil, want, nil); err != nil {
+		t.Fatalf("发送失败：%v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("接收失败：%v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("接收超时")
+	}
+
+	if gotText != want {
+		t.Fatalf("文本对不上：\n期望 %q\n实际 %q", want, gotText)
+	}
+	if len(gotPaths) != 0 {
+		t.Fatalf("只发文本不应该落任何文件，实际落了 %v", gotPaths)
+	}
+}
+
+// newLoopbackPair 建一对已经连通的本机 PeerConnection（只走 host 候选，不碰网络）。
+func newLoopbackPair(t *testing.T, ctx context.Context) (offerer, answerer *Peer) {
+	t.Helper()
+
+	offerer, err := New(Options{HostOnly: true})
+	if err != nil {
+		t.Fatalf("建 offer 方失败：%v", err)
+	}
+	answerer, err = New(Options{HostOnly: true})
+	if err != nil {
+		t.Fatalf("建 answer 方失败：%v", err)
+	}
+
+	offerSDP, err := offerer.CreateOffer()
+	if err != nil {
+		t.Fatalf("生成 offer 失败：%v", err)
+	}
+	answerSDP, err := answerer.AcceptOffer(offerSDP)
+	if err != nil {
+		t.Fatalf("收 offer 失败：%v", err)
+	}
+	if err := offerer.AcceptAnswer(answerSDP); err != nil {
+		t.Fatalf("收 answer 失败：%v", err)
+	}
+	if err := offerer.WaitOpen(ctx); err != nil {
+		t.Fatalf("offer 方通道没打开：%v", err)
+	}
+	if err := answerer.WaitOpen(ctx); err != nil {
+		t.Fatalf("answer 方通道没打开：%v", err)
+	}
+	return offerer, answerer
+}
+
 // 这条测的是最要命的一环：两条 PeerConnection 在真的握手里能不能开出通道、
 // 把一份目录原样搬过去。只走本机候选（HostOnly），不打 STUN、不依赖网络，
 // 所以它在断网环境下也必须过。
@@ -72,14 +151,14 @@ func TestLoopbackTransferCarriesFiles(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		paths, err := Receive(ctx, answerer.Channel(), dst, nil)
+		paths, err := Receive(ctx, answerer.Channel(), dst, nil, nil)
 		done <- result{paths, err}
 	}()
 
 	// 让接收端先把 OnMessage 注册好，再开始发。
 	time.Sleep(100 * time.Millisecond)
 
-	if err := Send(ctx, offerer.Channel(), []string{src}, nil); err != nil {
+	if err := Send(ctx, offerer.Channel(), []string{src}, "", nil); err != nil {
 		t.Fatalf("发送失败：%v", err)
 	}
 

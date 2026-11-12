@@ -14,6 +14,7 @@ import (
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"github.com/skip2/go-qrcode"
 )
 
 // 跨网互传：和局域网那条路并列的第二套通道。
@@ -52,6 +53,11 @@ type netShare struct {
 	prog  p2p.Progress
 	note  string // 出错原因，或者"传完了"这类结论
 	via   string // direct / relay：数据有没有绕道中继
+
+	// text 是这次顺带要发出去的一段文本；gotText 是收到的那段。
+	// 文本不落盘——它就是拿来复制的，铺开成界面上的一个框更顺手。
+	text    string
+	gotText string
 
 	cancel context.CancelFunc
 	win    *shareWindow
@@ -113,6 +119,20 @@ func (n *netShare) onProgress(p p2p.Progress) {
 	n.paint(false)
 }
 
+// setText 是 p2p 收到文本帧时的回调：文本一落地就叫界面重绘。
+func (n *netShare) setText(t string) {
+	n.mu.Lock()
+	n.gotText = t
+	n.mu.Unlock()
+	n.paint(true)
+}
+
+func (n *netShare) got() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.gotText
+}
+
 // reset 把上一次的痕迹清干净，供"再来一次"用。
 func (n *netShare) reset() {
 	n.set(func() {
@@ -122,6 +142,8 @@ func (n *netShare) reset() {
 		n.prog = p2p.Progress{}
 		n.note = ""
 		n.via = ""
+		n.text = ""
+		n.gotText = ""
 	})
 }
 
@@ -137,8 +159,9 @@ func (n *netShare) stop() {
 // startSend 是发送方入口：生成短码、连信令、等对方输码。
 func (s *shareWindow) startSend() {
 	items := s.list()
-	if len(items) == 0 {
-		s.status = "先添加要发送的文件或文件夹"
+	text := strings.TrimSpace(s.textDraft)
+	if len(items) == 0 && text == "" {
+		s.status = "先添加要发送的文件/文件夹，或者写一段文本"
 		s.win.Update(func() {})
 		return
 	}
@@ -169,10 +192,12 @@ func (s *shareWindow) startSend() {
 		n.note = "把这 6 位给对方，等它输进来"
 		n.prog = p2p.Progress{}
 		n.via = ""
+		n.text = text
+		n.gotText = ""
 	})
 	n.paint(true)
 
-	go n.send(ctx, base, paths, n.code)
+	go n.send(ctx, base, paths, text, n.code)
 }
 
 // startRecv 是接收方入口：拿对方的码连进去，把东西落到指定目录。
@@ -215,8 +240,8 @@ func (s *shareWindow) startRecv() {
 	go n.recv(ctx, base, code, n.dir)
 }
 
-// send 是发送方的整条流水线：等对方 → 出 offer → 收 answer → 传文件。
-func (n *netShare) send(ctx context.Context, base string, paths []string, code string) {
+// send 是发送方的整条流水线：等对方 → 出 offer → 收 answer → 传文本和文件。
+func (n *netShare) send(ctx context.Context, base string, paths []string, text, code string) {
 	sig, err := p2p.Dial(ctx, base, code, "sender")
 	if err != nil {
 		n.fail(err)
@@ -293,11 +318,17 @@ func (n *netShare) send(ctx context.Context, base string, paths []string, code s
 		n.note = "直连已建立，开始发送"
 	})
 
-	if err := p2p.Send(ctx, peer.Channel(), paths, n.onProgress); err != nil {
+	if err := p2p.Send(ctx, peer.Channel(), paths, text, n.onProgress); err != nil {
 		n.fail(fmt.Errorf("发送中断：%w", err))
 		return
 	}
-	n.finish(fmt.Sprintf("已发送 %d 项，对方那边应该收到了", len(paths)))
+	if text != "" && len(paths) > 0 {
+		n.finish(fmt.Sprintf("已发送 1 段文本和 %d 项文件", len(paths)))
+	} else if text != "" {
+		n.finish("文本已送达，对方在界面上能直接复制")
+	} else {
+		n.finish(fmt.Sprintf("已发送 %d 项，对方那边应该收到了", len(paths)))
+	}
 }
 
 // recv 是接收方：等 offer → 回 answer → 收文件。
@@ -358,12 +389,21 @@ func (n *netShare) recv(ctx context.Context, base, code, dir string) {
 		n.note = "直连已建立，开始接收"
 	})
 
-	paths, err := p2p.Receive(ctx, peer.Channel(), dir, n.onProgress)
+	paths, err := p2p.Receive(ctx, peer.Channel(), dir, n.setText, n.onProgress)
 	if err != nil {
 		n.fail(fmt.Errorf("接收中断：%w", err))
 		return
 	}
-	n.finish(fmt.Sprintf("收到 %d 个文件，已存到 %s", len(paths), dir))
+	switch {
+	case n.got() != "" && len(paths) > 0:
+		n.finish(fmt.Sprintf("收到 1 段文本和 %d 个文件，文件已存到 %s", len(paths), dir))
+	case n.got() != "":
+		n.finish("收到一段文本，可以直接复制")
+	case len(paths) > 0:
+		n.finish(fmt.Sprintf("收到 %d 个文件，已存到 %s", len(paths), dir))
+	default:
+		n.finish("对方发完了，但没收到任何内容")
+	}
 }
 
 // p2pTab 画跨网这一页。
@@ -437,37 +477,53 @@ func (s *shareWindow) testSignal() {
 // p2pIdle 是"还没开始"的样子：发送和接收两栏并排。
 func (s *shareWindow) p2pIdle(c *ui.Context, t *ui.Theme) {
 	items := s.list()
-	ui.Row(c).Gap(16).AlignItems(ui.Start).Children(func() {
+	ui.Row(c).Gap(28).AlignItems(ui.Start).Children(func() {
 		// 左：发送
-		ui.Column(c).Grow(1).Gap(8).Children(func() {
+		ui.Column(c).Grow(1).Gap(10).Children(func() {
 			ui.Text(c, "发送").FontSize(14).Bold()
 			if len(items) == 0 {
-				ui.Text(c, "下面先加文件，加完回来点「生成短码」").FontSize(12).TextColor(t.TextMuted)
+				ui.Text(c, "还没加东西。选文件或文件夹，加完点「生成短码」。").
+					FontSize(12).TextColor(t.TextMuted)
 			} else {
 				ui.Text(c, fmt.Sprintf("要发的 %d 项，共 %s", len(items), humanSize(sumSize(items)))).
 					FontSize(12).TextColor(t.TextMuted)
 			}
+
+			ui.Row(c).Gap(8).Children(func() {
+				if ui.Button(c, "添加文件").Clicked() {
+					go s.pickFiles()
+				}
+				if ui.Button(c, "添加文件夹").Clicked() {
+					go s.pickFolder()
+				}
+			})
+
+			// 加了什么得看得见，加错了能就地移除——不然只能凭记忆。
+			s.itemsBrief(c, t)
+
+			// 顺手发一段文本：一条命令、一串地址、一份口令。
+			// 这种时候存成 txt 让对方再去翻下载目录，纯属多绕两步。
+			ui.Text(c, "也可以只发一段文本").FontSize(12).TextColor(t.TextMuted)
+			ui.TextArea(c, &s.textDraft).Height(72).FontSize(12).
+				Placeholder("贴一条命令、一个地址、一段口令…… 对方在接收端直接复制")
+
 			if ui.PrimaryButton(c, "生成短码").Clicked() {
 				s.startSend()
 			}
-			ui.Text(c, "点了会生成 6 位码，把它告诉对方").FontSize(11).TextColor(t.TextMuted)
+			ui.Text(c, "生成 6 位短码；对方输码，或者用浏览器打开链接都能收").
+				FontSize(11).TextColor(t.TextMuted)
 		})
-		// 右：接收
-		ui.Column(c).Grow(1).Gap(8).Children(func() {
+
+		// 右：接收。只要一个短码，保存位置等点了「开始接收」再问。
+		ui.Column(c).Width(300).Gap(10).Children(func() {
 			ui.Text(c, "接收").FontSize(14).Bold()
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.TextInput(c, &s.net.joinCode).Width(140)
-				ui.Text(c, "6 位短码").FontSize(11).TextColor(t.TextMuted)
-			})
-			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, dirLabel(s.net.dir)).FontSize(12).TextColor(t.TextMuted).Grow(1).SingleLine()
-				if ui.Button(c, "保存到").Clicked() {
-					go s.pickSaveDir()
-				}
-			})
+			ui.Text(c, "对方给了短码就填在这里").FontSize(12).TextColor(t.TextMuted)
+			ui.TextInput(c, &s.net.joinCode).SingleLine().Grow(1)
 			if ui.PrimaryButton(c, "开始接收").Clicked() {
-				s.startRecv()
+				go s.pickDirThenRecv()
 			}
+			ui.Text(c, "点了会先让你选保存位置，选好才开始连").
+				FontSize(11).TextColor(t.TextMuted)
 		})
 	})
 	if s.net.joinCode != "" {
@@ -479,33 +535,71 @@ func (s *shareWindow) p2pIdle(c *ui.Context, t *ui.Theme) {
 	}
 }
 
-func (s *shareWindow) p2pRunning(c *ui.Context, t *ui.Theme, stage p2pStage, code string, prog p2p.Progress, note, via string) {
-	if s.net.role == "sender" && code != "" {
-		ui.Row(c).Gap(14).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "短码").FontSize(12).TextColor(t.TextMuted)
-			ui.Text(c, code).FontSize(32).Bold()
-			if ui.Button(c, "复制").Clicked() {
-				mygo.Clipboard.WriteText(code)
-				s.status = "短码已复制"
-			}
-			ui.Text(c, "对方在它的 Baozi 里填这 6 位").FontSize(11).TextColor(t.TextMuted)
-		})
-
-		// 对方不装 Baozi 也能收：信令服务同时托管了一个接收页，浏览器打开就是接收端。
-		// 这条路对手机最省事——不用装 App、不用输码，点开链接就等着。
-		if base := strings.TrimRight(s.signalBase(), "/"); base != "" {
-			pageURL := base + "/r?code=" + code
-			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "浏览器收").FontSize(12).TextColor(t.TextMuted).Width(60)
-				ui.Text(c, pageURL).FontSize(12).TextColor(t.Text).Grow(1).SingleLine()
-				if ui.Button(c, "复制链接").Clicked() {
-					mygo.Clipboard.WriteText(pageURL)
-					s.status = "接收页链接已复制"
+// itemsBrief 是发送栏里的文件清单：加了什么看得见，加错了能就地移除。
+func (s *shareWindow) itemsBrief(c *ui.Context, t *ui.Theme) {
+	for _, it := range s.list() {
+		itPath, itName, itSize, itDir := it.Path, it.Name, it.Size, it.Dir
+		ui.Row(c).Padding(6, 10).Gap(10).AlignItems(ui.Center).Radius(8).Background(t.Surface).
+			Children(func() {
+				label := "文件"
+				if itDir {
+					label = "文件夹"
+				}
+				ui.Text(c, itName).FontSize(12).SingleLine().Grow(1)
+				ui.Text(c, fmt.Sprintf("%s · %s", label, humanSize(itSize))).
+					FontSize(11).TextColor(t.TextMuted)
+				if ui.Button(c, "移除").Clicked() {
+					s.remove(itPath)
+					s.win.Update(func() {})
 				}
 			})
-			ui.Text(c, "把这个链接发给对方，他用手机或电脑浏览器打开就能收，不用装 Baozi").
-				FontSize(11).TextColor(t.TextMuted)
+	}
+}
+
+func (s *shareWindow) p2pRunning(c *ui.Context, t *ui.Theme, stage p2pStage, code string, prog p2p.Progress, note, via string) {
+	if s.net.role == "sender" && code != "" {
+		pageURL := ""
+		if base := strings.TrimRight(s.signalBase(), "/"); base != "" {
+			pageURL = base + "/r?code=" + code
 		}
+		// 链接一变就重画二维码。按 256 出图再缩到 140，边上不会糊。
+		if pageURL != "" && s.qrURL != pageURL {
+			if png, err := qrcode.Encode(pageURL, qrcode.Medium, 256); err == nil {
+				if bm, err := ui.DecodeBitmap(png); err == nil {
+					s.qr, s.qrURL = bm, pageURL
+				}
+			}
+		}
+
+		ui.Row(c).Gap(18).AlignItems(ui.Start).Children(func() {
+			ui.Column(c).Grow(1).Gap(10).Children(func() {
+				ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "短码").FontSize(12).TextColor(t.TextMuted)
+					ui.Text(c, code).FontSize(32).Bold()
+					if ui.Button(c, "复制短码").Clicked() {
+						mygo.Clipboard.WriteText(code)
+						s.status = "短码已复制"
+					}
+				})
+
+				if pageURL != "" {
+					ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+						ui.Text(c, "链接").FontSize(12).TextColor(t.TextMuted)
+						ui.Text(c, pageURL).FontSize(13).SingleLine().Grow(1)
+						if ui.Button(c, "复制链接").Clicked() {
+							mygo.Clipboard.WriteText(pageURL)
+							s.status = "接收页链接已复制"
+						}
+					})
+					ui.Text(c, "手机扫右边的码，或把链接发给对方——浏览器打开就能收，不用装 Baozi").
+						FontSize(11).TextColor(t.TextMuted)
+				}
+				ui.Text(c, "装了 Baozi 的一方也可以直接输这 6 位短码").FontSize(11).TextColor(t.TextMuted)
+			})
+			if s.qr != nil {
+				ui.Image(c, s.qr).Size(140, 140)
+			}
+		})
 	}
 
 	ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
@@ -531,12 +625,15 @@ func (s *shareWindow) p2pRunning(c *ui.Context, t *ui.Theme, stage p2pStage, cod
 			FontSize(11).TextColor(t.TextMuted).SingleLine()
 	}
 
-	if ui.Button(c, "取消").Clicked() {
-		s.net.stop()
-		s.net.reset()
-		s.status = "已取消"
-		s.win.Update(func() {})
-	}
+	// 取消按钮不该占满整行：它是个次要动作，宽度按文字来。
+	ui.Row(c).Children(func() {
+		if ui.Button(c, "取消").Clicked() {
+			s.net.stop()
+			s.net.reset()
+			s.status = "已取消"
+			s.win.Update(func() {})
+		}
+	})
 }
 
 func (s *shareWindow) p2pResult(c *ui.Context, t *ui.Theme, stage p2pStage, note, via string) {
@@ -548,10 +645,46 @@ func (s *shareWindow) p2pResult(c *ui.Context, t *ui.Theme, stage p2pStage, note
 	if via != "" {
 		ui.Text(c, "本条连接方式："+via).FontSize(11).TextColor(t.TextMuted)
 	}
+
+	// 收到的文本直接铺开：它存在的意义就是被复制走，塞进一个文件里没道理。
+	if text := s.net.got(); text != "" {
+		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "收到的文本").FontSize(12).TextColor(t.TextMuted)
+			if ui.Button(c, "复制文本").Clicked() {
+				mygo.Clipboard.WriteText(text)
+				s.status = "文本已复制"
+			}
+			ui.Text(c, fmt.Sprintf("%d 个字符", len([]rune(text)))).
+				FontSize(11).TextColor(t.TextMuted)
+		})
+		// 只读：要改也是在对方那边改，这里只负责看和复制。
+		shown := text
+		ui.TextArea(c, &shown).Height(96).FontSize(12).ReadOnly(true)
+	}
+
 	if ui.PrimaryButton(c, "再来一次").Clicked() {
 		s.net.reset()
 		s.win.Update(func() {})
 	}
+}
+
+// pickDirThenRecv 是接收方的入口：先问存哪儿，选好了才真正开始连。
+// 顺序反过来的话，用户点了"开始接收"却不知道文件会落到哪，还得回头找那个目录开关。
+func (s *shareWindow) pickDirThenRecv() {
+	paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+		Parent:    s.win,
+		Title:     "选择接收保存位置",
+		Directory: true,
+	})
+	if err != nil {
+		s.win.Update(func() { s.status = "选目录失败：" + err.Error() })
+		return
+	}
+	if len(paths) == 0 {
+		return // 取消了就别进"等对方"的状态
+	}
+	s.net.set(func() { s.net.dir = paths[0] })
+	s.startRecv()
 }
 
 func (s *shareWindow) pickSaveDir() {

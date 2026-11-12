@@ -840,7 +840,7 @@ func TestShareP2PWaitingShot(t *testing.T) {
 
 	tester := ui.NewTester(s.view, 760, 620)
 	tester.Frame()
-	for _, want := range []string{"短码", "bzt234", "浏览器收", "复制链接"} {
+	for _, want := range []string{"短码", "bzt234", "链接", "复制链接", "取消"} {
 		if !tester.HasText(want) {
 			t.Fatalf("等待态缺少 %q", want)
 		}
@@ -859,10 +859,34 @@ func TestShareP2PViewRenders(t *testing.T) {
 	tester := ui.NewTester(s.view, 760, 680)
 	tester.Frame()
 	for _, want := range []string{
-		"局域网链接", "跨网直传", "信令服务", "生成短码", "开始接收", "保存到",
+		"局域网链接", "跨网直传", "信令服务", "生成短码", "添加文件", "添加文件夹", "开始接收",
 	} {
 		if !tester.HasText(want) {
 			t.Fatalf("跨网页缺少 %q", want)
+		}
+	}
+	dumpPreview(t, tester)
+}
+
+// 局域网页也能顺带发一段文本：停了共享的状态下必须有那个输入框，
+// 否则用户只会想到"把话存成 txt 再发"。
+func TestShareLocalTextInputShot(t *testing.T) {
+	a := testApp(t)
+	src := filepath.Join(a.dataDir, "demo.txt")
+	if err := os.WriteFile(src, []byte("demo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &shareWindow{
+		app:       a,
+		pending:   []share.Item{{Path: src, Name: "demo.txt", Size: 4}},
+		textDraft: "这里是顺手要递过去的一段话",
+	}
+
+	tester := ui.NewTester(s.view, 760, 720)
+	tester.Frame()
+	for _, want := range []string{"生成链接", "待分享", "demo.txt", "顺带发一段文本"} {
+		if !tester.HasText(want) {
+			t.Fatalf("局域网页缺少 %q", want)
 		}
 	}
 	dumpPreview(t, tester)

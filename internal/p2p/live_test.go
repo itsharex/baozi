@@ -90,7 +90,7 @@ func TestLiveSignal(t *testing.T) {
 		}
 		t.Logf("接收方连接方式：%s", peer.CandidateType())
 
-		paths, err := Receive(ctx, peer.Channel(), dst, nil)
+		paths, err := Receive(ctx, peer.Channel(), dst, nil, nil)
 		t.Logf("收到 %d 个文件：%v", len(paths), paths)
 		recvDone <- res{err}
 	}()
@@ -141,7 +141,7 @@ func TestLiveSignal(t *testing.T) {
 	}
 	t.Logf("发送方连接方式：%s", peer.CandidateType())
 
-	if err := Send(ctx, peer.Channel(), []string{src}, nil); err != nil {
+	if err := Send(ctx, peer.Channel(), []string{src}, "", nil); err != nil {
 		t.Fatalf("发送失败：%v", err)
 	}
 

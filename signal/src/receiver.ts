@@ -42,6 +42,13 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
   .err { color:var(--bad); font-size:13px; margin-top:10px; white-space:pre-wrap; }
   .savebox { margin-top:16px; }
   .savebox button { width:100%; padding:12px; font-size:15px; }
+  /* 文本块：对方发来的一段话，不落盘，直接摊开给你复制 */
+  .textbox { margin-top:14px; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .texthead { display:flex; align-items:center; justify-content:space-between; gap:10px;
+              padding:8px 12px; background:#f5f7fa; color:var(--muted); font-size:12px; }
+  .texthead button { padding:6px 14px; font-size:12px; }
+  .textbody { margin:0; padding:12px; font:13px/1.6 ui-monospace,Consolas,monospace;
+              white-space:pre-wrap; word-break:break-word; max-height:260px; overflow:auto; }
   .codebox { display:flex; gap:8px; margin-top:12px; }
   input.codein { flex:1; min-width:0; padding:10px 12px; border:1px solid var(--line); border-radius:10px;
                  font:16px/1 ui-monospace,Consolas,monospace; letter-spacing:3px; text-transform:lowercase; }
@@ -71,6 +78,11 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
 
     <div class="list" id="list"></div>
 
+    <div class="textbox" id="textbox" hidden>
+      <div class="texthead"><span>对方发来的文本</span><button id="copyBtn">复制</button></div>
+      <pre class="textbody" id="textbody"></pre>
+    </div>
+
     <div class="savebox" id="savebox" hidden>
       <button id="saveBtn">保存文件</button>
     </div>
@@ -94,6 +106,11 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
   var barBox = el("barBox"), fill = el("fill"), bytes = el("bytes");
   var list = el("list"), err = el("err"), hint = el("hint");
   var savebox = el("savebox"), saveBtn = el("saveBtn");
+  var textbox = el("textbox"), textbody = el("textbody"), copyBtn = el("copyBtn");
+
+  // gotText 是对方发来的一段文本。它不落盘——文本存在的意义就是被复制走，
+  // 摊在页面上点一下"复制"比下载一个 txt 再找开快得多。
+  var gotText = "";
 
   var code = (new URL(location.href)).searchParams.get("code") || "";
   code = code.toLowerCase().replace(/[^0-9a-z]/g, "").slice(0, 6);
@@ -217,9 +234,17 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
         manifest = m.items || [];
         parts = manifest.map(function () { return []; });
         total = manifest.reduce(function (a, it) { return a + (it.size || 0); }, 0);
-        barBox.hidden = false;
-        renderList();
-        setState("接收中…", "ok");
+        // 清单可能是空的——那说明对方只发了文本，别画一条永远不动的进度条。
+        if (manifest.length) {
+          barBox.hidden = false;
+          renderList();
+          setState("接收中…", "ok");
+        }
+      } else if (m.type === "text") {
+        // 文本先到（Go 端把它排在文件前面），当场就摆出来，不必等整个传完。
+        gotText = m.text || "";
+        renderText();
+        setState("收到一段文本", "ok");
       } else if (m.type === "done") {
         finished = true;
         received = total > 0 ? total : received;
@@ -255,8 +280,54 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
     });
   }
 
+  // 把收到的文本摆出来。不转义就塞 innerHTML，空格和换行原样留着。
+  function renderText() {
+    if (!gotText) return;
+    textbox.hidden = false;
+    textbody.textContent = gotText;
+  }
+
+  copyBtn.onclick = function () {
+    var done = function () {
+      copyBtn.textContent = "已复制";
+      setTimeout(function () { copyBtn.textContent = "复制"; }, 1600);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(gotText).then(done, function () { fallbackCopy(done); });
+    } else {
+      fallbackCopy(done);
+    }
+  };
+
+  // 有些环境（http 页面、旧内核）没有 clipboard API，退回选区复制。
+  function fallbackCopy(after) {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = gotText;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      after();
+    } catch (e) {
+      hint.textContent = "自动复制被浏览器拦了，手动全选上面那段文本复制即可。";
+    }
+  }
+
   function finish() {
-    if (!manifest || !manifest.length) { fail("对方没发清单，什么也没收到"); return; }
+    if (!manifest || !manifest.length) {
+      // 只发了一段文本：这已经是一次完整的传输，不是"什么也没收到"。
+      if (gotText) {
+        renderText();
+        setState("收到一段文本", "ok");
+        hint.textContent = "文本就在上面，点「复制」粘到别处就行；这个页面可以关掉了。";
+        return;
+      }
+      fail("对方什么也没发过来");
+      return;
+    }
     setState("接收完成，等保存", "ok");
     fill.style.width = "100%";
     bytes.textContent = fmt(received) + "（" + manifest.length + " 个文件）";

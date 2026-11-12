@@ -47,6 +47,13 @@ type doneMsg struct {
 	Total int64  `json:"total"`
 }
 
+// textMsg 是一段文本。互传不只传文件：随手发一段话、一个地址、一条命令，
+// 对方在接收端直接点复制，比"存成 txt 再打开"省事得多。
+type textMsg struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
 // Progress 是给界面看的进度：总字节、已发/已收字节、当前文件。
 type Progress struct {
 	Done  int64
@@ -98,18 +105,32 @@ func collect(paths []string) ([]entry, error) {
 			return nil, fmt.Errorf("遍历 %s 失败：%w", p, err)
 		}
 	}
-	if len(out) == 0 {
+	if len(out) == 0 && len(paths) > 0 {
 		return nil, fmt.Errorf("没有可传的文件")
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].rel < out[j].rel })
 	return out, nil
 }
 
-// Send 把 paths（文件或文件夹）推到对端。
-func Send(ctx context.Context, dc *webrtc.DataChannel, paths []string, onProgress func(Progress)) error {
+// Send 把 paths（文件或文件夹）和一段可选文本推到对端。
+// 文本先走：它小、先到手就能早一点复制出去，也是"只发一段话"时的全部内容。
+func Send(ctx context.Context, dc *webrtc.DataChannel, paths []string, text string, onProgress func(Progress)) error {
 	entries, err := collect(paths)
 	if err != nil {
 		return err
+	}
+	if len(entries) == 0 && text == "" {
+		return fmt.Errorf("没有要传的东西")
+	}
+
+	if text != "" {
+		raw, err := json.Marshal(textMsg{Type: "text", Text: text})
+		if err != nil {
+			return err
+		}
+		if err := dc.SendText(string(raw)); err != nil {
+			return fmt.Errorf("发文本失败：%w", err)
+		}
 	}
 
 	var total int64
@@ -205,7 +226,8 @@ type frame struct {
 }
 
 // Receive 把对端推来的东西落进 dir。返回落地后的绝对路径。
-func Receive(ctx context.Context, dc *webrtc.DataChannel, dir string, onProgress func(Progress)) ([]string, error) {
+// 如果对端还发了文本，onText 会被调一次（文本不落盘，交给界面显示）。
+func Receive(ctx context.Context, dc *webrtc.DataChannel, dir string, onText func(string), onProgress func(Progress)) ([]string, error) {
 	// OnMessage 是回调式的，这里用一条带缓冲的通道把它变成"能 select 的流"。
 	// 缓冲给得比较大：接收慢于发送时，靠它顶住，再靠 SCTP 的流控反压。
 	ch := make(chan frame, 256)
@@ -248,11 +270,16 @@ func Receive(ctx context.Context, dc *webrtc.DataChannel, dir string, onProgress
 				Type  string `json:"type"`
 				Items []Item `json:"items"`
 				Total int64  `json:"total"`
+				Text  string `json:"text"`
 			}
 			if err := json.Unmarshal(fr.data, &head); err != nil {
 				return final, fmt.Errorf("收到看不懂的控制帧：%w", err)
 			}
 			switch head.Type {
+			case "text":
+				if onText != nil && head.Text != "" {
+					onText(head.Text)
+				}
 			case "manifest":
 				items = head.Items
 				total = 0
@@ -309,7 +336,8 @@ func Receive(ctx context.Context, dc *webrtc.DataChannel, dir string, onProgress
 // 路径全部经过清洗：对端再怎么构造名字，也跳不出 dir 这一层。
 func prepare(dir string, items []Item, outs *[]*os.File, final *[]string) error {
 	if len(items) == 0 {
-		return fmt.Errorf("清单是空的")
+		// 只发文本时清单是空的：这回没什么可建，不是错误。
+		return nil
 	}
 	root := filepath.Clean(dir)
 	for _, it := range items {

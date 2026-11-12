@@ -90,8 +90,9 @@ type Session struct {
 
 	mu       sync.RWMutex
 	items    []Item
-	fails    int  // 连续输错次数
-	breached bool // 输错太多，已主动停止
+	text     string // 顺带发的一段文本：不落盘，页面直接摊开给人复制
+	fails    int    // 连续输错次数
+	breached bool   // 输错太多，已主动停止
 
 	srv *http.Server
 	ln  net.Listener
@@ -264,6 +265,20 @@ func (s *Session) Items() []Item {
 	out := make([]Item, len(s.items))
 	copy(out, s.items)
 	return out
+}
+
+// SetText 换掉这次顺带展示的一段文本（空串 = 没有）。
+// 文本不进文件系统：共享的是"这段话"，不是"装着这段话的 txt"。
+func (s *Session) SetText(text string) {
+	s.mu.Lock()
+	s.text = text
+	s.mu.Unlock()
+}
+
+func (s *Session) Text() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.text
 }
 
 func (s *Session) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -453,10 +468,32 @@ a.file{display:flex;justify-content:space-between;padding:12px 14px;margin:8px 0
 background:rgba(127,127,127,.12);text-decoration:none;color:inherit}
 a.file:hover{background:rgba(127,127,127,.2)}
 .size{opacity:.6;font-size:18px}
+.textbox{margin:0 0 18px;border:1px solid rgba(127,127,127,.3);border-radius:12px;overflow:hidden}
+.texthead{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 14px;
+background:rgba(127,127,127,.1);font-size:13px;opacity:.75}
+.texthead button{border:0;border-radius:8px;padding:6px 14px;background:#3b82f6;color:#fff;font-size:13px;cursor:pointer}
+pre.txt{margin:0;padding:14px;font:14px/1.65 ui-monospace,Consolas,monospace;white-space:pre-wrap;
+word-break:break-word;max-height:320px;overflow:auto}
 .foot{margin-top:22px;padding-top:16px;border-top:1px solid rgba(127,127,127,.25);opacity:.55;font-size:12px}
 </style></head><body><div class="card">
-<h1>给你分享的文件</h1><p class="hint">点一下就开始下载 · 关掉 Baozi 或对方停止共享后，这个链接立即失效</p>`)
-	if len(items) == 0 {
+<h1>给你分享的内容</h1><p class="hint">点一下就开始下载 · 关掉 Baozi 或对方停止共享后，这个链接立即失效</p>`)
+
+	// 文本摆在文件上面：它是"马上要复制走"的东西，我给它先手。
+	if text := s.Text(); text != "" {
+		b.WriteString(`<div class="textbox"><div class="texthead"><span>对方发来的一段文本</span>` +
+			`<button id="copytext">复制</button></div><pre class="txt" id="txt">` +
+			html.EscapeString(text) + `</pre></div>
+<script>(function(){var btn=document.getElementById("copytext"),txt=document.getElementById("txt");
+var done=function(){btn.textContent="已复制";setTimeout(function(){btn.textContent="复制";},1600);};
+btn.onclick=function(){var s=txt.textContent;
+if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(s).then(done,
+function(){fallback();});}else{fallback();}
+function fallback(){var ta=document.createElement("textarea");ta.value=s;ta.style.position="fixed";
+ta.style.opacity="0";document.body.appendChild(ta);ta.select();try{document.execCommand("copy");done();}
+catch(e){}ta.remove();}};})();</script>`)
+	}
+
+	if len(items) == 0 && s.Text() == "" {
 		b.WriteString(`<p style="opacity:.6">对方还没有选择要分享的文件，稍等片刻再刷新这个页面。</p>`)
 	}
 	for _, it := range items {
