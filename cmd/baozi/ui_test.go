@@ -672,3 +672,22 @@ func TestIconPathStripsFilePrefix(t *testing.T) {
 		t.Fatalf("前缀大小写不同也应剥掉，实际 %q", got)
 	}
 }
+
+// 悬停选中的关键是"指针没动就不接管"：否则鼠标停在 A 上、用户按 ↓ 选 B，
+// 下一帧 hover 又把人拽回 A，键盘等于失灵。这里把三种情形钉住。
+func TestHoverTargetKeepsKeyboardChoice(t *testing.T) {
+	p := ui.Point{X: 10, Y: 10}
+	// 首帧（还没有上一帧位置）：接管指针下面那张。
+	if got, _, _ := hoverTarget(ui.Point{}, false, p, 0, 3); got != 3 {
+		t.Fatalf("首帧应接管为 3，实际 %d", got)
+	}
+	// 位置没变：键盘刚把选中从 3 挪到 1，hover 不许改回去。
+	if got, _, _ := hoverTarget(p, true, p, 1, 3); got != 1 {
+		t.Fatalf("指针没动应保持键盘选的 1，实际 %d", got)
+	}
+	// 位置变了：接管。
+	moved := ui.Point{X: 120, Y: 10}
+	if got, _, _ := hoverTarget(p, true, moved, 1, 3); got != 3 {
+		t.Fatalf("指针移动应接管为 3，实际 %d", got)
+	}
+}

@@ -212,7 +212,9 @@ func TestCardIconPreview(t *testing.T) {
 		{Item: search.Item{Name: "会议记录.txt", Path: `D:\docs\会议记录.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `D:\docs`}},
 	}
 	a.pinnedCount = len(a.results)
-	a.choose(0)
+	// 选中「遗忘之海」那张：它跟用户给的截图是同一个图标，方便对照"选中态该长什么样"
+	// （现在是一块圆角底色，没有边框）。
+	a.choose(5)
 
 	pw, ph := a.cfg.PanelSize()
 	tst := ui.NewTester(a.view, pw, ph)

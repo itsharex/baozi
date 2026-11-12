@@ -758,7 +758,6 @@ DLL 注入那条（`WH_CBT` 捕获 + `IShellView::Navigate`）需要往目标进
 只在"那套 WM_SETTEXT 被外壳拒掉 / 对话框被别的程序挡住"时还要手工救一次。
 `dirOf()` 负责"目录给自身、文件给所在目录、`shell:` 虚拟项无目录"的口径。
 
-
 ## 9. 索引服务化（已实现）
 
 最初索引跑在主进程里（`filepath.WalkDir`），179 万条要分钟级，且必须是普通权限。
@@ -964,7 +963,7 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 | 页签 / 分区 | 控件 | 写回字段 |
 |---|---|---|
 | 常规·唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
-| 常规·面板尺寸 | 两个 `NumberInput`（宽 420~2400 / 高 260~1600，步长 20）＋ 右侧实时换算「一排 N 列、约 M 行；物理 W×H」 | `panel.width` / `panel.height` |
+
 | 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
 | 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`NumberInput`（图标大小）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.iconSize` / `search.thumbnails` |
 | 常规·索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
@@ -1212,8 +1211,11 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 
 - `config.Panel{Width, Height}`（json `panel`），0 或缺省 = 默认 720×480；
 - `Config.PanelSize()` 夹到 420~2400 / 260~1600，越界的数存盘前就夹好，配置文件里不会躺一个永远不生效的值；
-- `ready()` 建窗时读一次；设置页「面板尺寸」保存后调 `application.applyPanelSize()`（`SetSize` +
-  可见时按新尺寸重新居中），**不用重启**——`show()` 本来每次唤出都按当时的 `Size()` 重新居中；
+- **没有设置项**：用户直接拖面板的四条边（`TitleBarHidden` + `HideWindowButtons` 才有 Windows 的缩放边缘，
+  见 `ready()`）。拖动中 `panel.Size()` 实时变，`gridCols()` 直接问它，列数跟着重排；
+- 停手 0.8 秒后 `panelResized()` 攒下的尺寸由 `savePanelSize()` 写进 `config.json`（尺寸没变就不写，
+  否则每次唤出的 `SetSize`/`SetPosition` 都会触发一次无谓的落盘）；
+- 不用 mygo 的 `StateKey`：它只在窗口真正 close 时写盘，而 Baozi 的"关闭"只是 `PreventDefault` 隐藏；
 - **列数不再是常量**：`application.gridCols()` = `(宽 - 2*cardGutter + cardGap) / (cardWidth + cardGap)`，
   720 → 7 列、1200 → 13 列、480 → 5 列。`homeGrid()` 的排布、`pinMoveFor()` 的行列换算、
   `↑`/`↓` 的步长全部走它，三者必须同源，否则"一排看得到 13 个、方向键却跳 7 格"。

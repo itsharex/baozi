@@ -188,6 +188,20 @@ type application struct {
 	pinDragActive bool
 	pinDragX      float32
 	pinDragY      float32
+
+	// hoverPoint 是上一帧指针在窗口里的位置。悬停选中只在它**变了**的时候接管，
+	// 否则鼠标停在某张卡上不动、用户按方向键，选中会被 hover 每帧拽回去。
+	hoverPoint ui.Point
+	// hoverKnown 标记 hoverPoint 有没有值：首帧（0,0）不能当成"指针没动"，
+	// 否则面板一唤出、指针正好在左上角时就永远不接管。
+	hoverKnown bool
+
+	// 拖面板边缘改尺寸：OnResize 在拖动过程中会连着来几十次，攒到停手才写盘，
+	// 否则每动一像素就重写一遍 config.json。
+	panelMu    sync.Mutex
+	panelPendW int
+	panelPendH int
+	panelSave  *time.Timer
 }
 
 // pinMove 是一次拖动排序的意图，from/to 都是 results 的下标。
@@ -572,39 +586,81 @@ func wrapName(name string, width float32, lines int) string {
 func (a *application) card(c *ui.Context, i int) {
 	r := a.results[i]
 	t := c.Theme()
-	bg, border := ui.Transparent, ui.Transparent
+	// 选中 / 悬停都是一个"圆角底色块"，**不描边**：参照用户给的启动器截图，
+	// 那边选中的那张是整块深灰圆角底，没有一个框套在外面。
+	// 之前用「浅底 + 蓝细边」，边框在小图标旁边显得琐碎，用户明确说不要。
+	bg := ui.Transparent
 	if i == a.chosen {
 		bg = t.SurfaceHover
-		border = t.Accent.Alpha(0.6)
 	}
-	// 「已固定」区的卡片可以拖着重排：拖动中的那张换底色+亮边，让人知道"手上有东西"。
+	// 「已固定」区的卡片可以拖着重排：拖动中的那张换成强调色底，让人知道"手上有东西"。
 	pinned := i >= len(a.results)-a.pinnedCount
 	dragging := pinned && a.pinDragActive && a.pinDragFrom == i
 	if dragging {
-		bg = t.SurfaceHover
-		border = t.Accent.Alpha(0.8)
+		bg = t.Accent.Alpha(0.22)
 	}
 	col := ui.Column(c).Width(cardWidth).Padding(6, 4).Gap(6).AlignItems(ui.Center).Radius(12).
-		Background(bg).BorderWidth(1).BorderColor(border).
+		Background(bg).
 		OnClick(func() {
 			a.chosen = i
 			a.open()
 		}).
 		ContextMenu(func(m *ui.Menu) { a.itemMenu(m, i) }).
 		Children(func() {
-			// 图标直接铺在卡片上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
-			// 辨识度，套个小方块只会把它压小、还多出一圈底色（用户要的就是启动器
-			// 那种"大图标 + 名字"的样子，见 cardIcon）。
-			a.resultIcon(c, r, a.cardIcon())
+			// 图标装在一个**固定高度**的方块里再居中：位图和线框的自身尺寸不一样
+			// （线框 SVG 的图形只占网格的 18/24），不套这个盒子的话，每张卡的图标顶边
+			// 高低不一、下面的名字也跟着上下错开。有了它也才谈得上"名字都从同一行开始"。
+			ui.Row(c).Width(cardWidth - 12).Height(a.cardIcon()).
+				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				// 图标直接铺在卡片上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
+				// 辨识度，套个小方块只会把它压小、还多出一圈底色（用户要的就是启动器
+				// 那种"大图标 + 名字"的样子，见 cardIcon）。
+				a.resultIcon(c, r, a.cardIcon())
+			})
+			// 名字最多两行：一行放得下就只占一行，超了才往下续第二行。
 			ui.Text(c, wrapName(r.Name, cardWidth-12, 2)).FontSize(12).TextColor(t.Text).
 				TextAlign(ui.Center).MaxLines(2).LineHeight(1.2).Tooltip(r.Name)
 		})
+	// 鼠标停在哪张卡上，就等于选中哪张（Enter / 右键 / 底栏都作用在它身上）。
+	a.hoverSelect(col, i)
 	if !pinned {
 		return
 	}
 	// 拖动本身不改数据：松手时才在下一帧的 applyPending 里重排（渲染途中不能改 results）。
 	col = col.Draggable(a.pinDragPoint(i), ui.DraggableOptions{})
 	a.trackPinDrag(i, col)
+}
+
+// hoverSelect 让"指针停在哪张卡上"就等于选中哪张：鼠标一移过去选中就跟着走，
+// 之后的 Enter、右键、底栏提示都作用在那张卡上。
+//
+// 关键在"只在指针真的动了的时候接管"。否则鼠标停在 A 上、用户按 ↓ 想选 B，
+// 下一帧 hover 又把人拽回 A——键盘就彻底失灵了。所以比的是**窗口坐标**，
+// 不是元素自己的相对坐标（那两张卡可能恰好同值）。
+func (a *application) hoverSelect(el ui.Element, i int) {
+	x, y, over := el.PointerPosition()
+	if !over {
+		return
+	}
+	bounds := el.Bounds()
+	chosen, point, known := hoverTarget(a.hoverPoint, a.hoverKnown,
+		ui.Point{X: bounds.X + x, Y: bounds.Y + y}, a.chosen, i)
+	a.hoverPoint, a.hoverKnown = point, known
+	if chosen != a.chosen {
+		a.chosen = chosen
+	}
+}
+
+// hoverTarget 是 hoverSelect 的纯逻辑部分，单独拿出来好测：
+// 指针不在元素上、或者位置没变，就不接管选中。
+func hoverTarget(prev ui.Point, known bool, abs ui.Point, chosen, i int) (int, ui.Point, bool) {
+	if !known {
+		return i, abs, true
+	}
+	if abs == prev {
+		return chosen, prev, true
+	}
+	return i, abs, true
 }
 
 // itemMenu 是首页卡片和结果行共用的右键菜单：固定 / 取消固定、从历史删除。
@@ -701,7 +757,7 @@ func (a *application) row(c *ui.Context, i int) {
 		bg = t.Accent.Alpha(0.16)
 		border = t.Accent.Alpha(0.5)
 	}
-	ui.Row(c).Padding(9, 12).MarginY(2).Gap(12).AlignItems(ui.Center).Radius(10).
+	row := ui.Row(c).Padding(9, 12).MarginY(2).Gap(12).AlignItems(ui.Center).Radius(10).
 		Background(bg).BorderWidth(1).BorderColor(border).
 		OnClick(func() {
 			// 鼠标点一下就打开：之前这里没有任何点击处理，点了像没反应。
@@ -717,6 +773,8 @@ func (a *application) row(c *ui.Context, i int) {
 			})
 			ui.Text(c, badge(r)).FontSize(10).TextColor(t.TextMuted)
 		})
+	// 悬停即选中，和首页卡片一致：鼠标扫过哪一行，Enter 就打开哪一行。
+	a.hoverSelect(row, i)
 }
 
 // iconSize 是结果行左侧图标的边长。没在设置里指定就跟着系统缩放走
@@ -729,9 +787,22 @@ func (a *application) iconSize() float32 {
 // gridCols 是首页网格一排能放几张卡：由当前面板宽度算出，宽度一改列数跟着变。
 // 方向键"上下走一行"用的也是它，所以它和 homeGrid 的排布必须同源。
 func (a *application) gridCols() int {
-	w, _ := a.cfg.PanelSize()
+	w, _ := a.panelSize()
 	n := (w - 2*cardGutter + cardGap) / (cardWidth + cardGap)
 	return max(1, n)
+}
+
+// panelSize 返回面板当前的实际宽高（DIP）。
+//
+// 有真窗口就问它——用户拖着边缘把面板拉宽之后，列数要立刻跟着变；
+// 视图测试里没有窗口（a.panel 为 nil），退回配置里的初始尺寸。
+func (a *application) panelSize() (int, int) {
+	if a.panel != nil {
+		if w, h := a.panel.Size(); w > 0 && h > 0 {
+			return w, h
+		}
+	}
+	return a.cfg.PanelSize()
 }
 
 // cardIcon 是首页卡片里图标的边长。卡片 84 宽，图标按"结果行图标 ×2.2"放大
@@ -766,7 +837,10 @@ func (a *application) resultIcon(c *ui.Context, r search.Result, size float32) {
 				return
 			}
 		}
-		ui.Icon(c, g).FontSize(size).TextColor(t.TextMuted)
+		// 线框图标用 Size 而不是 FontSize：FontSize 给的是"字号"，而 SVG 24 网格里
+		// 图形只占约 18/24，落到 60 的卡片里会显得比彩色位图小一圈、顶边也对不齐。
+		// 给死尺寸后图形按图形填满这个方块，和位图同高。
+		ui.Icon(c, g).Size(size, size).TextColor(t.TextMuted)
 		return
 	}
 	// 位图按 2.2 倍请求再缩下来：系统图标四周那圈透明边裁掉后剩下的内容往往只有
@@ -775,7 +849,7 @@ func (a *application) resultIcon(c *ui.Context, r search.Result, size float32) {
 		ui.Image(c, bm).Size(size, size)
 		return
 	}
-	ui.Icon(c, glyphFile).FontSize(size).TextColor(t.TextMuted)
+	ui.Icon(c, glyphFile).Size(size, size).TextColor(t.TextMuted)
 }
 
 // isProgram 判断这个"文件"其实是个可执行程序：.exe/.lnk/.msi/.scr/.com。
@@ -1624,18 +1698,41 @@ func historyKind(k search.Kind) history.Kind {
 }
 
 // applyPanelSize 把配置里的面板尺寸立刻用到窗口上（设置页保存后调用，不用重启）。
-// 面板每次 show 都会按当时的 Size 重新居中，所以这里只要改尺寸；万一面板正开着，
-// 顺手也挪一次，免得改完还挂在旧位置、只往右下长。
-func (a *application) applyPanelSize() {
-	if a.panel == nil {
+// panelResized 是窗口尺寸变化的回调：攒到用户停手再落盘。
+// 拖动时这个回调会连着来几十次（每帧一次），每次都写 config.json 太重。
+func (a *application) panelResized() {
+	w, h := a.panel.Size()
+	a.panelMu.Lock()
+	a.panelPendW, a.panelPendH = w, h
+	if a.panelSave != nil {
+		a.panelSave.Stop()
+	}
+	a.panelSave = time.AfterFunc(800*time.Millisecond, a.savePanelSize)
+	a.panelMu.Unlock()
+}
+
+// savePanelSize 把拖出来的尺寸写进配置。失败只记日志、不改内存里的 cfg，
+// 否则会出现"配置文件没写成、但这次运行按新尺寸走"的错位。
+func (a *application) savePanelSize() {
+	a.panelMu.Lock()
+	w, h := a.panelPendW, a.panelPendH
+	a.panelMu.Unlock()
+	if w <= 0 || h <= 0 {
 		return
 	}
-	w, h := a.cfg.PanelSize()
-	a.panel.SetSize(w, h)
-	if a.panel.IsVisible() {
-		d := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint())
-		a.panel.SetPosition(d.WorkArea.X+(d.WorkArea.Width-w)/2, d.WorkArea.Y+(d.WorkArea.Height-h)/3)
+	// 每次唤出面板都会先 SetSize/SetPosition 一次，那也会触发 OnResize；
+	// 尺寸没变就别重写 config.json——不然每唤出一次就多一次磁盘写。
+	if cw, ch := a.cfg.PanelSize(); w == cw && h == ch {
+		return
 	}
+	cfg := *a.cfg
+	cfg.Panel.Width, cfg.Panel.Height = w, h
+	if err := config.Save(&cfg, a.cfgPath); err != nil {
+		log.Printf("保存面板尺寸: %v", err)
+		return
+	}
+	a.cfg = &cfg
+	log.Printf("面板尺寸: %dx%d（已保存）", w, h)
 }
 
 // show 在鼠标所在显示器居中偏上位置显示面板。
@@ -1689,22 +1786,30 @@ func (a *application) ready() {
 	// 所以放这里算一次缓存住，视图里不再现问。
 	a.scale = screenScale()
 
-	// 面板宽高来自配置（设置页可改），这里只在启动时读一次；
-	// 设置页保存后会调 applyPanelSize 立刻 SetSize，不用重启。
+	// 面板尺寸不是写死的：首次启动用配置里的值（默认 720×480），之后**拖面板边缘**
+	// 改的大小由 mygo 按 StateKey 记在 window-state.json 里，下次启动照旧。
 	pw, ph := a.cfg.PanelSize()
 	a.panel = mygo.NewWindow(mygo.WindowOptions{
-		Title:         "Baozi",
-		Panel:         true,
-		Hidden:        true,
-		Frameless:     true,
-		Transparent:   true,
-		Vibrancy:      mygo.VibrancyGlass,
-		CornerRadius:  16,
-		Width:         pw,
-		Height:        ph,
-		DisableResize: true,
-		Content:       ui.View(a.view),
+		Title:  "Baozi",
+		Panel:  true,
+		Hidden: true,
+		// 不用 Frameless：Windows 上无边框窗口**没有缩放边缘**（拖不了），
+		// 换成"隐藏标题栏 + 隐藏窗口按钮"，保留阴影、圆角和四边（含顶边）的缩放边缘。
+		TitleBarStyle:     mygo.TitleBarHidden,
+		HideWindowButtons: true,
+		Transparent:       true,
+		Vibrancy:          mygo.VibrancyGlass,
+		CornerRadius:      16,
+		Width:             pw,
+		Height:            ph,
+		MinWidth:          config.MinPanelWidth,
+		MinHeight:         config.MinPanelHeight,
+		Content:           ui.View(a.view),
 	})
+	// 用户拖着面板边缘改大小：停手 800ms 后把尺寸写进 config.json，
+	// 下次启动按这个尺寸建窗。不用 mygo 的 StateKey——那个只在窗口真正关闭时落盘，
+	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
+	a.panel.OnResize(func() { a.panelResized() })
 	a.panel.OnClose(func(e *mygo.CloseEvent) {
 		// 真正退出时不能拦：mygo 的 Quit 是一个个关窗口，
 		// 只要有窗口在 OnClose 里 PreventDefault，整个 Quit 就被取消，
