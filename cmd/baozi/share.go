@@ -186,6 +186,8 @@ func (s *shareWindow) stop() {
 
 func (s *shareWindow) view(c *ui.Context) {
 	t := c.Theme()
+	// 和面板同一套字体，切窗口时不换字形。
+	usePanelFont(t)
 	c.Root().Background(t.Background)
 
 	ui.Column(c).Fill().Children(func() {

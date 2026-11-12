@@ -182,6 +182,8 @@ func TestCardIconPreview(t *testing.T) {
 		// 这张是"白底 tile + 小 logo"那类图标（游戏启动器常见），
 		// 以前 trim 不掉留白，卡片里就成了白框小图标。放进预览当回归样本。
 		`D:\Games\ywzh_launcher\Win64Release\PCLauncher\PCLauncher.exe`,
+		// 长名字样本也要有图标，否则渲染时会去问 Shell，而 Shell 在 ui.Tester 下阻塞。
+		`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
 	}
 	// 缓存键要跟 appIcon 算出来的一字不差：它把 size*2.2 再乘一次缩放。
 	px := int(float32(int(a.cardIcon()*2.2)) * a.scale)
@@ -210,6 +212,11 @@ func TestCardIconPreview(t *testing.T) {
 		{Item: search.Item{Name: "遗忘之海", Path: exes[5], Ext: ".exe", Kind: search.KindFile, Hint: `D:\Games\ywzh_launcher\Win64Release\PCLauncher`}},
 		{Item: search.Item{Name: "文档", Path: `D:\docs`, Kind: search.KindDir, Hint: `D:\`}},
 		{Item: search.Item{Name: "会议记录.txt", Path: `D:\docs\会议记录.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `D:\docs`}},
+		// 名字长到要换第二行的样本：用户截图里那一排就是因为这种卡"名字两行、别的卡一行"
+		// 导致图标顶和标题各偏了一截，这里固定住不被改回去。
+		// 必须挑一个**真实存在**的 exe：卡片渲染会去取图标，路径不存在会调 Shell，
+		// 而 Shell.* 在 ui.Tester 下会永久阻塞（工程里踩过这个坑）。
+		{Item: search.Item{Name: "WindowsPowerShell.exe", Path: `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`, Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32\WindowsPowerShell\v1.0`}},
 	}
 	a.pinnedCount = len(a.results)
 	// 选中「遗忘之海」那张：它跟用户给的截图是同一个图标，方便对照"选中态该长什么样"

@@ -209,6 +209,29 @@ type pinMove struct {
 	from, to int
 }
 
+// panelFont 是面板和设置窗的全局字体。
+//
+// Windows 上"系统 UI 字体"其实是两族拼起来的：拉丁字母走 Segoe UI、汉字回退到
+// Microsoft YaHei UI。同一个界面里两种字形混排，字宽和字重对不上，看着就"不齐"——
+// 面板里到处是"中文 + xxx.exe"这种混排，落差尤其明显。明写雅黑 UI（它自带完整
+// 拉丁字形）让中英同族，字号也才真的对得上。
+//
+// 不写 "Segoe UI Variable Text"：那是 Windows 11 才有的字体族，这台机器（Win10 22H2）
+// 没有，写进去只会静默回退成别的。
+const panelFont = "Microsoft YaHei UI"
+
+// fontOn 让视图测试能跳过设字体。mygo 解析字体族要回 native 主线程，
+// 而 ui.Tester 下没有主循环，设了会永久阻塞——和 Shell.* / mygo.App.* 在测试里
+// 卡死的毛病一样。测试环境本来也不需要看字形。
+var fontOn = true
+
+// usePanelFont 把当前主题的默认字体换成面板那一套。
+func usePanelFont(t *ui.Theme) {
+	if fontOn {
+		t.Font = panelFont
+	}
+}
+
 // resultKey 是结果在历史里的键：普通项用路径，命令用关键字。
 func resultKey(r search.Result) string {
 	if r.Path != "" {
@@ -365,6 +388,8 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 
 func (a *application) view(c *ui.Context) {
 	t := c.Theme()
+	// 面板统一用一套字体，见 panelFont。
+	usePanelFont(t)
 	root := c.Root()
 	if c.Vibrancy() {
 		root.Background(ui.Transparent)
@@ -496,7 +521,10 @@ func (a *application) homeGrid(c *ui.Context) {
 					if end > to {
 						end = to
 					}
-					ui.Row(c).Gap(cardGap).Children(func() {
+					// 顶部对齐是硬要求：卡片高度由"名字一行还是两行"决定，
+					// 默认的居中会让名字短的卡片整体往下沉，于是图标顶不齐、
+					// 标题也不在同一行（用户就是拿这个截图来指正的）。
+					ui.Row(c).Gap(cardGap).AlignItems(ui.Start).Children(func() {
 						for i := start; i < end; i++ {
 							a.card(c, i)
 						}

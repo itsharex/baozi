@@ -50,6 +50,9 @@ func testApp(t *testing.T) *application {
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
+	// 视图测试里不设自定义字体：解析字体族要回 native 主线程，ui.Tester 没有主循环，
+	// 设了测试会永久卡住（和 Shell.* / mygo.App.* 在测试里的毛病同源）。
+	fontOn = false
 	return &application{
 		cfg:     cfg,
 		cfgPath: filepath.Join(dir, "config.json"),
