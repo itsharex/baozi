@@ -1107,7 +1107,8 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 |---|---|
 | 首页是图标网格，「最近使用」+「已固定」两段，不是空白也不是纯列表 | `application.homeGrid()`：自己拼行（卡片 84 + 间距 6，一排几个由 `gridCols()` 按面板宽度算，默认 720 → 7），不用 `ui.Grid`——Grid 均分列宽会让卡片左右各空一截；`pinnedCount` 记录 results 里属于「已固定」的后缀长度 |
 | 选中应用 `Ctrl+K` 固定到首页 | `application.togglePin()` + `history.Store.TogglePin()`；标记存 `Entry.Pinned`，`Pinned(n)` 取固定项，`trim()` 优先保留固定项 |
-| 底栏左边写「会做什么」，右边写键位 | `footer()` + `keyCap()`：左边 `打开 抖音` / `已固定 · 记事本`，右边三组键帽 |
+| 底栏左边写「会做什么」，右边写键位 | `footer()` + `keyCap()`：左边 `打开 抖音` / `已固定 · 记事本`，右边几组键帽 |
+| 底栏分两层：键帽只提示，入口是按钮 | 键帽是"按了会怎样"的说明，故意画轻（`Surface` 底、无边框、10 号 `TextMuted`）；「设置」「互传」是能点的入口，用 `ui.Button`（白底 + `Border` 边 + 深色字，自带悬停/按下态），中间空开一截分组。早先两者同一套浅灰方块，看上去完全一样——这是反例，别再混回去 |
 | 选中行是「浅色胶囊 + 细边」 | `row()` 用 `Accent.Alpha(0.16)` 底 + `Accent.Alpha(0.5)` 1px 边；名称 14 粗、路径 11 灰 |
 | 顶栏放大镜 + 右上品牌胶囊 | 同一个 `SearchIcon` SVG + 右端「Baozi」胶囊 |
 | `Ctrl+Enter` 打开所在文件夹 | `application.openFolder()`：文件开父目录，目录开自身，`shell:` 路径直接跳过 |
