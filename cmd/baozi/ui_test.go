@@ -350,12 +350,12 @@ func TestGridColsFollowsPanelWidth(t *testing.T) {
 		t.Fatalf("默认 %d 宽时应为 %d 列，实际 %d", panelWidth, panelCols, got)
 	}
 	a.cfg.Panel.Width = 1200
-	if got := a.gridCols(); got != 13 {
-		t.Fatalf("1200 宽时一排 13 列，实际 %d", got)
+	if got := a.gridCols(); got != 12 {
+		t.Fatalf("1200 宽时一排 12 列，实际 %d", got)
 	}
 	a.cfg.Panel.Width = 480
-	if got := a.gridCols(); got != 5 {
-		t.Fatalf("480 宽时一排 5 列，实际 %d", got)
+	if got := a.gridCols(); got != 4 {
+		t.Fatalf("480 宽时一排 4 列，实际 %d", got)
 	}
 	// 再窄也得留一列，否则首页网格会一行都不画（那是彻底的空白）。
 	a.cfg.Panel.Width = config.MinPanelWidth

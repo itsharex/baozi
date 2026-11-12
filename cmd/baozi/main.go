@@ -49,10 +49,17 @@ const (
 	// 见 config.BaseIconSize / Config.IconSizeAt 与 application.iconSize。
 	// 之前是固定的 22 DIP，在 125% 缩放的屏上（这台机器就是）显得偏小。
 
-	// cardWidth 是首页卡片宽度，cardGap 是卡片间距，cardGutter 是网格左右留白。
-	// 一排几张不写死：面板宽度可以改，列数按这三个数算（application.gridCols）。
-	cardWidth  = 84
-	cardGap    = 6
+	// cardWidth 是首页卡片（也就是悬停/选中时那块圆角底）的宽度，cardGap 是列间距，
+	// cardGutter 是网格左右留白。一排几张不写死：列数按这三个数算（application.gridCols）。
+	//
+	// 这组数照用户给的启动器截图（470×119 那一排五个）量的比例定：图标之间的空隙
+	// 约等于图标宽的 0.6 倍，而底色块只比图标大一圈。原来卡片 84 宽、间距 6，块比图标
+	// 宽出一大截、图标之间反而贴得近，看着"块是块、图标是图标"两块互不相干。
+	cardWidth = 86
+	cardGap   = 12
+	// cardRowGap 是行间距，比列间距小得多：参考图里下一排图标紧跟着上一排的名字。
+	// 之前行、列共用 cardGap，第二排被推得太远，整片网格显得散。
+	cardRowGap = 12
 	cardGutter = 18
 	// panelCols 是默认宽度（720）下一排的卡片数，只给测试与默认布局当基准用；
 	// 真正渲染时一律走 a.gridCols()。
@@ -364,7 +371,7 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 	}
 	// 设置里把图标调大了，卡片跟着变高，落点判定也得跟着换，否则拖一格会跳两格。
 	// 行高 = 上下 padding 8 + 图标 + 图标与名字的间距 6 + 两行字 28.8 + 行间距 6。
-	rowStep := a.cardIcon() + 49
+	rowStep := a.cardIcon() + cardRowGap + 43
 	colStep := float32(cardWidth + cardGap)
 	colShift := int(math.Round(float64(dx) / float64(colStep)))
 	rowShift := int(math.Round(float64(dy) / float64(rowStep)))
@@ -515,7 +522,7 @@ func (a *application) homeGrid(c *ui.Context) {
 		// 一排几个由面板宽度算（gridCols），面板调宽调窄时列数自动跟着变。
 		cols := a.gridCols()
 		cards := func(from, to int) {
-			ui.Column(c).Gap(cardGap).Padding(2, cardGutter).Children(func() {
+			ui.Column(c).Gap(cardRowGap).Padding(2, cardGutter).Children(func() {
 				for start := from; start < to; start += cols {
 					end := start + cols
 					if end > to {
@@ -627,26 +634,26 @@ func (a *application) card(c *ui.Context, i int) {
 	if dragging {
 		bg = t.Accent.Alpha(0.22)
 	}
-	col := ui.Column(c).Width(cardWidth).Padding(6, 4).Gap(6).AlignItems(ui.Center).Radius(12).
-		Background(bg).
+	col := ui.Column(c).Width(cardWidth).Padding(4, 4).Gap(6).AlignItems(ui.Center).
 		OnClick(func() {
 			a.chosen = i
 			a.open()
 		}).
 		ContextMenu(func(m *ui.Menu) { a.itemMenu(m, i) }).
 		Children(func() {
-			// 图标装在一个**固定高度**的方块里再居中：位图和线框的自身尺寸不一样
-			// （线框 SVG 的图形只占网格的 18/24），不套这个盒子的话，每张卡的图标顶边
-			// 高低不一、下面的名字也跟着上下错开。有了它也才谈得上"名字都从同一行开始"。
-			ui.Row(c).Width(cardWidth - 12).Height(a.cardIcon()).
+			// 底色块只包住图标（比图标各大 4 像素），不铺满整张卡：照用户给的启动器截图，
+			// 选中那块是贴着图标的一圈圆角底，名字在黑底上、不参与高亮。
+			//
+			// 盒子固定高度是为了让位图和线框的图标顶边、名字基线都对得齐（线框 SVG 的
+			// 图形只占 24 网格的 18/24，不套盒子会小一圈、上下错开）。
+			ui.Row(c).Width(a.cardIcon() + 8).Height(a.cardIcon() + 4).Radius(12).Background(bg).
 				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				// 图标直接铺在卡片上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
-				// 辨识度，套个小方块只会把它压小、还多出一圈底色（用户要的就是启动器
-				// 那种"大图标 + 名字"的样子，见 cardIcon）。
+				// 图标直接铺在块上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
+				// 辨识度，套个小方块只会把它压小、还多出一圈底色（见 cardIcon）。
 				a.resultIcon(c, r, a.cardIcon())
 			})
 			// 名字最多两行：一行放得下就只占一行，超了才往下续第二行。
-			ui.Text(c, wrapName(r.Name, cardWidth-12, 2)).FontSize(12).TextColor(t.Text).
+			ui.Text(c, wrapName(r.Name, cardWidth-10, 2)).FontSize(12).TextColor(t.Text).
 				TextAlign(ui.Center).MaxLines(2).LineHeight(1.2).Tooltip(r.Name)
 		})
 	// 鼠标停在哪张卡上，就等于选中哪张（Enter / 右键 / 底栏都作用在它身上）。
