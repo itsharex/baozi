@@ -765,10 +765,22 @@ func (a *application) footer(c *ui.Context) {
 		a.keyCap(c, "右键", "删除/固定")
 		// 跟键帽之间空开一截，一眼能看出"提示"到这儿结束了，后面是两个入口。
 		ui.Row(c).Width(14).Height(1)
-		if ui.Button(c, "设置").Clicked() {
+		// 入口按钮带图标：文字按钮和键帽（浅灰小块）本来就容易混，加个图形立刻区分开，
+		// 也顺手把"哪个是设置、哪个是互传"从读字变成看图。
+		//
+		// 图标必须 Shrink(0)：底栏这一行里键帽占地方，空间不够时 flex 会把可压缩的
+		// 子元素一路压到 0 宽——图片就是那个最先被压没的东西（文字有 min-content 兜着，
+		// 图片没有），结果就是按钮只剩字、图标人间蒸发。
+		if btn := ui.Button(c, "").Shrink(0).Children(func() {
+			ui.Image(c, footerIcon(iconGear, t.Text, iconBitmapSize)).Size(16, 16).Shrink(0)
+			ui.Text(c, "设置").FontSize(12)
+		}); btn.Clicked() {
 			a.openSettings()
 		}
-		if ui.Button(c, "互传").Clicked() {
+		if btn := ui.Button(c, "").Shrink(0).Children(func() {
+			ui.Image(c, footerIcon(iconSwitch, t.Text, iconBitmapSize)).Size(16, 16).Shrink(0)
+			ui.Text(c, "互传").FontSize(12)
+		}); btn.Clicked() {
 			a.openShare()
 		}
 	})

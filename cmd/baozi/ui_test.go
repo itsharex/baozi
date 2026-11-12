@@ -632,6 +632,8 @@ func TestFooterHasEntryButtons(t *testing.T) {
 			t.Fatalf("底栏缺少入口 %q", want)
 		}
 	}
+	// 这个测试也顺带出图：底栏的图标是位图（不是文字），只断言文字看不出它画没画出来。
+	dumpPreview(t, tr)
 }
 
 func TestFooterShowsCopyPathKey(t *testing.T) {
