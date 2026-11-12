@@ -50,6 +50,8 @@ const (
 	// panelCols 是首页网格每行的卡片数：720 宽的面板，卡片 84 + 间距 6，一排 7 个。
 	// 方向键按行移动（上下各走一行）。
 	panelCols = 7
+	// cardWidth 是首页卡片宽度。图标最大 64 时仍然放得下（左右各留 6 的内边）。
+	cardWidth = 84
 	// maxPinned 是首页「已固定」区最多显示几个。
 	maxPinned = 12
 
@@ -318,8 +320,8 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 		return nil
 	}
 	// 设置里把图标调大了，卡片跟着变高，落点判定也得跟着换，否则拖一格会跳两格。
-	_, box := a.cardIconBox()
-	rowStep := float32(box + 57)
+	// 行高 = 上下 padding 8 + 图标 + 图标与名字的间距 6 + 两行字 28.8 + 行间距 6。
+	rowStep := a.cardIcon() + 49
 	colShift := int(math.Round(float64(dx) / 90))
 	rowShift := int(math.Round(float64(dy) / float64(rowStep)))
 	if colShift == 0 && rowShift == 0 {
@@ -554,10 +556,9 @@ func wrapName(name string, width float32, lines int) string {
 }
 
 // card 是首页网格里的一格：圆角图标块 + 居中的名字。
-// 尺寸照 Pane 的紧凑感：卡片 84 宽，图标块 32（跟着设置会涨到 38 为止），
-// 名字 10.5 号、最多三行
-// （三行才装得下 app 的真实名字，比如 "SnowShot_Video_2026-10-29_13-31-04.mp4"）。
-// 卡片宽高不跟着图标变——首页要整齐，放大留给结果行（见 cardIconBox）。
+// 尺寸照启动器那种"大图标 + 名字"的样子：卡片 84 宽，图标 55（跟着设置缩放），
+// 名字 12 号、最多两行。不再给图标套浅灰方块——那层底色会把彩色图标压小一圈。
+// 卡片宽不跟着图标变：哪怕图标调到 64，84 宽也还放得下，首页保持整齐。
 func (a *application) card(c *ui.Context, i int) {
 	r := a.results[i]
 	t := c.Theme()
@@ -573,7 +574,7 @@ func (a *application) card(c *ui.Context, i int) {
 		bg = t.SurfaceHover
 		border = t.Accent.Alpha(0.8)
 	}
-	col := ui.Column(c).Width(84).Padding(8, 4).Gap(5).AlignItems(ui.Center).Radius(12).
+	col := ui.Column(c).Width(cardWidth).Padding(6, 4).Gap(6).AlignItems(ui.Center).Radius(12).
 		Background(bg).BorderWidth(1).BorderColor(border).
 		OnClick(func() {
 			a.chosen = i
@@ -581,13 +582,12 @@ func (a *application) card(c *ui.Context, i int) {
 		}).
 		ContextMenu(func(m *ui.Menu) { a.itemMenu(m, i) }).
 		Children(func() {
-			icon, box := a.cardIconBox()
-			ui.Row(c).Width(box).Height(box).Radius(8).Background(t.Surface).
-				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				a.resultIcon(c, r, icon)
-			})
-			ui.Text(c, wrapName(r.Name, 76, 3)).FontSize(10.5).TextColor(t.Text).
-				TextAlign(ui.Center).MaxLines(3).LineHeight(1.2).Tooltip(r.Name)
+			// 图标直接铺在卡片上，不再套那个浅灰方块：应用/程序的彩色图标本身就是
+			// 辨识度，套个小方块只会把它压小、还多出一圈底色（用户要的就是启动器
+			// 那种"大图标 + 名字"的样子，见 cardIcon）。
+			a.resultIcon(c, r, a.cardIcon())
+			ui.Text(c, wrapName(r.Name, cardWidth-12, 2)).FontSize(12).TextColor(t.Text).
+				TextAlign(ui.Center).MaxLines(2).LineHeight(1.2).Tooltip(r.Name)
 		})
 	if !pinned {
 		return
@@ -716,19 +716,18 @@ func (a *application) iconSize() float32 {
 	return a.cfg.IconSizeAt(a.scale)
 }
 
-// cardIconBox 是首页卡片里那个浅色方块和其中图标的尺寸。
-// 卡片只有 84 宽（内容区 68），图标放到 30 就到头了，再大名字没地方放；
-// 反过来也不跟着设置往小缩——首页要的是整齐，不是跟着搜索行变。
-func (a *application) cardIconBox() (icon, box float32) {
-	icon = a.iconSize()
-	if icon < 23 {
-		icon = 23
+// cardIcon 是首页卡片里图标的边长。卡片 84 宽，图标按"结果行图标 ×2.2"放大
+// ——125% 缩放下结果行是 27.5、卡片就是 60.5，接近启动器那种"图标占满整格"的比例
+// （再大名字就只剩一行了）。上下都夹一下：太小认不出、太大名字没地方放。
+func (a *application) cardIcon() float32 {
+	icon := a.iconSize() * 2.2
+	if icon < 32 {
+		icon = 32
 	}
-	if icon > 30 {
-		icon = 30
+	if icon > 64 {
+		icon = 64
 	}
-	// 原来 23 的图标配 32 的方块，四边各留 4.5。保持这个内边宽度。
-	return icon, icon + 9
+	return icon
 }
 
 // resultIcon 画结果左侧的类型图标：文件/目录/命令用单色线框（icon.go），
@@ -795,17 +794,18 @@ func badge(r search.Result) string {
 // 对不上"就是这么来的）。文件与目录已改成 icon.go 里的单色线框图标，
 // 不再走这里——少了几万次 COM 调用，也不会再冒出深色底上的白色纸片。
 func (a *application) appIcon(r search.Result, px int) *ui.Bitmap {
-	if a.offline {
-		return nil
-	}
 	scale := a.scale
 	if scale <= 0 {
 		scale = 1
 	}
 	px = int(float32(px) * scale)
 	key := fmt.Sprintf("app:%d:%s", px, r.Path)
+	// 先看缓存：已经解码好的图标不依赖 Shell，离线（视图测试）也能照常画出来。
 	if b, ok := a.icons[key]; ok {
 		return b
+	}
+	if a.offline {
+		return nil
 	}
 	data, _ := mygo.Shell.FileIcon(r.Path, px)
 	if trimmed, err := win.TrimIcon(data); err == nil {

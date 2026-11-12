@@ -166,6 +166,60 @@ func TestPinDragReorders(t *testing.T) {
 	}
 }
 
+// TestCardIconPreview 用真实程序图标渲染首页卡片，看"大图标 + 名字、没有方块底"
+// 到底是什么样。图标不走 mygo.Shell.FileIcon（ui.Tester 里没有主循环会永久阻塞），
+// 而是用自家 COM 的 win.Thumbnail 取 .exe 的图标塞进缓存——appIcon 现在先查缓存，
+// 离线也能命中，所以这条路径画出来的就是真机上的效果。
+// 配 BAOZI_PREVIEW 出图；不设就把这个测试当"布局没崩"的冒烟。
+func TestCardIconPreview(t *testing.T) {
+	a := testApp(t)
+	exes := []string{
+		`C:\Windows\System32\notepad.exe`,
+		`C:\Windows\System32\mspaint.exe`,
+		`C:\Windows\System32\mstsc.exe`,
+		`C:\Windows\System32\calc.exe`,
+		`C:\Windows\System32\Taskmgr.exe`,
+	}
+	// 缓存键要跟 appIcon 算出来的一字不差：它把 size*2.2 再乘一次缩放。
+	px := int(float32(int(a.cardIcon()*2.2)) * a.scale)
+	for _, p := range exes {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		data, err := win.Thumbnail(p, px)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		// 真机路径会裁掉图标四周的透明边，这里照做，否则缩略图偏小。
+		if trimmed, err := win.TrimIcon(data); err == nil {
+			data = trimmed
+		}
+		if bm, _ := ui.DecodeBitmap(data); bm != nil {
+			a.icons[fmt.Sprintf("app:%d:%s", px, p)] = bm
+		}
+	}
+	a.results = []search.Result{
+		{Item: search.Item{Name: "记事本", Path: exes[0], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
+		{Item: search.Item{Name: "画图", Path: exes[1], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
+		{Item: search.Item{Name: "远程桌面连接", Path: exes[2], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
+		{Item: search.Item{Name: "计算器", Path: exes[3], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
+		{Item: search.Item{Name: "任务管理器", Path: exes[4], Ext: ".exe", Kind: search.KindFile, Hint: `C:\Windows\System32`}},
+		{Item: search.Item{Name: "文档", Path: `D:\docs`, Kind: search.KindDir, Hint: `D:\`}},
+		{Item: search.Item{Name: "会议记录.txt", Path: `D:\docs\会议记录.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `D:\docs`}},
+	}
+	a.pinnedCount = len(a.results)
+	a.choose(0)
+
+	tst := ui.NewTester(a.view, panelWidth, panelHeight)
+	tst.Frame()
+	for _, want := range []string{"记事本", "画图", "文档", "会议记录.txt"} {
+		if _, ok := tst.Find(want); !ok {
+			t.Fatalf("首页没渲染出「%s」", want)
+		}
+	}
+	dumpPreview(t, tst)
+}
+
 // 按下但取消（没真的拖动）不该改动顺序。
 // 用 CancelPress 而不是 Release：同一位置的按下+松开在卡片上是"点击"，
 // 会走到 open() 去打真文件，视图测试里不能碰。
