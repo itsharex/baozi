@@ -136,6 +136,9 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
   var ws = new WebSocket(location.origin.replace(/^http/, "ws") + "/ws?code=" + code + "&role=receiver");
   var pc = null, dc = null, manifest = null, parts = [], received = 0, total = 0;
   var opened = false;
+  // finished 是"已经收到 done"的标志。此后连接断掉是正常的（对方发完就退出了），
+  // 不能再把 connectionState 的 failed 当成错误盖到"已完成"上面。
+  var finished = false;
 
   ws.onopen = function () { setState("已连上信令，等对方进入房间…", "wait"); };
   ws.onerror = function () { fail("连不上信令服务器（" + location.host + "）"); };
@@ -169,10 +172,11 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
       };
       dc.onmessage = onData;
       dc.onclose = function () {
-        if (!manifest) setState("连接被对方关闭", "bad");
+        if (!manifest && !finished) setState("连接被对方关闭", "bad");
       };
     };
     pc.onconnectionstatechange = function () {
+      if (finished) return; // 传完了断开是正常的，别再报错
       if (pc.connectionState === "failed") fail("两端网络打不通（对称 NAT 或防火墙拦了）");
       if (pc.connectionState === "connected" && !opened) setState("已连上，等数据通道打开…", "ok");
     };
@@ -217,6 +221,7 @@ export const RECEIVER_HTML = `<!DOCTYPE html>
         renderList();
         setState("接收中…", "ok");
       } else if (m.type === "done") {
+        finished = true;
         received = total > 0 ? total : received;
         finish();
       }
