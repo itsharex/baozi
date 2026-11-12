@@ -49,21 +49,22 @@ const (
 	// 见 config.BaseIconSize / Config.IconSizeAt 与 application.iconSize。
 	// 之前是固定的 22 DIP，在 125% 缩放的屏上（这台机器就是）显得偏小。
 
-	// cardWidth 是首页卡片（也就是悬停/选中时那块圆角底）的宽度，cardGap 是列间距，
+	// cardWidthMin 是首页卡片（也就是悬停/选中时那块圆角底）的最小宽度，cardGap 是列间距，
 	// cardGutter 是网格左右留白。一排几张不写死：列数按这三个数算（application.gridCols）。
+	// 实际宽度由 a.cellWidth() 给：图标调大时卡片跟着变宽，名字才不会被挤成两行。
 	//
 	// 这组数照用户给的启动器截图（470×119 那一排五个）量的比例定：图标之间的空隙
 	// 约等于图标宽的 0.6 倍，而底色块只比图标大一圈。原来卡片 84 宽、间距 6，块比图标
 	// 宽出一大截、图标之间反而贴得近，看着"块是块、图标是图标"两块互不相干。
-	cardWidth = 86
-	cardGap   = 12
+	cardWidthMin = 86
+	cardGap      = 12
 	// cardRowGap 是行间距，比列间距小得多：参考图里下一排图标紧跟着上一排的名字。
 	// 之前行、列共用 cardGap，第二排被推得太远，整片网格显得散。
 	cardRowGap = 12
 	cardGutter = 18
 	// panelCols 是默认宽度（720）下一排的卡片数，只给测试与默认布局当基准用；
 	// 真正渲染时一律走 a.gridCols()。
-	panelCols = (panelWidth - 2*cardGutter + cardGap) / (cardWidth + cardGap)
+	panelCols = (panelWidth - 2*cardGutter + cardGap) / (cardWidthMin + cardGap)
 
 	// maxPinned 是首页「已固定」区最多显示几个。
 	maxPinned = 12
@@ -372,7 +373,7 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 	// 设置里把图标调大了，卡片跟着变高，落点判定也得跟着换，否则拖一格会跳两格。
 	// 行高 = 上下 padding 8 + 图标 + 图标与名字的间距 6 + 两行字 28.8 + 行间距 6。
 	rowStep := a.cardIcon() + cardRowGap + 43
-	colStep := float32(cardWidth + cardGap)
+	colStep := a.cellWidth() + cardGap
 	colShift := int(math.Round(float64(dx) / float64(colStep)))
 	rowShift := int(math.Round(float64(dy) / float64(rowStep)))
 	if colShift == 0 && rowShift == 0 {
@@ -518,7 +519,7 @@ func (a *application) homeGrid(c *ui.Context) {
 			ui.Text(c, title).FontSize(11).TextColor(t.TextMuted).Padding(10, 18, 3, 18)
 		}
 		// 不用 Grid：它的列宽是均分的，相同宽度下每列会比卡片宽、卡片居中会左右各空一截，
-		// 看着"占位很大"。这里自己拼行：卡片固定 cardWidth、间距 cardGap，
+		// 看着"占位很大"。这里自己拼行：卡片宽度走 cellWidth()、间距 cardGap，
 		// 一排几个由面板宽度算（gridCols），面板调宽调窄时列数自动跟着变。
 		cols := a.gridCols()
 		cards := func(from, to int) {
@@ -634,7 +635,7 @@ func (a *application) card(c *ui.Context, i int) {
 	if dragging {
 		bg = t.Accent.Alpha(0.22)
 	}
-	col := ui.Column(c).Width(cardWidth).Padding(6, 4).Gap(6).AlignItems(ui.Center).Radius(12).
+	col := ui.Column(c).Width(a.cellWidth()).Padding(6, 4).Gap(6).AlignItems(ui.Center).Radius(12).
 		Background(bg).
 		OnClick(func() {
 			a.chosen = i
@@ -655,7 +656,7 @@ func (a *application) card(c *ui.Context, i int) {
 				a.resultIcon(c, r, a.cardIcon())
 			})
 			// 名字最多两行：一行放得下就只占一行，超了才往下续第二行。
-			ui.Text(c, wrapName(r.Name, cardWidth-12, 2)).FontSize(12).TextColor(t.Text).
+			ui.Text(c, wrapName(r.Name, a.cellWidth()-12, 2)).FontSize(12).TextColor(t.Text).
 				TextAlign(ui.Center).MaxLines(2).LineHeight(1.2).Tooltip(r.Name)
 		})
 	// 鼠标停在哪张卡上，就等于选中哪张（Enter / 右键 / 底栏都作用在它身上）。
@@ -825,7 +826,7 @@ func (a *application) iconSize() float32 {
 // 方向键"上下走一行"用的也是它，所以它和 homeGrid 的排布必须同源。
 func (a *application) gridCols() int {
 	w, _ := a.panelSize()
-	n := (w - 2*cardGutter + cardGap) / (cardWidth + cardGap)
+	n := (w - 2*cardGutter + cardGap) / int(a.cellWidth()+cardGap)
 	return max(1, n)
 }
 
@@ -842,18 +843,30 @@ func (a *application) panelSize() (int, int) {
 	return a.cfg.PanelSize()
 }
 
-// cardIcon 是首页卡片里图标的边长。卡片 84 宽，图标按"结果行图标 ×2.2"放大
+// cardIcon 是首页卡片里图标的边长。卡片里图标按"结果行图标 ×2.2"放大
 // ——125% 缩放下结果行是 27.5、卡片就是 60.5，接近启动器那种"图标占满整格"的比例
-// （再大名字就只剩一行了）。上下都夹一下：太小认不出、太大名字没地方放。
+// （再大名字就只剩一行了）。只夹下限：太小认不出是什么。
+//
+// 上限不夹：图标大小是倍数之后，200% 在 4K 屏（系统 200% 缩放）会算到 88 像素、
+// 卡片跟着长到 104 宽，一排自然少放几张——用户把倍数调大，要的就是这个大。
+// 夹一个上限等于把"倍数"这个说法废掉一半。
 func (a *application) cardIcon() float32 {
 	icon := a.iconSize() * 2.2
 	if icon < 32 {
 		icon = 32
 	}
-	if icon > 64 {
-		icon = 64
-	}
 	return icon
+}
+
+// cellWidth 是首页一张卡（也是选中时那块圆角底）的宽度：至少 cardWidthMin
+// （要撑住"远程桌面连接"这种六字名），图标放大时按图标宽度加一圈留白。
+// 网格列数、拖动换位的步长都从它来，三者必须同源。
+func (a *application) cellWidth() float32 {
+	w := a.cardIcon() + 16
+	if w < cardWidthMin {
+		w = cardWidthMin
+	}
+	return w
 }
 
 // resultIcon 画结果左侧的类型图标：文件/目录/命令用单色线框（icon.go），

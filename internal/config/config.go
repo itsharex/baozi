@@ -113,10 +113,30 @@ type Search struct {
 	// Thumbnails 控制图片/视频在结果里显示内容缩略图还是类型线框图标。
 	// 指针是为了区分"没配置过"（nil，按开处理）和"用户明确关掉"。
 	Thumbnails *bool `json:"thumbnails,omitempty"`
-	// IconSize 是结果里那个图标块的边长（DIP 逻辑像素）。0（含没配置）表示
-	// 跟随系统缩放：100% 时 BaseIconSize、125% 时 ×1.25。
-	// 填了具体数字就照它显示，不再乘缩放——用户填的是他想要看到的大小。
+	// IconScale 是图标大小的倍数：1 = 100%，也就是系统缩放下的默认样子
+	// （100% 屏上是 22、125% 屏上是 27.5）。0（含没配置）按 100% 算。
+	// 设置页给 75/100/125/150/175/200% 几个台阶，也能手输（夹在 0.5~3 之间）。
+	IconScale float64 `json:"iconScale,omitempty"`
+	// IconSize 是旧字段（像素），只用于读老配置：升级时按"像素 ÷ 当时的默认大小"
+	// 折算成倍数，老用户看到的图标大小不会跳一下。新配置写的是 IconScale。
 	IconSize int `json:"iconSize,omitempty"`
+}
+
+// IconScale 的上下限：再小认不出是什么图标，再大名字就没地方放了。
+const (
+	MinIconScale = 0.5
+	MaxIconScale = 3.0
+)
+
+// ClampIconScale 把倍数收进合法区间，挡掉手输的 0、负数、离谱大的值。
+func ClampIconScale(k float64) float64 {
+	if k < MinIconScale {
+		return MinIconScale
+	}
+	if k > MaxIconScale {
+		return MaxIconScale
+	}
+	return k
 }
 
 // BaseIconSize 是 100% 缩放下的默认图标边长。这个基数决定"默认看起来多大"，
@@ -124,12 +144,19 @@ type Search struct {
 const BaseIconSize = 22
 
 // IconSizeAt 返回在给定系统缩放下的图标边长。
+//
+// 三档取值，优先级从高到低：IconScale（倍数，新配置）→ IconSize（像素，老配置）
+// → 什么都没有就按 100% 跟随系统缩放。
 func (c *Config) IconSizeAt(scale float32) float32 {
-	if n := c.Search.IconSize; n > 0 {
-		return float32(n)
-	}
 	if scale <= 0 {
 		scale = 1
+	}
+	if k := c.Search.IconScale; k > 0 {
+		return BaseIconSize * scale * float32(ClampIconScale(k))
+	}
+	// 老配置里存的是像素：直接用它，别因为升级让老用户的图标大小变了一遍。
+	if n := c.Search.IconSize; n > 0 {
+		return float32(n)
 	}
 	return BaseIconSize * scale
 }

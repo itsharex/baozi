@@ -996,7 +996,7 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 | 常规·唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
 
 | 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
-| 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`NumberInput`（图标大小）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.iconSize` / `search.thumbnails` |
+| 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Select` + `NumberInput`（图标大小：台阶/自定义倍数）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.iconScale` / `search.thumbnails` |
 | 常规·索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
 | 自定义命令 | 左列 `ui.List`（每条两行：显示名 + 全部激活词）＋ 新建/删除；右列表单：`TextInput`×3（激活词 / 显示名 / 程序）、`TextArea`（参数，一行一个）、`TextInput`（工作目录）、`Checkbox`（执行后不收起）、「将执行：」实时预览 | `commands`（结构化，不再是竖线文本） |
 
@@ -1164,34 +1164,42 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 - 开关：`search.thumbnails`（`*bool`，nil 视为开），设置界面的「排序」区有勾选。
   关掉后一律线框图标。
 
-### 图标多大（`search.iconSize` + `application.iconSize`）
+### 图标多大（`search.iconScale` + `application.iconSize`）
 
 结果行左边那个图标，尺寸过去是写死的 22 DIP。22 在 720 宽的面板里占 3%，在 125% 缩放的屏上
 （这台机器就是 120 DPI = 125%）看着偏小——虽然 mygo 是 PerMonitorV2 DPI-aware、22 DIP 已经
 被系统渲染成 27.5 物理像素，但**相对面板的比例没变**，用户看到的还是"小"。
 
-现在：
+**单位是倍数，不是像素**（用户的原话："为什么设定的是 px，改为倍数"）。像素说法有个绕不过去的
+问题：换台显示器、改一下系统缩放，同一个数字看起来就不一样了，用户没法表达"我要比默认大一圈"。
 
 - `config.BaseIconSize = 22` 是 100% 缩放下的基数；
-- 配置里 `search.iconSize` 为 0（缺省）→ 显示 `BaseIconSize × 系统缩放`，于是 125% 的屏上是
-  27.5、150% 是 33，**和高 DPI 屏的缩放一起变**；
-- 填了具体数字（1~64）→ 就按那个数字显示，**不再乘缩放**（用户填的是他想要看到多大）。
+- `search.iconScale` 是倍数（1 = 100%），`IconSizeAt` 算 `BaseIconSize × 系统缩放 × 倍数`。
+  于是 100% 在任何屏上都是"这块屏的默认样子"，125% 屏上是 27.5、150% 是 33；
+- 倍数夹在 `MinIconScale = 0.5` ~ `MaxIconScale = 3`：再小认不出图标，再大格子撑爆面板；
+- 设置页给 75/100/125/150/175/200% 六个台阶，选「自定义」才露出手输框（步进 0.05）；
+- **老配置兼容**：`search.iconSize`（像素）字段留着，`IconSizeAt` 的优先级是
+  `iconScale → iconSize → 跟随系统缩放`。老用户升级时看到的尺寸不会跳一下；
+  一旦在设置页保存过，就写 `iconScale` 并把 `iconSize` 清零（两套值同时存在没人说得清信哪个）。
 
 `application.iconSize()` 只做一件事：`a.cfg.IconSizeAt(a.scale)`。`a.scale` 是 `ready()` 里
 `mygo.Screen.Displays()` 取到的最大缩放（App 级 API，在 `ui.Tester` 下会阻塞，所以只算一次缓存）。
 
 两个跟尺寸耦合的地方要一起改，否则会出现"设置生效了但布局错位"：
 
-1. **首页卡片**（`cardIcon`）：卡片 84 宽，图标按"结果行图标 ×2.2"放大并夹在 32~64
-   （125% 缩放下是 60.5，占满整格）。图标直接铺在卡片上，**不再套那个浅灰圆角方块**——
-   那层底色既把彩色图标压小一圈，又多出一块和背景打架的灰面。用户给的目标样子是
-   游戏启动器那种"大图标 + 下方居中名字"，方块底是它不要的。
-   卡片高度因此是"上下 padding 8 + 图标 + 6 + 两行字 + 行距 6"，`pinMoveFor` 用
+1. **首页卡片**（`cardIcon` / `cellWidth`）：图标按"结果行图标 ×2.2"放大，卡片宽度
+   `cellWidth() = max(86, 图标 + 16)`——**卡片跟着图标变宽**，不再是一个固定 86。
+   早先卡片写死 84 宽、图标夹在 64 以内，倍数一调大图标就会顶出底块；现在宽度、列数
+   （`gridCols`）、拖动换位的步长（`pinMoveFor.colStep`）全部从 `cellWidth()` 来，三者同源，
+   所以"图标放大 → 一排少放几张"是自然结果，不是裁掉。
+   图标只夹下限 32：上限不夹，因为夹了就等于把"倍数"这个说法废掉一半。
+   卡片高度是"上下 padding 8 + 图标 + 6 + 两行字 + 行距 6"，`pinMoveFor` 用
    `icon + 49` 跟着算，不然拖动重排会跳格。
 2. **结果行行高**：行高是"图标"和"名字 + 提示两行字"取高的那个，而名字那列本身就有 38 左右。
    所以 22 → 27.5 时**行高不变、显示行数也不变，只是图标变大**；只有图标超过 38 才会把行撑开。
    这不是 bug，是想要的：默认换大一号不该让一屏少显示两行。`TestIconSizeSettingGrowsRows`
-   把这两段都钉住了（44 时行高几乎不动，60 时才明显涨）。
+   把这两段都钉住了（44 时行高几乎不动，60 时才明显涨），`TestIconScaleWidensCards`
+   钉住"倍数放大 → 卡片变宽 → 一排变少"这条连锁。
 
 **卡片里图标只有程序是彩色的**：`KindApp` 与 `.exe/.lnk/.msi/...` 走 `appIcon`（系统彩色图标），
 目录/文档/命令仍是 `icon.go` 的单色线框（那是 Pane 式的统一语言，也是当初换掉系统文件图标的

@@ -49,6 +49,27 @@ func TestIconSizeAt(t *testing.T) {
 	if got := c.IconSizeAt(1.25); got != 34 {
 		t.Fatalf("用户填了 34 就该是 34（不再乘缩放），实际 %v", got)
 	}
+
+	// 倍数（新配置）优先于旧的像素字段：1 倍就是系统缩放下的默认大小。
+	c.Search.IconSize = 0
+	c.Search.IconScale = 1
+	if got := c.IconSizeAt(1.25); got != BaseIconSize*1.25 {
+		t.Fatalf("100%% 倍应是默认大小 %v，实际 %v", BaseIconSize*1.25, got)
+	}
+	// 125% 是"在默认基础上再大一圈"，系统缩放照样要乘进去。
+	c.Search.IconScale = 1.25
+	if got := c.IconSizeAt(1.25); got != BaseIconSize*1.25*1.25 {
+		t.Fatalf("125%% 倍应再放大一圈，实际 %v", got)
+	}
+	// 手输的离谱值要被夹住：0.1 倍会小到认不出，10 倍会把格子撑爆。
+	for _, tc := range []struct {
+		in, want float64
+	}{{0.1, MinIconScale}, {10, MaxIconScale}} {
+		c.Search.IconScale = tc.in
+		if got := c.IconSizeAt(1); got != float32(BaseIconSize*tc.want) {
+			t.Fatalf("%v 倍应夹到 %v，实际 %v", tc.in, tc.want, got)
+		}
+	}
 }
 
 // 目录来源开关的缺省语义：配置里没有这一块 → 全部启用（老配置的行为不变）。

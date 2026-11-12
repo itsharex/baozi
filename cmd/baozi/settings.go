@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 	"unicode"
@@ -36,8 +37,11 @@ type settingsWindow struct {
 	maxResults float64
 	// thumbnails 决定图片/视频显示内容缩略图还是线框图标。
 	thumbnails bool
-	// iconSize 是结果行图标的边长（DIP）；0 = 跟随系统缩放。
-	iconSize float64
+	// iconScale 是图标的倍数（1 = 100%）。界面给几个台阶，也能手输。
+	iconScale float64
+	// iconPreset 是下拉里当前选中的那一项（某个台阶标签，或「自定义」）。
+	// 单独记一份，是为了让"选了自定义"这个状态活过每一帧重绘。
+	iconPreset string
 
 	roots         string
 	excludes      string
@@ -112,7 +116,8 @@ func (s *settingsWindow) load() {
 	s.typeOrder = strings.Join(cfg.Search.TypeOrder, ", ")
 	s.maxResults = float64(cfg.Search.MaxResults)
 	s.thumbnails = cfg.ThumbnailsOn()
-	s.iconSize = float64(cfg.Search.IconSize)
+	s.iconScale = iconScaleOf(cfg, s.app.scale)
+	s.iconPreset = iconPresetLabel(s.iconScale)
 
 	s.roots = strings.Join(cfg.Index.Roots, "\n")
 	s.excludes = strings.Join(cfg.Index.Excludes, "\n")
@@ -250,11 +255,26 @@ func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 			ui.Text(c, "最多显示结果数").FontSize(12).TextColor(t.TextMuted).Width(150)
 			ui.NumberInput(c, &s.maxResults, 10, 500, 10).Width(120)
 		})
+		iconLabels := iconScaleLabels()
+		iconSel := s.iconPreset
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "图标大小").FontSize(12).TextColor(t.TextMuted).Width(150)
-			ui.NumberInput(c, &s.iconSize, 0, 64, 2).Width(120)
+			ui.Select(c, &iconSel, iconLabels).Width(130)
+			if iconSel == iconCustomLabel {
+				ui.NumberInput(c, &s.iconScale, config.MinIconScale, config.MaxIconScale, 0.05).Width(90)
+				ui.Text(c, "倍").FontSize(12).TextColor(t.TextMuted)
+			}
 			ui.Text(c, s.iconPreview()).FontSize(11).TextColor(t.TextMuted)
 		})
+		// 台阶 + 自定义：选台阶直接落到那个倍数，选「自定义」才露出输入框。
+		// 选择本身记在 s.iconPreset 里——否则手输一个不在台阶上的值之后，
+		// 下拉会自己跳回最近的台阶，输入框跟着消失。
+		if iconSel != s.iconPreset {
+			s.iconPreset = iconSel
+			if v, ok := iconPresetValue(iconSel); ok {
+				s.iconScale = v
+			}
+		}
 		ui.Checkbox(c, &s.thumbnails, "图片、视频、PDF 显示内容缩略图")
 		ui.Text(c, "缩略图在后台取，取到才替换掉线框图标，不会拖慢唤出。"+
 			"关掉后一律用单色线框图标（系统没有缩略图提供者的文件本来也只有线框）。").FontSize(11).TextColor(t.TextMuted)
@@ -510,18 +530,76 @@ func sectionTitle(c *ui.Context, t *ui.Theme, title, desc string) {
 	})
 }
 
-// iconPreview 在"图标大小"输入框旁边说清现在到底会显示多大：
-// 填 0（跟随系统缩放）时给出按缩放算出的实际值，填了具体数字就说明它不再乘缩放。
-// 用的是编辑中的值，不是已保存的配置，所以改数字时这行字会跟着变。
+// iconCustomLabel 是下拉里"自定义"那一项：选它才露出倍数输入框。
+const iconCustomLabel = "自定义"
+
+// iconScaleSteps 是图标大小的几个台阶。100% 就是系统缩放下的默认大小，
+// 所以这几个数不是"绝对尺寸"，而是"在默认基础上再放大缩小多少"。
+var iconScaleSteps = []struct {
+	Label string
+	Value float64
+}{
+	{"75%", 0.75},
+	{"100%", 1},
+	{"125%", 1.25},
+	{"150%", 1.5},
+	{"175%", 1.75},
+	{"200%", 2},
+}
+
+func iconScaleLabels() []string {
+	out := make([]string, 0, len(iconScaleSteps)+1)
+	for _, s := range iconScaleSteps {
+		out = append(out, s.Label)
+	}
+	return append(out, iconCustomLabel)
+}
+
+// iconPresetLabel 报告当前倍数落在哪个台阶上；不在任何一个台阶上就是"自定义"。
+func iconPresetLabel(k float64) string {
+	for _, s := range iconScaleSteps {
+		if math.Abs(s.Value-k) < 0.005 {
+			return s.Label
+		}
+	}
+	return iconCustomLabel
+}
+
+// iconPresetValue 把台阶标签换回倍数；"自定义"没有对应值。
+func iconPresetValue(label string) (float64, bool) {
+	for _, s := range iconScaleSteps {
+		if s.Label == label {
+			return s.Value, true
+		}
+	}
+	return 0, false
+}
+
+// iconScaleOf 是"配置里到底该按几倍画"：新字段优先；老配置里存的是像素，
+// 按当时的默认大小折成倍数，免得升级后图标突然变了个样。
+func iconScaleOf(cfg *config.Config, sysScale float32) float64 {
+	if k := cfg.Search.IconScale; k > 0 {
+		return config.ClampIconScale(k)
+	}
+	if n := cfg.Search.IconSize; n > 0 {
+		base := float64(config.BaseIconSize)
+		if sysScale > 0 {
+			base *= float64(sysScale)
+		}
+		return config.ClampIconScale(float64(n) / base)
+	}
+	return 1
+}
+
+// iconPreview 在"图标大小"旁边说清现在到底会画多大：给出倍数、系统缩放，
+// 以及换算出来的实际像素。用的是编辑中的值，所以改一下这行字就跟着变。
 func (s *settingsWindow) iconPreview() string {
 	scale := s.app.scale
 	if scale <= 0 {
 		scale = 1
 	}
-	if s.iconSize >= 1 {
-		return fmt.Sprintf("%.0f 像素（固定，不再跟着缩放）", s.iconSize)
-	}
-	return fmt.Sprintf("0 = 跟随系统缩放，当前 %g%% → %.1f 像素", scale*100, config.BaseIconSize*scale)
+	base := float64(config.BaseIconSize) * float64(scale)
+	return fmt.Sprintf("→ %.1f 像素（系统缩放 %g%%）", base*config.ClampIconScale(s.iconScale), scale*100)
 }
 
 func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
@@ -551,7 +629,9 @@ func (s *settingsWindow) save() {
 	cfg.Search.TypeOrder = splitList(s.typeOrder)
 	cfg.Search.MaxResults = int(s.maxResults)
 	cfg.Search.Thumbnails = boolPtr(s.thumbnails)
-	cfg.Search.IconSize = int(s.iconSize)
+	cfg.Search.IconScale = config.ClampIconScale(s.iconScale)
+	// 旧字段清零：两套值同时存在时没人说得清该信哪个。
+	cfg.Search.IconSize = 0
 
 	oldRoots := s.app.cfg.Index.Roots
 	cfg.Index.Roots = splitLines(s.roots)

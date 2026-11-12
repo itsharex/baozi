@@ -108,7 +108,74 @@ func TestSettingsViewRenders(t *testing.T) {
 			t.Fatalf("设置界面缺少来源开关 %q", want)
 		}
 	}
+	// 图标大小那一行：下拉在未展开时只画当前值，所以这里只确认这一行在，
+	// 台阶本身由 TestIconScalePresets 直接查数据。
+	if !tester.HasText("图标大小") {
+		t.Fatal("设置界面缺少「图标大小」这一行")
+	}
 	dumpPreview(t, tester)
+}
+
+// 台阶本身：下拉里要有哪几档、当前倍数落在哪一档、手输的值如何归类。
+func TestIconScalePresets(t *testing.T) {
+	labels := iconScaleLabels()
+	for _, want := range []string{"75%", "100%", "125%", "150%", "175%", "200%", iconCustomLabel} {
+		found := false
+		for _, l := range labels {
+			if l == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("台阶里缺少 %q，实际 %v", want, labels)
+		}
+	}
+
+	// 1.25 落在 125% 这一档；1.3 不在任何台阶上，归自定义。
+	if got := iconPresetLabel(1.25); got != "125%" {
+		t.Fatalf("1.25 倍应当是 125%%，实际 %q", got)
+	}
+	if got := iconPresetLabel(1.3); got != iconCustomLabel {
+		t.Fatalf("1.3 倍应当归自定义，实际 %q", got)
+	}
+	// 台阶标签要能换回倍数，否则选了下拉不会改值。
+	for _, tc := range []struct {
+		label string
+		want  float64
+	}{{"75%", 0.75}, {"175%", 1.75}, {"200%", 2}} {
+		got, ok := iconPresetValue(tc.label)
+		if !ok || got != tc.want {
+			t.Fatalf("%s 应当对应 %v，实际 %v（%v）", tc.label, tc.want, got, ok)
+		}
+	}
+	if _, ok := iconPresetValue(iconCustomLabel); ok {
+		t.Fatal("自定义不该对应任何固定倍数")
+	}
+}
+
+// 图标改成倍数之后，放大必须真的连锁到布局：卡片变宽、同一块面板一排能放的卡变少。
+// 只改数字不动布局，就等于"设置里调了没用"。
+func TestIconScaleWidensCards(t *testing.T) {
+	a := testApp(t)
+	a.cfg.Search.IconSize = 0
+	a.cfg.Search.IconScale = 1
+
+	baseW, baseCols := a.cellWidth(), a.gridCols()
+	if baseW != cardWidthMin {
+		t.Fatalf("100%% 倍时卡片应是最小宽度 %v，实际 %v", float32(cardWidthMin), baseW)
+	}
+
+	a.cfg.Search.IconScale = 2
+	if a.cellWidth() <= baseW {
+		t.Fatalf("200%% 倍时卡片应当变宽，实际还是 %v", a.cellWidth())
+	}
+	if a.gridCols() >= baseCols {
+		t.Fatalf("卡片变宽之后一排应当放不下那么多了，实际 %d → %d", baseCols, a.gridCols())
+	}
+	// 倍数要真的乘进图标尺寸，而不是被夹取吃掉。
+	if a.iconSize() != config.BaseIconSize*2 {
+		t.Fatalf("200%% 倍时图标应是 %v，实际 %v", config.BaseIconSize*2, a.iconSize())
+	}
 }
 
 // dumpPreview 在 BAOZI_PREVIEW=<绝对路径> 时把这一帧存成 PNG，
@@ -630,10 +697,56 @@ func TestIconSizeSettingGrowsRows(t *testing.T) {
 	}
 }
 
+// 首页网格的实拍：固定项在前、后面跟着网格。BAOZI_PREVIEW=<绝对路径> 才写盘；
+// 再加 BAOZI_ICONSCALE=1.75 就能看到"图标放大后卡片跟着变宽"的样子。
+func TestGridPreviewShot(t *testing.T) {
+	a := testApp(t)
+	if v := os.Getenv("BAOZI_ICONSCALE"); v != "" {
+		k, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			t.Fatalf("BAOZI_ICONSCALE 不是数字: %v", v)
+		}
+		a.cfg.Search.IconSize = 0
+		a.cfg.Search.IconScale = k
+	}
+	for _, e := range []history.Entry{
+		{Path: `D:\Games\遗忘之海\game.exe`, Name: "遗忘之海", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\notepad.exe`, Name: "记事本", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\System32\cmd.exe`, Name: "命令提示符", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\System32\mstsc.exe`, Name: "远程桌面连接", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\System32\calc.exe`, Name: "计算器", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\System32\taskmgr.exe`, Name: "任务管理器", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\System32\mspaint.exe`, Name: "画图", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `C:\Windows\regedit.exe`, Name: "注册表编辑器", Kind: history.KindApp, Ext: ".exe", Hint: "应用"},
+		{Path: `D:\work\baozi`, Name: "baozi", Kind: history.KindDir, Hint: `D:\work`},
+	} {
+		a.hist.TouchEntry(e)
+	}
+	if _, ok := a.hist.TogglePin(`D:\Games\遗忘之海\game.exe`); !ok {
+		t.Fatal("固定失败")
+	}
+	a.refilter()
+	stubAllIcons(a)
+	tr := ui.NewTester(a.view, panelWidth, panelHeight)
+	tr.Frame()
+	dumpPreview(t, tr)
+	t.Logf("缩放 %v，倍数 %.2f，图标 %.1f，卡片宽 %.1f，一排 %d 张",
+		a.scale, a.cfg.Search.IconScale, a.cardIcon(), a.cellWidth(), a.gridCols())
+}
+
 // 图标大小的实拍。BAOZI_SCALE=1.25 BAOZI_PREVIEW=<绝对路径> 跑它，看到的就是
-// "125% 缩放屏上的默认图标"；把 cfg.Search.IconSize 改成具体数字再跑一次即可对比。
+// "125% 缩放屏上的默认图标"；再加 BAOZI_ICONSCALE=1.75 就能看到"默认基础上再放大 1.75 倍"。
 func TestIconPreviewShot(t *testing.T) {
 	a := testApp(t)
+	// 倍数走环境变量，便于同一套数据出几张小大不同的图做对比。
+	if v := os.Getenv("BAOZI_ICONSCALE"); v != "" {
+		k, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			t.Fatalf("BAOZI_ICONSCALE 不是数字: %v", v)
+		}
+		a.cfg.Search.IconSize = 0
+		a.cfg.Search.IconScale = k
+	}
 	a.offline = true
 	a.query = "zz"
 	a.results = []search.Result{
