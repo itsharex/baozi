@@ -343,6 +343,22 @@ DO 只做纯转发（自己只发 `peer_joined` / `peer_left`）。免费计划�
 **没做的**：TURN 中继。`Options.TURN` 留了口子，Cloudflare Realtime TURN 免费额度 1TB/月，
 需要在账号里生成短期凭证。对称 NAT 现在会直接报"两端网络都没打通"。
 
+**浏览器当接收端**（`signal/src/receiver.ts`）：信令服务顺带托管一个页面 `/r?code=<短码>`，
+里面那段 JS 自己 `new RTCPeerConnection`、自己 `createAnswer`、自己解析同一套帧格式。
+于是接收方不用装 Baozi——这对手机最省事，也把"跨网"这件事的入口从"先装个软件"降到"点开一条链接"。
+
+几个必须对齐的点，改任何一处都要两边一起改：
+
+- **帧格式照抄** `internal/p2p/transfer.go`：小端 4 字节文件序号 + 32KB 数据，
+  文本帧是 manifest / done。所以 `binary.LittleEndian` 与 `DataView.getUint32(0, true)` 必须成对；
+- **不做 trickle**：页面也要等 `iceGatheringState === "complete"` 再把 answer 发出去，
+  给 6 秒兜底（Go 端 `gatherBudget` 是 8 秒，留余量）。发早了 Go 会拿到一条没有候选的 answer；
+- **角色固定**：发送方永远是装 Baozi 的那台（它有文件、也只有它能读磁盘），
+  浏览器永远 `role=receiver`。所以 Go 侧不用改一行——它发 offer，浏览器回 answer；
+- **落盘是攒出来的**：页面把每个文件的块塞进 `Blob`，收完再 `a.download` 触发保存。
+  Chrome 桌面实测会自动落到下载目录；手机浏览器会拦无手势的下载，所以收完同时亮一个
+  「保存文件」按钮作为兜底。这也是为什么大文件建议用客户端收——那边是边收边写。
+
 ## 7. 读取文件管理器当前目录（对应 Lertaro `IActivePathCollector`）
 
 只读、不接管对方搜索。按目标进程分路：

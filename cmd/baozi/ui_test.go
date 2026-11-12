@@ -810,6 +810,30 @@ func TestHoverTargetKeepsKeyboardChoice(t *testing.T) {
 
 // 跨网那一页要有自己的样子：两个页签、信令地址、发送/接收两栏。
 // 这里渲染它，并在设置 BAOZI_PREVIEW 时出图，肉眼核对有没有挤在一起。
+// 发送方等对方进来时的样子：短码要大，下面还要给一条"对方不装 Baozi 也能收"的网页地址。
+func TestShareP2PWaitingShot(t *testing.T) {
+	a := testApp(t)
+	s := &shareWindow{app: a, tab: 1}
+	a.cfg.Share.Signal = ""
+	s.signalInput = s.signalBase()
+	s.net = &netShare{
+		win:   s,
+		role:  "sender",
+		stage: p2pWaiting,
+		code:  "bzt234",
+		note:  "已连上信令，等对方进入房间",
+	}
+
+	tester := ui.NewTester(s.view, 760, 620)
+	tester.Frame()
+	for _, want := range []string{"短码", "bzt234", "浏览器收", "复制链接"} {
+		if !tester.HasText(want) {
+			t.Fatalf("等待态缺少 %q", want)
+		}
+	}
+	dumpPreview(t, tester)
+}
+
 func TestShareP2PViewRenders(t *testing.T) {
 	a := testApp(t)
 	s := &shareWindow{app: a, tab: 1}

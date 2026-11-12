@@ -13,6 +13,8 @@ interface Env {
   ROOM: DurableObjectNamespace;
 }
 
+import { RECEIVER_HTML } from "./receiver";
+
 const CODE_RE = /^[0-9a-z]{6}$/;
 // 房间建好后没人来，超过这个时间就作废，免得短码被占着不放。
 const ROOM_TTL_MS = 10 * 60 * 1000;
@@ -24,6 +26,18 @@ export default {
     // 给 Baozi 做连通性探测用：填完 URL 点"测试"，就是打这个。
     if (url.pathname === "/health") {
       return Response.json({ ok: true, service: "baozi-signal" });
+    }
+
+    // 浏览器接收页：接收方不用装 Baozi，打开 /r?code=xxxxxx 就能收。
+    // 页面里的 JS 直接连 /ws 走同一套信令，所以这里只负责发一个静态页面。
+    if (url.pathname === "/r") {
+      return new Response(RECEIVER_HTML, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          // 改版之后要立刻生效，不让人拿到旧页面。
+          "cache-control": "no-cache",
+        },
+      });
     }
 
     if (url.pathname === "/ws") {

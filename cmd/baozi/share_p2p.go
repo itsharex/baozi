@@ -490,6 +490,22 @@ func (s *shareWindow) p2pRunning(c *ui.Context, t *ui.Theme, stage p2pStage, cod
 			}
 			ui.Text(c, "对方在它的 Baozi 里填这 6 位").FontSize(11).TextColor(t.TextMuted)
 		})
+
+		// 对方不装 Baozi 也能收：信令服务同时托管了一个接收页，浏览器打开就是接收端。
+		// 这条路对手机最省事——不用装 App、不用输码，点开链接就等着。
+		if base := strings.TrimRight(s.signalBase(), "/"); base != "" {
+			pageURL := base + "/r?code=" + code
+			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "浏览器收").FontSize(12).TextColor(t.TextMuted).Width(60)
+				ui.Text(c, pageURL).FontSize(12).TextColor(t.Text).Grow(1).SingleLine()
+				if ui.Button(c, "复制链接").Clicked() {
+					mygo.Clipboard.WriteText(pageURL)
+					s.status = "接收页链接已复制"
+				}
+			})
+			ui.Text(c, "把这个链接发给对方，他用手机或电脑浏览器打开就能收，不用装 Baozi").
+				FontSize(11).TextColor(t.TextMuted)
+		}
 	}
 
 	ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
