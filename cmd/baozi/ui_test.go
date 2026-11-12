@@ -894,6 +894,41 @@ func TestShareP2PTextResultShot(t *testing.T) {
 	dumpPreview(t, tester)
 }
 
+// 「测试」的结果必须出现在信令行下面——跨网页签没有底栏，早先只写 status
+// 等于点了没反应。顺带钉住那条细状态线，别再把反馈收没了。
+func TestShareSignalTestResultShot(t *testing.T) {
+	a := testApp(t)
+	s := &shareWindow{
+		app:        a,
+		tab:        1,
+		signalTest: signalBad,
+		signalMsg:  "连不上 https://signal.1jia.life：连接超时",
+		status:     "信令服务连不上",
+	}
+	a.cfg.Share.Signal = ""
+	s.signalInput = s.signalBase()
+	s.net = &netShare{win: s}
+
+	tester := ui.NewTester(s.view, 760, 680)
+	tester.Frame()
+	for _, want := range []string{"测试", "连不上", "连接超时", "信令服务连不上"} {
+		if !tester.HasText(want) {
+			t.Fatalf("测试结果没显示出来，缺少 %q", want)
+		}
+	}
+	dumpPreview(t, tester)
+
+	// 成功态也得能看见，并且带耗时。
+	s.signalTest, s.signalMsg = signalOK, "https://signal.1jia.life 能用，412ms 就有回应"
+	ok := ui.NewTester(s.view, 760, 680)
+	ok.Frame()
+	for _, want := range []string{"能用", "412ms"} {
+		if !ok.HasText(want) {
+			t.Fatalf("成功态缺少 %q", want)
+		}
+	}
+}
+
 // 局域网页也能顺带发一段文本：停了共享的状态下必须有那个输入框，
 // 否则用户只会想到"把话存成 txt 再发"。
 func TestShareLocalTextInputShot(t *testing.T) {

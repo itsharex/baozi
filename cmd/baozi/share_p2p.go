@@ -455,6 +455,35 @@ func (s *shareWindow) signalRow(c *ui.Context, t *ui.Theme) {
 	})
 	ui.Text(c, "跨网只用它交换一次连接信息；两端连上后文件直连，一个字节都不经过它").
 		FontSize(11).TextColor(t.TextMuted)
+	s.signalResult(c, t)
+}
+
+// 「测试」有几种结果。测试中也要占一格，否则点了按钮到出结果之间是空白，
+// 用户会以为按钮没反应、再点两下。
+const (
+	signalIdle = iota
+	signalTesting
+	signalOK
+	signalBad
+)
+
+// signalResult 把测试结果摆在信令行下面：一个色点 + 一句人话（成功还带耗时）。
+// 不做 toast：这东西要能一直在，用户回头看一眼就知道上次测的是什么、什么时候。
+func (s *shareWindow) signalResult(c *ui.Context, t *ui.Theme) {
+	if s.signalMsg == "" {
+		return
+	}
+	color, mark := t.TextMuted, "○"
+	switch s.signalTest {
+	case signalOK:
+		color, mark = t.Accent, "●"
+	case signalBad:
+		color, mark = t.Danger, "●"
+	}
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, mark).FontSize(11).TextColor(color)
+		ui.Text(c, s.signalMsg).FontSize(12).TextColor(color).Grow(1)
+	})
 }
 
 func (s *shareWindow) testSignal() {
@@ -462,15 +491,36 @@ func (s *shareWindow) testSignal() {
 	if base == "" {
 		base = strings.TrimSpace(s.signalInput)
 	}
+	if base == "" {
+		s.win.Update(func() {
+			s.signalTest = signalBad
+			s.signalMsg = "还没有填信令地址"
+		})
+		return
+	}
+	// 先亮"正在测"，再去连。这个顺序不能反：连不上时要等 8 秒超时，
+	// 期间界面上必须已经有动静。
+	s.win.Update(func() {
+		s.signalTest = signalTesting
+		s.signalMsg = "正在测 " + base + " …"
+	})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	start := time.Now()
 	err := p2p.Health(ctx, base)
+	cost := time.Since(start).Round(time.Millisecond)
+
 	s.win.Update(func() {
 		if err != nil {
-			s.status = "信令服务连不上：" + err.Error()
-		} else {
-			s.status = "信令服务可用"
+			s.signalTest = signalBad
+			s.signalMsg = "连不上 " + base + "：" + err.Error()
+			s.status = "信令服务连不上"
+			return
 		}
+		s.signalTest = signalOK
+		s.signalMsg = fmt.Sprintf("%s 能用，%s 就有回应", base, cost)
+		s.status = "信令服务可用"
 	})
 }
 

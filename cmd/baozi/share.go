@@ -41,6 +41,11 @@ type shareWindow struct {
 	// 别把用户正在输入的内容冲掉。
 	signalInput  string
 	signalLoaded bool
+	// signalTest / signalMsg 是「测试」按钮的结果，就地显示在按钮下面一行。
+	// 早先只写进 status，而 status 在底栏——跨网这页连底栏都收掉了，
+	// 于是"点了测试"跟"什么都没发生"在界面上是同一件事。
+	signalTest int
+	signalMsg  string
 
 	// textDraft 是"顺手发一段文本"的输入框。文本跟文件一样是互传的一等公民：
 	// 一条命令、一串地址、一份口令，存成 txt 再让对方去找文件就没意思了。
@@ -250,7 +255,15 @@ func (s *shareWindow) view(c *ui.Context) {
 
 		// 跨网这一页的按钮都在页面里自成一体（发送栏自带添加、接收栏自带开始），
 		// 底栏再摆一份只会让人犹豫点哪边，所以整条收掉。
+		// 但状态不能跟着一起收：底栏原本还兼职报"短码已复制""已取消""保存位置"，
+		// 收掉之后这些事就变成"点了没反应"。这里留一条只读的细状态线。
 		if s.tab == 1 {
+			if s.status != "" {
+				ui.Row(c).Padding(0, 24, 12, 24).Gap(8).AlignItems(ui.Center).Children(func() {
+					ui.Text(c, "·").FontSize(11).TextColor(t.TextMuted)
+					ui.Text(c, s.status).FontSize(11).TextColor(t.TextMuted).Grow(1)
+				})
+			}
 			return
 		}
 
