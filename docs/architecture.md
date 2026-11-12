@@ -965,7 +965,7 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 |---|---|---|
 | 常规·唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
 | 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
-| 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.thumbnails` |
+| 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`NumberInput`（图标大小）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.iconSize` / `search.thumbnails` |
 | 常规·索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
 | 自定义命令 | 左列 `ui.List`（每条两行：显示名 + 全部激活词）＋ 新建/删除；右列表单：`TextInput`×3（激活词 / 显示名 / 程序）、`TextArea`（参数，一行一个）、`TextInput`（工作目录）、`Checkbox`（执行后不收起）、「将执行：」实时预览 | `commands`（结构化，不再是竖线文本） |
 
@@ -1131,6 +1131,35 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 - **`ui.List` 是虚拟列表**（只有可见行调 `row()`），所以"只给可见行取图"不需要额外判断。
 - 开关：`search.thumbnails`（`*bool`，nil 视为开），设置界面的「排序」区有勾选。
   关掉后一律线框图标。
+
+### 图标多大（`search.iconSize` + `application.iconSize`）
+
+结果行左边那个图标，尺寸过去是写死的 22 DIP。22 在 720 宽的面板里占 3%，在 125% 缩放的屏上
+（这台机器就是 120 DPI = 125%）看着偏小——虽然 mygo 是 PerMonitorV2 DPI-aware、22 DIP 已经
+被系统渲染成 27.5 物理像素，但**相对面板的比例没变**，用户看到的还是"小"。
+
+现在：
+
+- `config.BaseIconSize = 22` 是 100% 缩放下的基数；
+- 配置里 `search.iconSize` 为 0（缺省）→ 显示 `BaseIconSize × 系统缩放`，于是 125% 的屏上是
+  27.5、150% 是 33，**和高 DPI 屏的缩放一起变**；
+- 填了具体数字（1~64）→ 就按那个数字显示，**不再乘缩放**（用户填的是他想要看到多大）。
+
+`application.iconSize()` 只做一件事：`a.cfg.IconSizeAt(a.scale)`。`a.scale` 是 `ready()` 里
+`mygo.Screen.Displays()` 取到的最大缩放（App 级 API，在 `ui.Tester` 下会阻塞，所以只算一次缓存）。
+
+两个跟尺寸耦合的地方要一起改，否则会出现"设置生效了但布局错位"：
+
+1. **首页卡片**（`cardIconBox`）：卡片只有 84 宽（内容区 68），图标封顶 30、方块 = 图标 + 9，
+   所以卡片高度会随图标从 83 长到 90。`pinMoveFor` 里那个"一行 89"因此改成按方块算
+   （`box + 57`），不然拖动重排时拖一格会跳两格。
+2. **结果行行高**：行高是"图标"和"名字 + 提示两行字"取高的那个，而名字那列本身就有 38 左右。
+   所以 22 → 27.5 时**行高不变、显示行数也不变，只是图标变大**；只有图标超过 38 才会把行撑开。
+   这不是 bug，是想要的：默认换大一号不该让一屏少显示两行。`TestIconSizeSettingGrowsRows`
+   把这两段都钉住了（44 时行高几乎不动，60 时才明显涨）。
+
+实拍：`BAOZI_SCALE=1.25 BAOZI_PREVIEW=… go test -run TestIconPreviewShot`，这张图就是
+125% 屏上的默认样子；`BAOZI_SCALE=1` 再跑一次即得 100% 的对照。
 
 ### 已固定区的拖动排序
 

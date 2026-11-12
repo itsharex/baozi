@@ -7,6 +7,26 @@ import (
 	"testing"
 )
 
+// 图标尺寸的缺省语义：没配置就跟着系统缩放，配了就照配置（不再乘缩放）。
+func TestIconSizeAt(t *testing.T) {
+	var c Config
+	if got := c.IconSizeAt(1); got != BaseIconSize {
+		t.Fatalf("100%% 缩放应为 %d，实际 %v", BaseIconSize, got)
+	}
+	if got := c.IconSizeAt(1.25); got != BaseIconSize*1.25 {
+		t.Fatalf("125%% 缩放应为 %v，实际 %v", BaseIconSize*1.25, got)
+	}
+	// scale 拿不到（0）不能算出 0 —— 那样图标会整个消失。
+	if got := c.IconSizeAt(0); got != BaseIconSize {
+		t.Fatalf("缩放未知时应退回 %d，实际 %v", BaseIconSize, got)
+	}
+
+	c.Search.IconSize = 34
+	if got := c.IconSizeAt(1.25); got != 34 {
+		t.Fatalf("用户填了 34 就该是 34（不再乘缩放），实际 %v", got)
+	}
+}
+
 // 目录来源开关的缺省语义：配置里没有这一块 → 全部启用（老配置的行为不变）。
 func TestPathSourcesDefaultOn(t *testing.T) {
 	var c Config

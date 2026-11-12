@@ -68,7 +68,7 @@ func TestThumbnailRendersInResultRow(t *testing.T) {
 	if _, err := os.Stat(p); err != nil {
 		t.Skipf("这台机器没有素材图：%v", err)
 	}
-	size := float32(glyphSize) // 走变量，避免常量 48.4 直接转 int 被编译器拒绝
+	size := a.iconSize() // 走变量，避免常量直接转 int 被编译器拒绝
 	px := int(size * 2.2)
 	data, err := win.Thumbnail(p, px)
 	if err != nil {

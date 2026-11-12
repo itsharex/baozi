@@ -5,6 +5,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +45,23 @@ func testApp(t *testing.T) *application {
 		hist:    h,
 		icons:   map[string]*ui.Bitmap{},
 		status:  "测试",
+		// 真机上 a.scale 是在 ready() 里问系统拿的；测试里用 BAOZI_SCALE 模拟，
+		// 好在高 DPI 下截实拍（不设就是 1，即 100% 缩放）。
+		scale: testScale(),
 	}
+}
+
+// testScale 读 BAOZI_SCALE（如 1.25 / 1.5）来模拟显示器缩放，默认 1。
+func testScale() float32 {
+	v := os.Getenv("BAOZI_SCALE")
+	if v == "" {
+		return 1
+	}
+	f, err := strconv.ParseFloat(v, 32)
+	if err != nil || f <= 0 {
+		return 1
+	}
+	return float32(f)
 }
 
 func TestPanelViewRenders(t *testing.T) {
@@ -530,4 +547,71 @@ func TestIsProgram(t *testing.T) {
 			t.Fatalf("%q (%s, kind=%v) 应返回 %v，实际 %v", c.path, c.ext, c.kind, c.want, got)
 		}
 	}
+}
+
+// 图标调大以后，结果行必须真的跟着变高——只改一个数字而布局不动，就等于设置没生效。
+// 这里用"第二行名字的纵坐标"当标尺：两行结果，第一行吃掉更多高度，第二行就会更低。
+func TestIconSizeSettingGrowsRows(t *testing.T) {
+	a := testApp(t)
+	a.offline = true
+	a.query = "zz"
+	a.results = []search.Result{
+		{Item: search.Item{Name: "zz-one.txt", Path: `C:\zz-one.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `C:\`}},
+		{Item: search.Item{Name: "zz-two.txt", Path: `C:\zz-two.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `C:\`}},
+	}
+	a.choose(0)
+
+	// 第二行名字的纵坐标
+	secondRowY := func() float32 {
+		stubAllIcons(a)
+		tr := ui.NewTester(a.view, panelWidth, panelHeight)
+		tr.Frame()
+		rect, ok := tr.Find("zz-two.txt")
+		if !ok {
+			t.Fatal("第二行结果没渲染出来")
+		}
+		return rect.Y
+	}
+
+	// a.scale 在测试里是 0，IconSizeAt 会退回 1.0，也就是 BaseIconSize。
+	small := secondRowY()
+	if got := a.iconSize(); got != config.BaseIconSize {
+		t.Fatalf("缩放未知时图标应退回 %d，实际 %v", config.BaseIconSize, got)
+	}
+
+	// 注意这里要开到 60 而不是 44：行高是"图标"和"名字+提示两行字"取高的那个，
+	// 名字那列本身就有 38 左右，图标不超过它就不会把行撑开（这是好事——默认
+	// 22→27.5 只是图标变大、显示行数不变）。60 才能证明图标真的进了布局。
+	a.cfg.Search.IconSize = 60
+	big := secondRowY()
+	if got := a.iconSize(); got != 60 {
+		t.Fatalf("设置里填了 60，图标应为 60，实际 %v", got)
+	}
+	if gap := big - small; gap < 12 {
+		t.Fatalf("图标从 %d 调到 60 之后行高只涨了 %.1f，说明图标没真的进布局",
+			config.BaseIconSize, gap)
+	}
+}
+
+// 图标大小的实拍。BAOZI_SCALE=1.25 BAOZI_PREVIEW=<绝对路径> 跑它，看到的就是
+// "125% 缩放屏上的默认图标"；把 cfg.Search.IconSize 改成具体数字再跑一次即可对比。
+func TestIconPreviewShot(t *testing.T) {
+	a := testApp(t)
+	a.offline = true
+	a.query = "zz"
+	a.results = []search.Result{
+		{Item: search.Item{Name: "zz-季度报告.pdf", Path: `D:\docs\zz-季度报告.pdf`, Ext: ".pdf", Kind: search.KindFile, Hint: `D:\docs`}},
+		{Item: search.Item{Name: "zz-work", Path: `D:\work\zz-work`, Kind: search.KindDir, Hint: `D:\work`}},
+		{Item: search.Item{Name: "zz-tools.exe", Path: `D:\1tools\zz-tools.exe`, Ext: ".exe", Kind: search.KindFile, Hint: `D:\1tools`}},
+		{Item: search.Item{Name: "zz-notes.txt", Path: `D:\docs\zz-notes.txt`, Ext: ".txt", Kind: search.KindFile, Hint: `D:\docs`}},
+	}
+	a.choose(0)
+	stubAllIcons(a)
+	tr := ui.NewTester(a.view, panelWidth, panelHeight)
+	tr.Frame()
+	dumpPreview(t, tr)
+	if a.iconSize() <= 0 {
+		t.Fatal("图标尺寸算成了 0，那样什么都画不出来")
+	}
+	t.Logf("缩放 %v，图标 %.1f", a.scale, a.iconSize())
 }

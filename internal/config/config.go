@@ -107,6 +107,25 @@ type Search struct {
 	// Thumbnails 控制图片/视频在结果里显示内容缩略图还是类型线框图标。
 	// 指针是为了区分"没配置过"（nil，按开处理）和"用户明确关掉"。
 	Thumbnails *bool `json:"thumbnails,omitempty"`
+	// IconSize 是结果里那个图标块的边长（DIP 逻辑像素）。0（含没配置）表示
+	// 跟随系统缩放：100% 时 BaseIconSize、125% 时 ×1.25。
+	// 填了具体数字就照它显示，不再乘缩放——用户填的是他想要看到的大小。
+	IconSize int `json:"iconSize,omitempty"`
+}
+
+// BaseIconSize 是 100% 缩放下的默认图标边长。这个基数决定"默认看起来多大"，
+// 缩放比例只负责把高 DPI 屏上的视觉尺寸找回来。
+const BaseIconSize = 22
+
+// IconSizeAt 返回在给定系统缩放下的图标边长。
+func (c *Config) IconSizeAt(scale float32) float32 {
+	if n := c.Search.IconSize; n > 0 {
+		return float32(n)
+	}
+	if scale <= 0 {
+		scale = 1
+	}
+	return BaseIconSize * scale
 }
 
 // ThumbnailsOn 报告是否显示缩略图：没配置过默认开。

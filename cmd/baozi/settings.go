@@ -36,6 +36,8 @@ type settingsWindow struct {
 	maxResults float64
 	// thumbnails 决定图片/视频显示内容缩略图还是线框图标。
 	thumbnails bool
+	// iconSize 是结果行图标的边长（DIP）；0 = 跟随系统缩放。
+	iconSize float64
 
 	roots         string
 	excludes      string
@@ -110,6 +112,7 @@ func (s *settingsWindow) load() {
 	s.typeOrder = strings.Join(cfg.Search.TypeOrder, ", ")
 	s.maxResults = float64(cfg.Search.MaxResults)
 	s.thumbnails = cfg.ThumbnailsOn()
+	s.iconSize = float64(cfg.Search.IconSize)
 
 	s.roots = strings.Join(cfg.Index.Roots, "\n")
 	s.excludes = strings.Join(cfg.Index.Excludes, "\n")
@@ -244,6 +247,11 @@ func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "最多显示结果数").FontSize(12).TextColor(t.TextMuted).Width(150)
 			ui.NumberInput(c, &s.maxResults, 10, 500, 10).Width(120)
+		})
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "图标大小").FontSize(12).TextColor(t.TextMuted).Width(150)
+			ui.NumberInput(c, &s.iconSize, 0, 64, 2).Width(120)
+			ui.Text(c, s.iconPreview()).FontSize(11).TextColor(t.TextMuted)
 		})
 		ui.Checkbox(c, &s.thumbnails, "图片、视频、PDF 显示内容缩略图")
 		ui.Text(c, "缩略图在后台取，取到才替换掉线框图标，不会拖慢唤出。"+
@@ -498,6 +506,20 @@ func sectionTitle(c *ui.Context, t *ui.Theme, title, desc string) {
 	})
 }
 
+// iconPreview 在"图标大小"输入框旁边说清现在到底会显示多大：
+// 填 0（跟随系统缩放）时给出按缩放算出的实际值，填了具体数字就说明它不再乘缩放。
+// 用的是编辑中的值，不是已保存的配置，所以改数字时这行字会跟着变。
+func (s *settingsWindow) iconPreview() string {
+	scale := s.app.scale
+	if scale <= 0 {
+		scale = 1
+	}
+	if s.iconSize >= 1 {
+		return fmt.Sprintf("%.0f 像素（固定，不再跟着缩放）", s.iconSize)
+	}
+	return fmt.Sprintf("0 = 跟随系统缩放，当前 %g%% → %.1f 像素", scale*100, config.BaseIconSize*scale)
+}
+
 func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Text(c, label).FontSize(12).TextColor(t.TextMuted).Width(230)
@@ -525,6 +547,7 @@ func (s *settingsWindow) save() {
 	cfg.Search.TypeOrder = splitList(s.typeOrder)
 	cfg.Search.MaxResults = int(s.maxResults)
 	cfg.Search.Thumbnails = boolPtr(s.thumbnails)
+	cfg.Search.IconSize = int(s.iconSize)
 
 	oldRoots := s.app.cfg.Index.Roots
 	cfg.Index.Roots = splitLines(s.roots)

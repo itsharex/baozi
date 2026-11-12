@@ -43,10 +43,9 @@ const (
 	panelWidth  = 720
 	panelHeight = 480
 
-	// 结果行左侧的图标方块：28 DIP 的浅色底 + 22 号的单色线框图（见 icon.go）。
-	// 之前是 24 DIP 的系统彩色图标直接贴上去，混着白纸片、还因非原生尺寸发糊。
-	iconBox   = 28
-	glyphSize = 22
+	// 结果行左侧图标的尺寸不再写死：默认跟着系统缩放走，也能在设置里指定，
+	// 见 config.BaseIconSize / Config.IconSizeAt 与 application.iconSize。
+	// 之前是固定的 22 DIP，在 125% 缩放的屏上（这台机器就是）显得偏小。
 
 	// panelCols 是首页网格每行的卡片数：720 宽的面板，卡片 84 + 间距 6，一排 7 个。
 	// 方向键按行移动（上下各走一行）。
@@ -310,15 +309,19 @@ func (a *application) trackPinDrag(i int, el ui.Element) {
 }
 
 // pinMoveFor 把拖动位移换算成落点。
-// 卡片 84 宽、行内间距 6，所以一列 90；卡片高约 83（4 + 32 图标 + 5 + 三行字 38 + 4）、
-// 行间距 6，所以一行 89。这两个数字要跟 card() 与 homeGrid() 保持一致。
+// 卡片 84 宽、行内间距 6，所以一列 90；行高随图标块的尺寸走（块 + 57，
+// 其中 57 = 上下 padding 8 + 图标块与名字的间距 5 + 三行字 38 + 行间距 6），
+// 图标块 32 时正好是 89。这两组数字要跟 card() 与 homeGrid() 保持一致。
 func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 	recentTo := len(a.results) - a.pinnedCount
 	if a.pinnedCount < 2 || from < recentTo {
 		return nil
 	}
+	// 设置里把图标调大了，卡片跟着变高，落点判定也得跟着换，否则拖一格会跳两格。
+	_, box := a.cardIconBox()
+	rowStep := float32(box + 57)
 	colShift := int(math.Round(float64(dx) / 90))
-	rowShift := int(math.Round(float64(dy) / 89))
+	rowShift := int(math.Round(float64(dy) / float64(rowStep)))
 	if colShift == 0 && rowShift == 0 {
 		return nil
 	}
@@ -551,8 +554,10 @@ func wrapName(name string, width float32, lines int) string {
 }
 
 // card 是首页网格里的一格：圆角图标块 + 居中的名字。
-// 尺寸照 Pane 的紧凑感：卡片 84 宽，图标块 32，名字 10.5 号、最多三行
+// 尺寸照 Pane 的紧凑感：卡片 84 宽，图标块 32（跟着设置会涨到 38 为止），
+// 名字 10.5 号、最多三行
 // （三行才装得下 app 的真实名字，比如 "SnowShot_Video_2026-10-29_13-31-04.mp4"）。
+// 卡片宽高不跟着图标变——首页要整齐，放大留给结果行（见 cardIconBox）。
 func (a *application) card(c *ui.Context, i int) {
 	r := a.results[i]
 	t := c.Theme()
@@ -576,9 +581,10 @@ func (a *application) card(c *ui.Context, i int) {
 		}).
 		ContextMenu(func(m *ui.Menu) { a.itemMenu(m, i) }).
 		Children(func() {
-			ui.Row(c).Width(32).Height(32).Radius(8).Background(t.Surface).
+			icon, box := a.cardIconBox()
+			ui.Row(c).Width(box).Height(box).Radius(8).Background(t.Surface).
 				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
-				a.resultIcon(c, r, 23)
+				a.resultIcon(c, r, icon)
 			})
 			ui.Text(c, wrapName(r.Name, 76, 3)).FontSize(10.5).TextColor(t.Text).
 				TextAlign(ui.Center).MaxLines(3).LineHeight(1.2).Tooltip(r.Name)
@@ -694,13 +700,35 @@ func (a *application) row(c *ui.Context, i int) {
 		}).
 		ContextMenu(func(m *ui.Menu) { a.itemMenu(m, i) }).
 		Children(func() {
-			a.resultIcon(c, r, glyphSize)
+			a.resultIcon(c, r, a.iconSize())
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, r.Name).TextColor(t.Text).FontSize(14).Bold().SingleLine().Tooltip(r.Name)
 				ui.Text(c, r.Hint).FontSize(11).TextColor(t.TextMuted).SingleLine()
 			})
 			ui.Text(c, badge(r)).FontSize(10).TextColor(t.TextMuted)
 		})
+}
+
+// iconSize 是结果行左侧图标的边长。没在设置里指定就跟着系统缩放走
+// （100% → 22、125% → 27.5），这块逻辑在 config.Search.IconSizeAt 里，
+// 因为它同时要被设置页的"当前会显示多大"预览用到。
+func (a *application) iconSize() float32 {
+	return a.cfg.IconSizeAt(a.scale)
+}
+
+// cardIconBox 是首页卡片里那个浅色方块和其中图标的尺寸。
+// 卡片只有 84 宽（内容区 68），图标放到 30 就到头了，再大名字没地方放；
+// 反过来也不跟着设置往小缩——首页要的是整齐，不是跟着搜索行变。
+func (a *application) cardIconBox() (icon, box float32) {
+	icon = a.iconSize()
+	if icon < 23 {
+		icon = 23
+	}
+	if icon > 30 {
+		icon = 30
+	}
+	// 原来 23 的图标配 32 的方块，四边各留 4.5。保持这个内边宽度。
+	return icon, icon + 9
 }
 
 // resultIcon 画结果左侧的类型图标：文件/目录/命令用单色线框（icon.go），
