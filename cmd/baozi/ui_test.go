@@ -620,6 +620,20 @@ func TestDirOf(t *testing.T) {
 }
 
 // 底栏要写出 Ctrl+Shift+C 这条键帽，否则用户不知道有这个动作。
+// 底栏的两个入口（设置 / 互传）必须是看得出来的按钮，不能又缩回键帽那种浅灰小方块——
+// 它们跟「Enter 打开」不是一个层级：后者是提示，前者是能点的东西。
+func TestFooterHasEntryButtons(t *testing.T) {
+	a := testApp(t)
+	stubAllIcons(a)
+	tr := ui.NewTester(a.view, panelWidth, panelHeight)
+	tr.Frame()
+	for _, want := range []string{"设置", "互传"} {
+		if !tr.HasText(want) {
+			t.Fatalf("底栏缺少入口 %q", want)
+		}
+	}
+}
+
 func TestFooterShowsCopyPathKey(t *testing.T) {
 	a := testApp(t)
 	stubAllIcons(a)

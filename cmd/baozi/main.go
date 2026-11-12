@@ -750,6 +750,10 @@ func (a *application) resultList(c *ui.Context) {
 }
 
 // footer 是底栏：左边说选中项会做什么，右边用键帽写清 Enter / Ctrl+Enter / Ctrl+K。
+//
+// 键帽（keyCap）只是提示，故意画得很轻：浅灰底、无边框、灰色小字。
+// 「设置」「互传」是能点的按钮，必须和键帽分开——早先它们也是浅灰底的小块，
+// 结果跟键帽长得一模一样，用户根本看不出那是入口。
 func (a *application) footer(c *ui.Context) {
 	t := c.Theme()
 	ui.Row(c).Padding(9, 18).Gap(10).AlignItems(ui.Center).Children(func() {
@@ -759,10 +763,14 @@ func (a *application) footer(c *ui.Context) {
 		a.keyCap(c, "Ctrl+Shift+C", "复制路径")
 		a.keyCap(c, "Ctrl+K", "固定")
 		a.keyCap(c, "右键", "删除/固定")
-		ui.Text(c, "设置").FontSize(11).TextColor(t.TextMuted).
-			Padding(4, 8).Radius(6).Background(t.Surface).OnClick(a.openSettings)
-		ui.Text(c, "互传").FontSize(11).TextColor(t.TextMuted).
-			Padding(4, 8).Radius(6).Background(t.Surface).OnClick(a.openShare)
+		// 跟键帽之间空开一截，一眼能看出"提示"到这儿结束了，后面是两个入口。
+		ui.Row(c).Width(14).Height(1)
+		if ui.Button(c, "设置").Clicked() {
+			a.openSettings()
+		}
+		if ui.Button(c, "互传").Clicked() {
+			a.openShare()
+		}
 	})
 }
 
