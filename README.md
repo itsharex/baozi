@@ -2,6 +2,7 @@
 
 [![build](https://github.com/l0rraine/baozi/actions/workflows/build.yml/badge.svg)](https://github.com/l0rraine/baozi/actions/workflows/build.yml)
 [![release](https://img.shields.io/github/v/release/l0rraine/baozi?label=release)](https://github.com/l0rraine/baozi/releases)
+[![license](https://img.shields.io/github/license/l0rraine/baozi)](LICENSE)
 [![Go](https://img.shields.io/badge/Go-1.27.3-00ADD8?logo=go)](go.mod)
 [![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows)](https://github.com/l0rraine/baozi)
 
@@ -667,3 +668,7 @@ CI（`.github/workflows/build.yml`）在每次推 `main` 和每个 PR 上跑 gof
 - `cmd/baozi`：用 mygo 的 `ui.Tester` 无窗口渲染面板/设置/互传三个界面并断言关键文案，另校验两段式命令解析、"应用历史还原成应用名"，
   以及正则模式的六件事：拼音不参与、模糊拆词不参与、模式按用户写的走、只匹配文件名不匹配路径、
   准确度恒为 1.0、点 `.*` 按钮能开关
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。
