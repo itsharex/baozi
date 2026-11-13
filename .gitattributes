@@ -1,0 +1,22 @@
+# 行尾统一：Windows 上 core.autocrlf=true 会把 Go 源码检出成 CRLF，
+# gofmt 拿到 CRLF 就认定"这文件没格式化"，CI 的 gofmt 检查会整批误报。
+* text=auto eol=lf
+
+# Go 源码、模块、工作流、文档一律 LF
+*.go   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+
+# 这些是给 Windows 解释器读的，保持 CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 图标与图片按二进制处理
+*.ico binary
+*.png binary
+*.exe binary
