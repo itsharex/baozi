@@ -1,0 +1,44 @@
+name: release
+
+# 打 tag 就出安装包：三个 exe 打成一个 zip 挂到 Release 上。
+# 三个 exe 必须同目录（baozi.exe 会在自己旁边找 hook / index），所以不能拆开发。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist/baozi.exe ./cmd/baozi
+          go build -trimpath -ldflags "-s -w" -o dist/baozi-hook.exe ./cmd/baozi-hook
+          go build -trimpath -ldflags "-s -w" -o dist/baozi-index.exe ./cmd/baozi-index
+          Get-ChildItem dist/*.exe | Select-Object Name, Length
+
+      - name: pack
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          Compress-Archive -Path dist/baozi.exe, dist/baozi-hook.exe, dist/baozi-index.exe -DestinationPath "dist/baozi-$ver-windows-amd64.zip"
+          Get-Item "dist/baozi-$ver-windows-amd64.zip" | Select-Object Name, Length
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/baozi-*-windows-amd64.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -1,5 +1,10 @@
 # Baozi
 
+[![build](https://github.com/l0rraine/baozi/actions/workflows/build.yml/badge.svg)](https://github.com/l0rraine/baozi/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/l0rraine/baozi?label=release)](https://github.com/l0rraine/baozi/releases)
+[![Go](https://img.shields.io/badge/Go-1.27.3-00ADD8?logo=go)](go.mod)
+[![Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows)](https://github.com/l0rraine/baozi)
+
 Windows 上的快速启动器：**双击 Ctrl 唤出**，搜文件、搜应用、执行自定义命令、和小范围内传文件。
 用 Go 重写 Lertaro 的核心体验，界面用 [mygo](https://github.com/egoist/mygo) 的原生 UI（Direct3D 11，无 WebView2）。
 视觉上参照 [Pane](https://github.com/LBEILC/Pane) 的路子：磨砂玻璃浮窗、大圆角、跟随系统深浅色，空查询时先给"最近使用"。
@@ -7,6 +12,17 @@ Windows 上的快速启动器：**双击 Ctrl 唤出**，搜文件、搜应用�
 ```
 双击 Ctrl  →  浮窗  →  输入  →  ↑↓ 选择  →  Enter 打开
 ```
+
+## 下载
+
+不想自己编的话，去 [Releases](https://github.com/l0rraine/baozi/releases) 下载
+`baozi-vX.Y.Z-windows-amd64.zip`，解压到任意目录（别放 `Program Files`——它要往自己旁边和
+`%LOCALAPPDATA%` 写东西），双击 `baozi.exe` 即可。
+
+**三个 exe 必须留在同一目录**：`baozi.exe` 启动时会在自己旁边找 `baozi-hook.exe`（双击 Ctrl 的钩子）
+和 `baozi-index.exe`（可选，设置里一键装成后台索引服务）。
+
+还没发过版本时，`Actions` 里最新一次 `build` 的 `baozi-windows-amd64` artifact 也是能直接跑的包。
 
 ## 现在能用的功能
 
@@ -24,18 +40,22 @@ Windows 上的快速启动器：**双击 Ctrl 唤出**，搜文件、搜应用�
 | — | 开机自动启动（登录后静默待在托盘，不弹面板） | 已实现，设置里可开关 |
 | — | 快速索引服务（直接读 NTFS USN Journal，174 万条 17 秒） | 已实现，设置里一键装/卸 |
 
-## 跑起来
+## 从源码跑起来
+
+需要 Go 1.27.3 或更新（`go.mod` 里钉的就是它）、Windows 10/11。
 
 ```powershell
-# 编译（Go 1.27.3+，本机在 D:\Go）
 # -H=windowsgui 必须带上：不带的话 exe 是 console 子系统，双击会先弹一个黑色终端窗口。
-D:\Go\bin\go.exe build -trimpath -ldflags "-H=windowsgui -s -w" -o dist\baozi.exe       ./cmd\baozi
-D:\Go\bin\go.exe build -trimpath -ldflags "-s -w"              -o dist\baozi-hook.exe  ./cmd\baozi-hook
-D:\Go\bin\go.exe build -trimpath -ldflags "-s -w"              -o dist\baozi-index.exe ./cmd\baozi-index
+go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist\baozi.exe       ./cmd\baozi
+go build -trimpath -ldflags "-s -w"              -o dist\baozi-hook.exe  ./cmd\baozi-hook
+go build -trimpath -ldflags "-s -w"              -o dist\baozi-index.exe ./cmd\baozi-index
 
 # 直接跑
 .\dist\baozi.exe
 ```
+
+（上面的三条构建命令和 CI、Release 里跑的完全一致，改命令行请顺手一起改
+`.github/workflows/build.yml`。）
 
 三个 exe 必须放在同一目录：`baozi.exe` 启动时会在自己旁边找 `baozi-hook.exe`
 （可选）与 `baozi-index.exe`（装服务时用）。钩子进程带 `CreateNoWindow` 启动，自己也不会弹窗。
@@ -125,11 +145,11 @@ D:\Go\bin\go.exe build -trimpath -ldflags "-s -w"              -o dist\baozi-ind
 
 每个尺寸都是**按解析式单独画**的，不是把 256 缩下来——16px 上会自动省掉褶子，
 缩图会糊成三条竖杠。生成器在 `tools/icongen/main.go`（`//go:build ignore`），
-改完配色跑 `D:\Go\bin\go.exe run tools\icongen\main.go`，再重新生成 syso：
+改完配色跑 `go run tools\icongen\main.go`，再重新生成 syso：
 
 ```powershell
 $env:GOARCH = "amd64"
-D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.ico -o cmd\baozi\rsrc_windows_amd64.syso
+go run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.ico -o cmd\baozi\rsrc_windows_amd64.syso
 ```
 
 
@@ -252,7 +272,7 @@ D:\Go\bin\go.exe run github.com/akavel/rsrc@v0.10.2 -ico cmd\baozi\assets\baozi.
 ### 重新部署信令服务
 
 ```powershell
-cd D:\work\baozi\signal
+cd signal
 npm install
 npx wrangler login
 npx wrangler deploy
@@ -615,16 +635,27 @@ internal/pinyin/    汉字 → 首字母 / 全拼（只留字母数字、统一�
 internal/search/    fzf 式匹配打分（含拼音档位）+ 频次/类型/准确性加权排序；
                     另有 regex.go：正则模式的编译与"必定出现的字面"预筛
 internal/share/     局域网互传：HTTP + 一次性令牌 + 只发不收（没有任何上传通道）
-internal/win/       Win32：前台窗口、全屏判定
+internal/win/       Win32：前台窗口、全屏判定、系统图标与缩略图、打开/保存框跟随、
+                    以及资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa 的
+                    "当前目录"读取（每种都能在设置里单独关掉）
 docs/architecture.md 白盒架构、公式、与 Lertaro 的差异、未实现项的落地方案
 ```
 
-## 测试
+## 测试与 CI
 
 ```powershell
-D:\Go\bin\go.exe test ./...
-D:\Go\bin\go.exe vet  ./...
+go vet ./...
+go test ./...
 ```
+
+CI（`.github/workflows/build.yml`）在每次推 `main` 和每个 PR 上跑 gofmt、`go vet`、纯逻辑包测试，
+再把三个 exe 编一遍当 artifact 挂出来：
+
+- 进 CI 的测试只挑不依赖桌面的包：`config` / `history` / `index` / `pinyin` / `search` / `share` / `p2p`；
+- `cmd/baozi` 的 `ui.Tester` 渲染测试和 `internal/win` 的窗口抓取**故意不进 CI**：它们要真实桌面会话
+  （Explorer 在跑、有窗口可抓），无头 runner 上只会得到假失败，本地跑 `go test ./...` 才是它们的正位。
+- 打 `v*` tag 会触发 `.github/workflows/release.yml`：编三个 exe、打成
+  `baozi-vX.Y.Z-windows-amd64.zip`、自动生成 release notes 挂到 Releases。
 
 - `internal/search`：匹配分级（含拼音首字母/全拼）、三项权重的优先级、应用压过 .exe；
   正则模式另有四类断言：预筛绝不筛掉真命中、`rpt|backup` 这类分支不漏、非法模式报错、

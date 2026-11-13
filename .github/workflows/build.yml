@@ -1,0 +1,77 @@
+name: build
+
+# 每次推到 main 或开 PR 都验一遍：格式、vet、纯逻辑测试、三个 exe 能不能编出来。
+# GUI 相关测试（cmd/baozi 的渲染测试、internal/win 的窗口抓取）不放进来：
+# 它们需要真实桌面会话，无头 runner 上跑只会得到一堆假失败。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'signal/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'signal/**'
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        shell: pwsh
+        run: |
+          $bad = gofmt -l cmd internal
+          if ($bad) {
+            Write-Host "这些文件需要 gofmt："
+            $bad
+            throw "gofmt check failed"
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      # 只跑不依赖桌面的包：搜索、拼音、历史、索引、互传（局域网）、P2P 协议。
+      - name: go test（纯逻辑包）
+        run: >
+          go test -count=1 -timeout 240s
+          ./internal/config
+          ./internal/history
+          ./internal/index
+          ./internal/pinyin
+          ./internal/search
+          ./internal/share
+          ./internal/p2p
+
+      - name: build
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist/baozi.exe ./cmd/baozi
+          go build -trimpath -ldflags "-s -w" -o dist/baozi-hook.exe ./cmd/baozi-hook
+          go build -trimpath -ldflags "-s -w" -o dist/baozi-index.exe ./cmd/baozi-index
+          Get-ChildItem dist/*.exe | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: baozi-windows-amd64
+          path: |
+            dist/baozi.exe
+            dist/baozi-hook.exe
+            dist/baozi-index.exe
+          if-no-files-found: error
+          retention-days: 14
