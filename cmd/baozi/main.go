@@ -204,12 +204,19 @@ type application struct {
 	// 否则面板一唤出、指针正好在左上角时就永远不接管。
 	hoverKnown bool
 
-	// 拖面板边缘改尺寸：OnResize 在拖动过程中会连着来几十次，攒到停手才写盘，
-	// 否则每动一像素就重写一遍 config.json。
+	// 面板改尺寸、拖着面板走：这两个回调在拖动过程中会连着来几十次，
+	// 攒到用户停手才写盘，否则每动一像素就重写一遍 config.json。
+	// 尺寸和位置共用同一个定时器，免得两个 goroutine 各写一份、互相覆盖。
 	panelMu    sync.Mutex
 	panelPendW int
 	panelPendH int
+	panelPendX int
+	panelPendY int
 	panelSave  *time.Timer
+	// panelPlaceAt 是上一次"刚把面板摆到目标位置"的时刻。面板弹出的头几百毫秒里
+	// mygo / 系统还会把它挪几下（实测过，能把配好的位置一路滑走），那些移动不是
+	// 用户拖的，不能记进配置，否则"记住位置"就变成"记住每次被挪到哪"。
+	panelPlaceAt time.Time
 }
 
 // pinMove 是一次拖动排序的意图，from/to 都是 results 的下标。
@@ -446,7 +453,11 @@ func (a *application) view(c *ui.Context) {
 		a.open()
 	}
 
-	ui.Column(c).Fill().Children(func() {
+	// DragWindow 挂在根容器上：按住面板任意空白处拖动，整个窗口就跟着走。
+	// 子元素（输入框、卡片、按钮）命中优先，所以打字和点击不受影响；
+	// 拖到哪、松手后位置记进配置（见 panelGeometryChanged），下次唤出照旧复现。
+	// 面板本来就没有标题栏（TitleBarHidden），没有这条就完全拿不动它。
+	ui.Column(c).Fill().DragWindow().Children(func() {
 		// 顶栏：放大镜 + 大字输入 + 正则开关 + 右端品牌胶囊（Pane 右上角那个 "Pane" 标）。
 		ui.Row(c).Padding(16, 20).Gap(14).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, searchIcon).FontSize(20).TextColor(t.TextMuted)
@@ -1767,42 +1778,103 @@ func historyKind(k search.Kind) history.Kind {
 	return history.KindFile
 }
 
-// applyPanelSize 把配置里的面板尺寸立刻用到窗口上（设置页保存后调用，不用重启）。
-// panelResized 是窗口尺寸变化的回调：攒到用户停手再落盘。
+// panelSettle 是面板弹出后允许位置再被系统/mygo 改动的窗口期。这段时间里的移动
+// 不是用户拖的，不记进配置；过了这段时间，位置才算数。
+const panelSettle = 900 * time.Millisecond
+
+// placePanel 把面板摆到 (x, y)：先摆一次，弹出过程结束后再补一次。
+// 补的那次是关键——面板刚显示时位置会被改掉（见 panelPlaceAt 的注释）。
+func (a *application) placePanel(x, y int) {
+	a.panelMu.Lock()
+	a.panelPlaceAt = time.Now()
+	a.panelMu.Unlock()
+	a.panel.SetPosition(x, y)
+	time.AfterFunc(panelSettle/2, func() { a.panel.SetPosition(x, y) })
+}
+
+// panelGeometryChanged 是窗口尺寸/位置变化的回调：攒到用户停手再落盘。
 // 拖动时这个回调会连着来几十次（每帧一次），每次都写 config.json 太重。
-func (a *application) panelResized() {
+// 尺寸和位置走同一个定时器：两件事都要写同一个文件，分开定定时器会互相覆盖。
+func (a *application) panelGeometryChanged() {
 	w, h := a.panel.Size()
+	x, y := a.panel.Position()
+	a.panelMu.Lock()
+	if time.Since(a.panelPlaceAt) < panelSettle {
+		// 面板正在弹出，这期间的位移是显示过程造成的，**不记**——
+		// 否则每次唤出都把记录的位置改写成"被挪到的那个值"，复现就永远对不上。
+		a.panelMu.Unlock()
+		return
+	}
+	a.panelMu.Unlock()
+	if !a.panel.IsVisible() {
+		// 面板收起来之后它还会被系统挪一下（实测：隐藏几秒后位置会漂走）。
+		// 那不是用户拖的，记进去就等于每唤出一次把位置改一次。
+		log.Printf("面板几何: 隐藏状态下的移动 %d,%d，忽略", x, y)
+		return
+	}
 	a.panelMu.Lock()
 	a.panelPendW, a.panelPendH = w, h
+	a.panelPendX, a.panelPendY = x, y
 	if a.panelSave != nil {
 		a.panelSave.Stop()
 	}
-	a.panelSave = time.AfterFunc(800*time.Millisecond, a.savePanelSize)
+	a.panelSave = time.AfterFunc(800*time.Millisecond, a.savePanelGeometry)
 	a.panelMu.Unlock()
 }
 
-// savePanelSize 把拖出来的尺寸写进配置。失败只记日志、不改内存里的 cfg，
+// savePanelGeometry 把拖出来的尺寸和位置写进配置。失败只记日志、不改内存里的 cfg，
 // 否则会出现"配置文件没写成、但这次运行按新尺寸走"的错位。
-func (a *application) savePanelSize() {
+func (a *application) savePanelGeometry() {
 	a.panelMu.Lock()
 	w, h := a.panelPendW, a.panelPendH
+	x, y := a.panelPendX, a.panelPendY
 	a.panelMu.Unlock()
 	if w <= 0 || h <= 0 {
 		return
 	}
-	// 每次唤出面板都会先 SetSize/SetPosition 一次，那也会触发 OnResize；
-	// 尺寸没变就别重写 config.json——不然每唤出一次就多一次磁盘写。
-	if cw, ch := a.cfg.PanelSize(); w == cw && h == ch {
+	// 拖到屏幕边缘时面板可以有一截探出工作区；下次启动本来就会被夹回来，
+	// 这里先夹一次，省得配置里记的值和实际摆的位置差几像素、每启动一次对不齐。
+	near := mygo.Screen.DisplayNearestPoint(mygo.Point{X: x + w/2, Y: y + h/2})
+	x, y = clampPanelTo(x, y, w, h, near.WorkArea)
+	// 每次唤出面板都会先 SetPosition（还会 SetSize），那也会触发 OnMove/OnResize；
+	// 没真变就别重写 config.json——不然每唤出一次就多一次磁盘写。
+	cw, ch := a.cfg.PanelSize()
+	cx, cy, has := a.cfg.PanelPos()
+	if w == cw && h == ch && has && x == cx && y == cy {
 		return
 	}
 	cfg := *a.cfg
 	cfg.Panel.Width, cfg.Panel.Height = w, h
+	px, py := x, y
+	cfg.Panel.X, cfg.Panel.Y = &px, &py
 	if err := config.Save(&cfg, a.cfgPath); err != nil {
-		log.Printf("保存面板尺寸: %v", err)
+		log.Printf("保存面板位置/尺寸: %v", err)
 		return
 	}
 	a.cfg = &cfg
-	log.Printf("面板尺寸: %dx%d（已保存）", w, h)
+	log.Printf("面板几何: %dx%d @ %d,%d（已保存）", w, h, x, y)
+}
+
+// panelPosition 返回面板该摆在哪：拖过就按记下的位置复现，没拖过就居中偏上。
+//
+// 记下的坐标必须先夹回可见区域：拔掉一块显示器、改了分辨率之后，旧坐标可能
+// 整块落在屏外——面板一唤出就在看不见的地方，等于启动器失效了。
+func (a *application) panelPosition(d mygo.Display, w, h int) (int, int) {
+	if px, py, ok := a.cfg.PanelPos(); ok {
+		// 用面板中心去找"最近的显示器"，这样多半屏已经在另一块屏上时也认得对。
+		near := mygo.Screen.DisplayNearestPoint(mygo.Point{X: px + w/2, Y: py + h/2})
+		return clampPanelTo(px, py, w, h, near.WorkArea)
+	}
+	return d.WorkArea.X + (d.WorkArea.Width-w)/2, d.WorkArea.Y + (d.WorkArea.Height-h)/3
+}
+
+// clampPanelTo 把面板左上角夹进给定工作区，保证它一定看得见。
+//
+// 面板比工作区还宽/高时（竖屏 + 很宽的面板、4K 拖到 1080p 屏上），
+// "右边界 - 宽"会算出小于原点的负偏移，所以外面还要 max 一次：宁可右边溢出，
+// 也要让左上角（顶栏那条搜索框）留在可见区域。
+func clampPanelTo(x, y, w, h int, wa mygo.Rectangle) (int, int) {
+	return max(wa.X, min(x, wa.X+wa.Width-w)), max(wa.Y, min(y, wa.Y+wa.Height-h))
 }
 
 // show 在鼠标所在显示器居中偏上位置显示面板。
@@ -1813,7 +1885,13 @@ func (a *application) show() {
 	}
 	d := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint())
 	w, h := a.panel.Size()
-	a.panel.SetPosition(d.WorkArea.X+(d.WorkArea.Width-w)/2, d.WorkArea.Y+(d.WorkArea.Height-h)/3)
+	x, y := a.panelPosition(d, w, h)
+	if px, py, ok := a.cfg.PanelPos(); ok {
+		log.Printf("唤出: 记下的位置 %d,%d → 实际 %d,%d（面板 %dx%d，工作区 %+v）", px, py, x, y, w, h, d.WorkArea)
+	} else {
+		log.Printf("唤出: 没记过位置，居中偏上 → %d,%d（工作区 %+v）", x, y, d.WorkArea)
+	}
+	a.placePanel(x, y)
 	a.query = ""
 	// 唤出前把索引追一次：这是"刚存的文件马上能搜到"的关键一步。
 	// 没变化时只是两次 stat（微秒级）；有变化才复制快照叠增量（约 15ms），
@@ -1828,6 +1906,9 @@ func (a *application) show() {
 	}
 	// 焦点要等窗口真的成为前台之后再交给输入框，否则焦点会被重新激活的窗口抢走。
 	a.panel.Update(func() { a.input.Focus() })
+	// 弹出过程结束后把最终位置记一次：这时它要么是配置里的值，要么是用户已经
+	// 拖过的新位置，两种都该落盘。（等于配置时 savePanelGeometry 会跳过写盘。）
+	time.AfterFunc(panelSettle+100*time.Millisecond, a.panelGeometryChanged)
 	log.Print("toggle: 显示面板")
 }
 
@@ -1879,7 +1960,10 @@ func (a *application) ready() {
 	// 用户拖着面板边缘改大小：停手 800ms 后把尺寸写进 config.json，
 	// 下次启动按这个尺寸建窗。不用 mygo 的 StateKey——那个只在窗口真正关闭时落盘，
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
-	a.panel.OnResize(func() { a.panelResized() })
+	a.panel.OnResize(func() { a.panelGeometryChanged() })
+	// 拖面板本身（见 view 里给根容器挂的 DragWindow）同样停手 800ms 后记位置。
+	// 拖面板本身（见 view 里给根容器挂的 DragWindow）同样停手 800ms 后记位置。
+	a.panel.OnMove(func() { a.panelGeometryChanged() })
 	a.panel.OnClose(func(e *mygo.CloseEvent) {
 		// 真正退出时不能拦：mygo 的 Quit 是一个个关窗口，
 		// 只要有窗口在 OnClose 里 PreventDefault，整个 Quit 就被取消，

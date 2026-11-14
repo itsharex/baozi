@@ -173,6 +173,19 @@ type Panel struct {
 	// Width / Height 是逻辑像素（DIP）。0 或没配置表示用默认值。
 	Width  int `json:"width,omitempty"`
 	Height int `json:"height,omitempty"`
+	// X / Y 是面板左上角的屏幕坐标（物理像素）。拖动面板时默默记下来，
+	// 下次启动照这个位置摆。用指针是为了区分"从没记过"（nil，按默认居中偏上）
+	// 和"恰好记在 0,0"（左上角屏，那是真实位置）。
+	X *int `json:"x,omitempty"`
+	Y *int `json:"y,omitempty"`
+}
+
+// PanelPos 返回记过的面板位置；从没拖动过时 ok 为 false。
+func (c *Config) PanelPos() (x, y int, ok bool) {
+	if c.Panel.X == nil || c.Panel.Y == nil {
+		return 0, 0, false
+	}
+	return *c.Panel.X, *c.Panel.Y, true
 }
 
 // 面板尺寸的默认值与上下限。下限保证能看见至少一行结果 + 顶栏底栏；

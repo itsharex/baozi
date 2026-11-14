@@ -158,3 +158,26 @@ func TestPathSourcesJSONRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// 面板位置：从没拖动过时读不出东西（调用方据此走"居中偏上"），
+// 记过一次之后要能原样读回、并且落盘后还在。
+// 用指针字段就是为这个：0,0 是左上角屏的真实位置，不能和"没记过"混为一谈。
+func TestPanelPos(t *testing.T) {
+	var c Config
+	if _, _, ok := c.PanelPos(); ok {
+		t.Fatal("空白配置不该有面板位置")
+	}
+
+	x, y := 1180, 260
+	c.Panel.X, c.Panel.Y = &x, &y
+	if gx, gy, ok := c.PanelPos(); !ok || gx != x || gy != y {
+		t.Fatalf("应读回 %d,%d，实际 %d,%d ok=%v", x, y, gx, gy, ok)
+	}
+
+	// 0,0 必须算"记过"。
+	zero := 0
+	c.Panel.X, c.Panel.Y = &zero, &zero
+	if gx, gy, ok := c.PanelPos(); !ok || gx != 0 || gy != 0 {
+		t.Fatalf("0,0 应读回 0,0 ok=true，实际 %d,%d ok=%v", gx, gy, ok)
+	}
+}
