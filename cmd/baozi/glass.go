@@ -216,7 +216,6 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 	// 那条线紧挨着深色壁纸时会显得比玻璃亮得多，看起来就是四角内部各有一道
 	// 白色圆弧。圆角的分界现在完全靠"桌面色 → 玻璃"这个色差本身，弧上只有
 	// 超采样给出的柔和过渡。
-	_ = edge
 	// 三件套：4×4 子采样算出"这个像素有多少面积在弧外"，再在 mask 上做两遍 3×3
 	// 柔化，最后按 mask 把桌面色铺上去。
 	//
@@ -253,6 +252,16 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 						fx := bx + (float64(sx)+0.5)*sub
 						fy := by + (float64(sy)+0.5)*sub
 						// >0 在弧外（该角这一侧），<0 在弧内（面板这一侧）。
+						//
+						// 只在角那个象限里算：这里量的是"到圆心的距离"，对整圆
+						// 都成立。圆心在 (arc, arc)，半径 arc 的圆在面板内部还有
+						// 半个（(2*arc, arc) 就是圆上一点），那些点同样满足 r>arc，
+						// 会被当成"弧外"去铺桌面色 —— 面板里就多出一段弯的色带，
+						// 看着正是"圆弧跟边框交完界还继续画"。超过圆心的那一侧
+						// 属于面板内部，一律是玻璃。
+						if fx > float64(arc) || fy > float64(arc) {
+							continue
+						}
 						sd := math.Hypot(float64(arc)-fx, float64(arc)-fy) - float64(arc)
 						// 区域外一律铺满桌面色：那一圈是 DWM 填的白。
 						if sd > 0 || math.Hypot(float64(region)-fx, float64(region)-fy) > float64(region) {
@@ -296,6 +305,7 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				}
 				al := masks[y*size+x]
 				// 区域外必须完全不透明：那里是 DWM 的白，透出来就是漏光。
+				// 同样只在角象限内判 —— 圆心的另一侧是面板内部，玻璃。
 				bx, by := float64(x)+0.5, float64(y)+0.5
 				if corner == 1 || corner == 3 {
 					bx = float64(size) - bx
@@ -303,7 +313,8 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				if corner == 2 || corner == 3 {
 					by = float64(size) - by
 				}
-				if math.Hypot(float64(region)-bx, float64(region)-by) > float64(region) {
+				inCorner := bx <= float64(arc) && by <= float64(arc)
+				if inCorner && math.Hypot(float64(region)-bx, float64(region)-by) > float64(region) {
 					al = 1
 				}
 				// 弧上那 1 DIP 的边线：颜色、宽度都和四条直边线一致，两段在弧的
@@ -318,18 +329,23 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				// 一条 1 DIP 宽的斜环扫过像素中心时覆盖率只有 0.3~0.6，线会淡到
 				// 看着"角上没有边框"。放宽 + 开方之后弧上是 0.8~1.0 的覆盖，
 				// 外沿还留着柔化，既不比直边淡，也不会显粗。
-				edgeW := float64(a.glassScale())
-				sdC := math.Hypot(float64(arc)-bx, float64(arc)-by) - float64(arc)
-				if t := -sdC; t > -edgeW && t < edgeW*1.5 {
-					if w := 1 - math.Abs(t-edgeW/2)/edgeW; w > 0 {
-						if w = math.Sqrt(w) * 1.25; w > 1 {
-							w = 1
-						}
-						cr = cr*(1-w) + float64(edge.R)*w
-						cg = cg*(1-w) + float64(edge.G)*w
-						cb = cb*(1-w) + float64(edge.B)*w
-						if w > al {
-							al = w
+				//
+				// 和上面一样必须限定在角象限里：否则边线会沿着整个圆再画一圈，
+				// 面板内部就多出一段弧形边线。
+				if inCorner {
+					edgeW := float64(a.glassScale())
+					sdC := math.Hypot(float64(arc)-bx, float64(arc)-by) - float64(arc)
+					if t := -sdC; t > -edgeW && t < edgeW*1.5 {
+						if w := 1 - math.Abs(t-edgeW/2)/edgeW; w > 0 {
+							if w = math.Sqrt(w) * 1.25; w > 1 {
+								w = 1
+							}
+							cr = cr*(1-w) + float64(edge.R)*w
+							cg = cg*(1-w) + float64(edge.G)*w
+							cb = cb*(1-w) + float64(edge.B)*w
+							if w > al {
+								al = w
+							}
 						}
 					}
 				}
