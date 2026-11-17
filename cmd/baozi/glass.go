@@ -228,6 +228,26 @@ func (a *application) refineCornerColors() {
 	}
 }
 
+// cornerOuterSide 报一个越界坐标是不是落在"窗口之外"的那一侧。
+//
+// 四角位图的四个方向不是同一种东西：两条边贴着窗口边（再往外就是桌面/白），
+// 另外两条边朝面板内部（再往外就是玻璃）。柔化采样越界时，前者要补不透明、
+// 后者要补透明，混为一谈就会在面板内部画出一条方形的桌面色带。
+//
+// corner：0 左上、1 右上、2 左下、3 右下（与 captureCornerPatches 的 origins 一致）。
+func cornerOuterSide(corner, size, x, y int) bool {
+	switch corner {
+	case 0:
+		return x < 0 || y < 0
+	case 1:
+		return x >= size || y < 0
+	case 2:
+		return x < 0 || y >= size
+	default:
+		return x >= size || y >= size
+	}
+}
+
 // buildCornerBitmaps 画四角的"月牙"：弧外铺该角真实的桌面色，弧内全透明（露出
 // 玻璃），弧上靠 4×4 超采样做成柔和过渡、**不描任何边线**。
 //
@@ -319,8 +339,17 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				masks[y*size+x] = float64(hit) / float64(ss*ss)
 			}
 		}
-		// 2) 两遍 3×3 柔化。图外按 1（不透明）处理，免得边缘的 alpha 被拉低、
-		//    在区域边上露出一圈半透明的白。
+		// 2) 两遍 3×3 柔化。
+		//
+		// 采样越界时补什么值，**必须分方向**：
+		//   · 贴着窗口边的那两侧（可以理解为"窗口之外"）补 1（不透明）。那里是
+		//     DWM 填的白，月牙必须不透明地盖住它，否则弧外漏一圈白。
+		//   · 朝面板内部的那两侧补 0（透明）。这里曾经一律补 1，代价很具体：
+		//     月牙是 40×40 的位图，弧半径只有 30，朝内那两条边离弧还有 10 像素
+		//     的空档，本来就该全透明；补 1 之后柔化把这条边上的 mask 拉到 0.33
+		//     左右，于是位图的内边缘沿着整个 40 像素铺出一条"桌面色"带 ——
+		//     因为位图是方的，这条带在面板内部就是一条水平、一条垂直的边。
+		//     用户看到并描出来的那两条框线，就是它。
 		for pass := 0; pass < 2; pass++ {
 			for y := 0; y < size; y++ {
 				for x := 0; x < size; x++ {
@@ -329,7 +358,9 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 						for dx := -1; dx <= 1; dx++ {
 							xx, yy := x+dx, y+dy
 							if xx < 0 || yy < 0 || xx >= size || yy >= size {
-								sum += 1
+								if cornerOuterSide(corner, size, xx, yy) {
+									sum += 1
+								}
 								continue
 							}
 							sum += masks[yy*size+xx]
