@@ -1955,3 +1955,87 @@ mygo 的 `drawNow`（全量布局 + GPU 合成 + present）与 DWM 同步里，�
 验收也一起做了：拖动中 `GetWindowRgn` 返回 0（无区域＝矩形），停手后返回 3
 （复杂区域＝圆角）；复位后左下角落弧外是桌面色、弧上有 1px 边框、弧内是玻璃，
 没有横向或纵向的色带。
+
+## 18. 阴影：为什么只能自己画，以及四角那道白线到底是什么
+
+### 18.1 Win10 上"有区域的窗口没有 DWM 阴影"（实测结论，别再试了）
+
+圆角必须靠 `SetWindowRgn`（Win10 没有别的形状手段，`DWMWA_WINDOW_CORNER_PREFERENCE`
+是 Win11 才认的），而**窗口一旦有区域，DWM 就不投阴影**。证据链：
+
+- 空闲（区域在）时，窗口外侧整条带取色全是 `#FFFFFF`；
+- 按住拖动的那一瞬间（mygo 会临时撤区域）才冒出一圈 `+0:#C7C7C7 → +18:#FDFDFD`；
+- 松手把区域设回去，影立刻消失。
+
+逐项试过、全部"返回成功但无影"：`DWMWA_NCRENDERING_POLICY`（设 ENABLED 返回 S_OK、
+属性回读也是 ENABLED，影照旧没有）、`DwmExtendFrameIntoClientArea(1px)`、两者的顺序组合、
+外部进程里同样组合。另外 mygo 的 `SetHasShadow` 开头就是
+`if !w.captionless() || w.vibrancy != "" { return }` —— 只要 `WindowOptions` 里带
+`Vibrancy`，连 `DwmExtendFrameIntoClientArea` 都不会走，所以面板现在**不设 Vibrancy**
+（Win10 上它本来也没有视觉作用，只是把材质路径换成 `win.SystemGlass()`）。
+
+### 18.2 做法：一个自绘的 layered 窗口
+
+`internal/win/shadow.go`：`WS_POPUP | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`
+（**不带 `WS_EX_TRANSPARENT`**），窗口类 `BaoziShadowWnd` 自己注册，位图用
+`UpdateLayeredWindow` 交 32 位预乘 BGRA。四道坑：
+
+1. `WS_EX_TRANSPARENT` 会让这个分层窗口**整片不参与合成**（不是"鼠标穿透"那么轻）。
+   穿鼠标改成在 `WM_NCHITTEST` 里回 `HTTRANSPARENT`。
+2. SDF 必须用标准式
+   `hypot(max(qx,0), max(qy,0)) + min(max(qx,qy),0) - r`。当初写成 `hypot(qx,qy)-r`
+   直接用原始值，只要有一轴深入面板内部（`qy` 是很小的负数）就被撑爆，整条直边
+   alpha 全 0 —— 屏幕上就是"只有四角有影、四条边光秃秃"。
+3. 阴影层**不能垫在面板下面**：垫着实测完全看不见（位图 alpha 明明有值、
+   `UpdateLayeredWindow` 也返回成功）。改成 `HWND_TOPMOST` 压在面板上面，
+   面板内部 alpha 恒 0，所以不影响玻璃。
+4. `offY` 不能偏移。曾把图层整体下移 `m/8` 假装光源在上，结果底边那几行 alpha
+   没归零，阴影在图层最下一行被硬切，屏幕上是一道水平直角硬边。
+
+### 18.3 四角那道白线：只能由这一层补
+
+面板被 `SetWindowRgn` 裁形之后，**弧外那块是 DWM 填的白，面板自己的像素在区域外
+直接被丢弃** —— App 里的"月牙"位图根本盖不到那块白，能画出去的只有弧里侧半截，
+3×3 柔化又把它摊成压在玻璃上的浅色弧线，正是用户反复说的"四角内部白圆弧 / 漏光"。
+现在四角全部交给阴影层（`UseCornerBitmaps = false`，月牙代码保留但不再摆放）：
+
+- `cornerCoverage(radius, margin, borderW)` 在**角部局部坐标**下做 4×4 超采样，产出三份表：
+  `cov`（弧外覆盖率）、`shade`（该压多黑，曲线和外圈一致）、`band`（弧内侧 `borderW`
+  像素的边框覆盖率）；按 `[radius, margin, borderW]` 缓存，与面板尺寸无关，缩放一帧不用重算；
+- 四个角按 `patchSize-1-lx|ly` 镜像复用，只补"面板矩形以内"的缺口；矩形以外保持纯黑阴影
+  （否则拖动时旧 patch 会在影子里印出一块过期壁纸）；
+- 弧外像素 `color = patch*(1-shade)`、**alpha = 255**（涂实：那块本来就在轮廓外，
+  半透明会把边界那一格的白漏出来）；
+- 弧内侧紧贴边界的 1px 涂成不透明边框色（`seam`），再往里 `borderW` 像素按覆盖率做抗锯齿
+  —— 这样弧上的边框和四条直边连续、颜色一致。
+
+> 顺带一个观察：面板自己在边界上有 1px `#FFFFFF`（mygo 的"白底 + 裁形"留下的），
+> 直边上也有、并且和背景无关。所以现在弧和直边一样，是一条连续的边框线，
+> 不会再出现"只在弧上有、直边没有"的那种白弧。
+
+### 18.4 缩放跟手：从 15~25ms 打回 6ms 以内
+
+阴影层每帧重建的代价一开始是灾难性的：`Place` 走遍整张 `1143×764 ≈ 87 万`像素，
+一帧 15~25ms，肉眼就是卡（用户原话"太不跟手了"）。三层优化：
+
+1. **只画边带**：面板盖住的内部 alpha 恒 0，没必要算 —— 降到"四条 m 宽边带 + 四个角块"。
+2. **直边一行/一列共用一个值**：顶/底带里只要这一列不在四角范围（`qx<=0`），`d` 就等于
+   `qy-r`；左右带同理。真正要算距离的只剩四个角块。
+3. **`math.Hypot` → `math.Sqrt`**：内层循环里 Hypot 为了防溢出做的缩放很贵（几千像素差 2~3ms）。
+
+实测（`阴影: 重建`/`缩放: 回调` 两条日志，1300×880 的面板）：位图 **1.0~1.5ms**、
+`UpdateLayeredWindow` **1.0~2.0ms**，一帧合计 3.0~3.6ms；`OnResize` 回调整体回到
+**6ms 以内**（6ms 阈值一条都不再记）。
+
+缩放期间**不再收阴影层**，而是每帧 `refreshShadow()`：收起之后四角"弧外那块"就没人补，
+缩放的整个过程中四角会冒白 —— 和"拖动时四角变直角"是同一类观感问题。
+
+### 18.5 复验工具
+
+- `tools\shot.ps1`：面板已可见就不按 Ctrl，只把"外扩 40px"的窗口图存成 `dist\shot_panel.png`；
+- `tools\resize.ps1`：从外部进程 `SetWindowPos` 连续放大/缩小各 16 帧，回读 `缩放:` 日志；
+- `tools\resize_shot.ps1`：子进程跑帧序列、父进程半拍后截屏，用来确认**缩放过程中**
+  四角仍然是圆的、阴影还在；
+- `tools\shadowprobe`：不依赖 app，单独把阴影层摆到指定矩形并 dump alpha 图（`dist\shadow_alpha.png`）。
+
+> 注意：`GetPixel(GetDC(0))` 之类的屏幕抓取**拍不到分层窗口**，验证渲染只能截图。

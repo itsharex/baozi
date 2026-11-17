@@ -166,6 +166,9 @@ type application struct {
 	// 的抗锯齿就是它们给的。变了桌面色或换了面板尺寸就重建（见 buildCornerBitmaps）。
 	cornerBitmaps [4]*ui.Bitmap
 	cornerPx      int
+	// cornerEdge 是圆角边框弧的颜色（0xRRGGBB），传给自绘阴影层 —— 弧那一段
+	// 的边框现在由它画：面板的画布被 SetWindowRgn 裁掉了，画不出去。
+	cornerEdge uint32
 	// cornerSize 是上面四张图当前**实际的像素边长**。它和 cornerPx（沿用的大
 	// 尺寸）分开记：尺寸没变时只能 Update 像素、不能换新 Bitmap —— ui.Image
 	// 渲染一次就把纹理缓存住了，换对象屏上不会变。
@@ -179,9 +182,10 @@ type application struct {
 	// 每帧都重画四张图（外加四张 GPU 纹理）就是"缩放卡卡的"另一半原因。
 	// 月牙的边长只跟圆角半径有关，和面板多大无关，所以缩放期间沿用旧图完全正确。
 	cornerTimer *time.Timer
-	// inResize 记"正在连续缩放"。缩放期间窗口区域被撤掉（见 ClearRegion），
-	// 停手后由 finishResize 设回去，避免拖动中每帧都让 DWM 重算形状。
-	inResize bool
+	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
+	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
+	// internal/win/shadow.go）。
+	shadow *win.Shadow
 	// borderColor 是最后一帧用的面板边线色，四角月牙要把这条边一起画进去
 	// （mygo 画边框的圆角段没有抗锯齿，那正是四角台阶的第二个来源）。
 	borderColor ui.Color
@@ -485,7 +489,9 @@ func (a *application) view(c *ui.Context) {
 		// 既然透不出去，就别留透明：根上铺一层**桌面本来的颜色**（从快照里取的），
 		// 裁掉的角上看到的就是桌面，与真的透出去肉眼无异。
 		root.Background(ui.Transparent)
-	} else if c.Vibrancy() {
+	} else if win.SystemGlass() {
+		// 系统 acrylic 那一路（我们自己抓不到全屏快照时走它）：窗口没有 Vibrancy
+		// 了，所以这里不能再用 c.Vibrancy() 判断，直接问系统开关。
 		root.Background(ui.Transparent)
 	} else {
 		root.Background(t.Background)
@@ -656,7 +662,7 @@ func (a *application) view(c *ui.Context) {
 			// 采样渗到透明边缘，角上漏出一两个白点（左上、左下从 0 起步，所以没事，
 			// 这就是四个角只有斜对的两个露白的原因）。这里按窗口客户区的真实像素
 			// 宽高算偏移，乘回缩放之后正好是整数。
-			if a.cornerPx > 0 {
+			if UseCornerBitmaps && a.cornerPx > 0 {
 				s := a.glassScale()
 				pw, ph := a.panelSize()
 				cw, ch := int(math.Round(float64(pw)*float64(s))), int(math.Round(float64(ph)*float64(s)))
@@ -1825,7 +1831,7 @@ func (a *application) open() {
 	}
 	// 命令可以要求"执行后别收面板"（KeepOpen）：面板先收再跑，是默认行为。
 	if !(r.Kind == search.KindCommand && r.KeepOpen) {
-		a.panel.Hide()
+		a.hidePanel()
 	}
 
 	// 历史要带着"这是什么"一起记，否则重启后还原不出正确的名字和图标。
@@ -1935,7 +1941,7 @@ func (a *application) openFolderAt(i int) {
 		a.setStatus("打开文件夹失败：" + err.Error())
 		return
 	}
-	a.panel.Hide()
+	a.hidePanel()
 }
 
 // copyDir 把选中项所在目录放进剪贴板。对话框跟随是自动的（见 win.DialogFollow），
@@ -2013,15 +2019,23 @@ func (a *application) placePanel(x, y int) {
 	time.AfterFunc(panelSettle/2, func() { a.panel.SetPosition(x, y) })
 }
 
-// finishResize 是缩放停手后的一次收尾：把窗口区域设回去，再按新位置重画四角月牙。
+// hidePanel 收起面板时连阴影层一起收：阴影是另一个独立窗口，面板藏起来它不会
+// 自己消失（实测会孤零零留在桌面上，还会被下一次唤出的桌面取色采进去）。
+func (a *application) hidePanel() {
+	a.hideShadow()
+	a.panel.Hide()
+}
+
+// finishResize 是缩放停手后的一次收尾：重设圆角区域、重画四角月牙，最后把阴影
+// 层按新的尺寸重建并显示出来。
 //
-// 顺序不能反：先有区域（DWM 才按圆角裁阴影），月牙再盖到四角上补抗锯齿。
+// 顺序不能反：阴影位图是按最终尺寸算的，得等尺寸定了再算；四角月牙要在阴影显示
+// 之前重画，因为月牙里那块"窗外桌面色"是从面板外侧实时取的，阴影已经亮起来的话
+// 会把那几个取样点压暗。
 func (a *application) finishResize() {
-	a.panelMu.Lock()
-	a.inResize = false
-	a.panelMu.Unlock()
 	a.applyRoundRegion()
 	a.refreshCorners()
+	a.refreshShadow()
 }
 
 // panelGeometryChanged 是窗口尺寸/位置变化的回调：攒到用户停手再落盘。
@@ -2115,6 +2129,10 @@ func (a *application) show() {
 		log.Print("前台是全屏应用，忽略唤出")
 		return
 	}
+	// 上一次收起时阴影层可能还亮着（面板藏了，阴影是另一个窗口，不会自己消失），
+	// 这里先收掉：下面的桌面底色取样是从面板外侧实时取的，自己的阴影会把那几
+	// 个点压暗（实测角上取到 #D4D4D4 而不是真桌面）。
+	a.hideShadow()
 	d := mygo.Screen.DisplayNearestPoint(mygo.Screen.CursorScreenPoint())
 	w, h := a.panel.Size()
 	x, y := a.panelPosition(d, w, h)
@@ -2141,6 +2159,9 @@ func (a *application) show() {
 	// 四角的桌面色要在窗口移到本次位置之后再取（取的是窗外 2px 的实时像素），
 	// 月牙也得跟着重画 —— 这两件事都不能放到 Show 之前。
 	a.refreshCorners()
+	// 阴影层放在最后：它是从面板外侧取样的，得等四角的桌面色取完再显示，
+	// 否则那几像素的取样会被自己的阴影压暗。
+	a.refreshShadow()
 	// Show 内部只调 SetForegroundWindow，从任务栏/别的窗口切回来时会被前台锁拒绝，
 	// 所以这里自己带上 AttachThreadInput 再抢一次；拿不到也不影响面板显示。
 	if !forceForeground(a.panel.NativeHandle()) {
@@ -2160,7 +2181,7 @@ func (a *application) toggle() {
 		// 而不是把面板收起来——否则用户按了快捷键看到面板消失，还得再按一次。
 		if a.panel.IsFocused() {
 			log.Print("toggle: 隐藏面板")
-			a.panel.Hide()
+			a.hidePanel()
 			// 收起面板正是回收的好时机：增量每条都复制一份可写表，
 			// 那些被换下来的旧表要等 GC，而 GC 不会把页还给 OS。
 			releaseMemory()
@@ -2178,6 +2199,9 @@ func (a *application) toggle() {
 
 func (a *application) ready() {
 	a.icons = map[string]*ui.Bitmap{}
+	// 阴影层先建好（隐藏状态）。放在最前面：后面的窗口初始化里不会用到它，
+	// 但唤出时一定要有，晚建的话第一帧就没影。
+	a.shadow = win.NewShadow()
 	// 显示器缩放只能在 mygo 起来之后问（App 初始化前调 Screen.Displays 会 panic），
 	// 所以放这里算一次缓存住，视图里不再现问。
 	a.scale = screenScale()
@@ -2197,10 +2221,12 @@ func (a *application) ready() {
 		TitleBarStyle:     mygo.TitleBarHidden,
 		HideWindowButtons: true,
 		Transparent:       true,
-		// Win11 22H2 起 mygo 的 vibrancy 走系统 backdrop（DWMWA_SYSTEMBACKDROP_TYPE），
-		// 那边由 DWM 实时出材质；Win10 上它没有任何视觉作用，面板的玻璃是自己抓屏做的
-		// 静态底（见 glass.go 的说明：只要窗口带 Content，noRedirect 就跑不掉）。
-		Vibrancy:     mygo.VibrancyGlass,
+		// 这里**不设 Vibrancy**。Win10 上 mygo 的 vibrancy 本来就没有视觉作用（系统
+		// backdrop 只有 Win11 22H2 起才有），但它会让 mygo 自己的 SetHasShadow 直接
+		// return（那边写着 `if !w.captionless() || w.vibrancy != "" { return }`），
+		// 连 DwmExtendFrameIntoClientArea 那一下都拿不到。面板的阴影现在是自绘的
+		// （见 internal/win/shadow.go 与 glass.go 的 refreshShadow），所以这里既不需要
+		// 它、也不该让它多走一条材质路径。
 		CornerRadius: glassRadius,
 		Width:        pw,
 		Height:       ph,
@@ -2213,21 +2239,19 @@ func (a *application) ready() {
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
 	a.panel.OnResize(func() {
 		t0 := time.Now()
-		// 玻璃的取景偏移在 build 时按客户区重算，窗口一变只要重建一帧。
-		//
-		// 圆角和月牙在缩放过程中都**先不动**，等停手 160ms 一次做掉：
-		//   · 窗口区域：SetWindowRgn 改的是 DWM 算阴影和重定向表面用的形状，
-		//     每帧改一次很实 —— 实测把一帧的 SetWindowPos 从 3ms 拖到 7ms。
-		//     而且区域是按窗口坐标记的，窗口变大时旧区域还会把新长出来的部分
-		//     裁掉。所以一进缩放就把区域整个撤掉，用四角月牙铺的桌面色撑着形状；
-		//   · 四角月牙：每帧重画四个角要合成四张图、上传四张 GPU 纹理。月牙的
-		//     边长只由圆角半径决定，和面板尺寸无关，缩放期间沿用旧图完全正确。
-		// 这两件事都是"稳下来才有意义"的活，压在拖动帧里只会让人手等着。
+		// 阴影层**每帧都跟着重建**，不再收起来。
+		// 收起之后四角"弧外那块"就没人补了：那是 DWM 填的白，面板自己被区域裁掉
+		// 画不出去 —— 缩放过程中四角会冒白（和"拖动时四角变直角"是同一类观感问题）。
+		// 代价是一次全位图重画，实测 1100×700 约 2~3ms，和区域重设一起仍在 6ms 内。
+		a.refreshShadow()
+		// 窗口区域**每帧都要跟着重设**：形状不跟着窗口走的话，拖动过程中四角就是直的
+		// （而且旧区域还会把窗口新长出来的部分裁掉）。这一步只是一次
+		// CreateRoundRectRgn + SetWindowRgn，实测不到 1ms。
+		a.applyRoundRegion()
+		// 四角月牙则**不能每帧重造**：每帧要合成四张图、上传四张 GPU 纹理。
+		// 月牙的边长只由圆角半径决定、和面板尺寸无关，缩放期间沿用旧图完全正确
+		// （只有桌面色可能略旧）。等停手 160ms 再重画一次。
 		a.panelMu.Lock()
-		if !a.inResize {
-			a.inResize = true
-			win.ClearRegion(a.panel.NativeHandle())
-		}
 		if a.cornerTimer != nil {
 			a.cornerTimer.Stop()
 		}
@@ -2248,8 +2272,14 @@ func (a *application) ready() {
 		// 玻璃跟着面板走：整屏磨砂图不动，只改窗口在图上取景的偏移。
 		// 每帧只是一次重建，没有裁图、模糊、纹理上传，所以跟手。
 		a.panel.Update(func() {})
+		// 阴影层也要跟着挪，否则松手前它会停在原地。只挪位置、不重算位图
+		// （尺寸没变），所以开销就是一次 UpdateLayeredWindow。
+		a.followShadow()
 		a.panelGeometryChanged()
 	})
+	// 阴影层的收起**不挂在 OnHide 上**：mygo 藏/显窗口用的是 DWMWA_CLOAK，Show 的
+	// 过程里也会报一次 hide，挂上去就成了"刚显示又被收掉"（实测：面板在，图层
+	// IsWindowVisible=False）。所有收面板的地方都走 a.hidePanel()。
 	a.panel.OnClose(func(e *mygo.CloseEvent) {
 		// 真正退出时不能拦：mygo 的 Quit 是一个个关窗口，
 		// 只要有窗口在 OnClose 里 PreventDefault，整个 Quit 就被取消，
@@ -2258,9 +2288,9 @@ func (a *application) ready() {
 			return
 		}
 		e.PreventDefault()
-		a.panel.Hide()
+		a.hidePanel()
 	})
-	a.panel.OnBlur(a.panel.Hide)
+	a.panel.OnBlur(a.hidePanel)
 
 	// 1) 索引：先用上次快照秒开，再按配置决定是否重扫
 	a.bootIndex()

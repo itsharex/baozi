@@ -4,13 +4,65 @@ package win
 
 import (
 	"image"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
+	// gdi32 / user32 在 thumb.go、fullscreen.go 里已经建过，同一个包共用。
+	dwmapi                 = windows.NewLazySystemDLL("dwmapi.dll")
 	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
 	procSetWindowRgn       = user32.NewProc("SetWindowRgn")
 	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
+	procDwmSetWindowAttr   = dwmapi.NewProc("DwmSetWindowAttribute")
+	procDwmExtendFrame     = dwmapi.NewProc("DwmExtendFrameIntoClientArea")
 )
+
+// effectWindow 是 DWM 画非客户区时的策略。没有它，这个窗口**根本没有阴影**：
+// 实测空闲时窗口外侧整条带全是桌面底色（#FFFFFF），拖动时才临时出现一圈
+// #C7C7C7 渐隐的阴影。DWMNCRP_ENABLED 之后阴影常驻，而且跟着窗口区域走 ——
+// 圆角区域的四个角，阴影也是圆的（实测角上 +4px 处 #EEEEEE、中段 #C3C3C3）。
+const (
+	dwmwaNCRenderingPolicy = 2
+	dwmNCRPEnabled         = 2
+)
+
+// EnableWindowFrameShadow 让 DWM 给这个窗口画阴影：先开非客户区绘制，再把
+// 边框往客户区里扩 1px。
+//
+// 两步缺一不可。这个窗口是 captionless + noRedirect 的：客户区铺满整个窗口、
+// 边框宽度为 0，DWM 眼里就没有"非客户区"可画 —— 实测空闲时窗口外侧整条带
+// 全是桌面底色，一点阴影都没有。扩 1px 相当于告诉它"这里有 1px 的边框"，
+// DWM 才会在窗口外面投阴影。扩出来的那 1px 由我们的合成内容盖住，看不见。
+func EnableWindowFrameShadow(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	on := uint32(dwmNCRPEnabled)
+	procDwmSetWindowAttr.Call(hwnd, dwmwaNCRenderingPolicy, uintptr(unsafe.Pointer(&on)), unsafe.Sizeof(on))
+	m := margins{Left: 1, Right: 1, Top: 1, Bottom: 1}
+	r, _, _ := procDwmExtendFrame.Call(hwnd, uintptr(unsafe.Pointer(&m)))
+	return r == 0
+}
+
+// margins 是 DwmExtendFrameIntoClientArea 的参数（顺序：左、右、上、下）。
+type margins struct {
+	Left, Right, Top, Bottom int32
+}
+
+// EnableViewFrame 让 DWM 画这个窗口的非客户区（也就是给它阴影）。
+//
+// 每次唤出都要调：mygo 在 Show/隐藏之间会动窗口样式，DWM 那边不一定留着。
+// 返回 false 说明系统不认（Win7 以前的系统没有这个属性）。
+func EnableViewFrame(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	v := uint32(dwmNCRPEnabled)
+	r, _, _ := procDwmSetWindowAttr.Call(hwnd, dwmwaNCRenderingPolicy, uintptr(unsafe.Pointer(&v)), unsafe.Sizeof(v))
+	return r == 0
+}
 
 const (
 	smXVirtualScreen  = 76
@@ -64,10 +116,7 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 }
 
 // ClearRegion 撤掉窗口区域，窗口恢复成整个矩形。
-//
-// 缩放过程中用它：SetWindowRgn 改的是 DWM 算阴影和重定向表面时用的形状，每帧
-// 改一次代价很实（实测把一帧的 SetWindowPos 从 3ms 拖到 7ms）。而形状本身由四角
-// 月牙铺的桌面色撑着，缩放时看不出差别，所以整段拖动期间撤掉、停手再设回去。
+// 目前没有调用方，留着是因为"临时量一个没有区域的形状"在排查时很方便。
 func ClearRegion(hwnd uintptr) bool {
 	if hwnd == 0 {
 		return false

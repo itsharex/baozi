@@ -4,6 +4,7 @@ import (
 	"image"
 	"log"
 	"math"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
@@ -40,6 +41,15 @@ const glassStep = 8
 // x=38 才起弯，中间就 17~18px 的弧）。26 DIP 那版是十年前的问题——弧太靠里，
 // 那条边线看着像画进了边框内部，其实是当时的整圆 bug（弧的判定没限定在角象限，
 // 面板内部又画了四分之三圈），那个已经修掉了，所以半径可以放回来。
+// UseCornerBitmaps 决定四角那圈"月牙"还要不要画。
+//
+// 现在是 **false**：四角的弧外那一块已经交给 internal/win/shadow.go 的分层窗口
+// 去补（它压在面板之上、不受 SetWindowRgn 裁剪，能把 DWM 填的白整个换掉，还顺带
+// 把边框弧画出来）。月牙留在面板里其实干不成这件事 —— 它被区域裁掉，弧外那部分
+// 根本画不出去；能被画出去的只有弧里侧那半截，3×3 柔化又把它摊成一条压在玻璃上
+// 的浅色弧线，正是用户反复说的"四角内部有一道白色圆弧线"。
+const UseCornerBitmaps = false
+
 const glassRadius = 24
 
 // glassClipRadius 是内容（面板底色、边线、四角月牙）的圆角半径（DIP）。
@@ -180,6 +190,9 @@ func (a *application) refreshCorners() {
 	if a.borderSet {
 		edge = a.borderColor
 	}
+	// 圆角那段边框弧现在由阴影层画（面板自己的像素被 SetWindowRgn 裁掉了），
+	// 颜色走这里传给它，和四条直边同一色。
+	a.cornerEdge = uint32(edge.R)<<16 | uint32(edge.G)<<8 | uint32(edge.B)
 	a.buildCornerBitmaps(
 		int(math.Round(float64(glassClipRadius)*s)),
 		int(math.Round(float64(glassRadius)*s)),
@@ -418,6 +431,16 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				if inCorner && math.Hypot(float64(region)-bx, float64(region)-by) > float64(region) {
 					al = 1
 				}
+				// 阴影压暗：月牙铺的是**抓图时**的桌面（那时外侧还没有阴影），而
+				// 阴影一出来，紧挨着月牙外侧立刻暗下去 —— 月牙于是成了面板边缘
+				// 内侧一道更亮的弧，看着正是"四角内部漏光/多了条白弧"。这里把
+				// 同一份 alpha 曲线乘进去，月牙和外面的阴影就接成一体。
+				if dark := win.CornerDarken(int(bx), int(by), region, a.shadowMargin()); dark > 0 {
+					f := 1 - dark
+					cr *= f
+					cg *= f
+					cb *= f
+				}
 				// 弧上那 1 DIP 的边线：颜色、宽度都和四条直边线一致，两段在弧的
 				// 端点接上，整圈框就是连续的（早期只画了四条直边、跳过圆角段，
 				// 所以四个角看着"没有边框"）。
@@ -618,6 +641,78 @@ func (a *application) applyRoundRegion() {
 	// 四角不需要靠子窗口区域来"挖空"：顶层区域已经把圆角切出来了，区域外的像素
 	// 系统根本不显示，内容画到客户区四角上也不会露出来。DWM 的阴影同理，按顶层
 	// 区域画，四角是圆的。
+}
+
+// refreshShadow 按面板当前的位置和尺寸重画自绘阴影层，并让它显出来。
+//
+// 为什么是自绘：Win10 上**窗口只要有 SetWindowRgn 的区域，DWM 就不投阴影** ——
+// 空闲时窗口外侧整条带全是桌面底色；只有拖动缩放那一瞬间（区域被撤掉）才冒出
+// 一圈 #C7C7C7→#FFFFFF 的影，停手把区域设回去立刻消失。DWMWA_NCRENDERING_POLICY
+// 和 DwmExtendFrameIntoClientArea 都返回成功，影依然没有。而圆角和抗锯齿只能靠
+// 区域（SetWindowRgn 是 1 位掩码），两者不能共存，所以自己画一层
+// （见 internal/win/shadow.go：一个 layered 窗口垫在面板底下，交一张带 alpha 的
+// 位图，阴影就跟着圆角走，跟面板形状锁死）。
+func (a *application) refreshShadow() {
+	if a.shadow == nil {
+		return
+	}
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	x, y, w, h := win.WindowRectPixels(hwnd)
+	if w <= 0 || h <= 0 {
+		return
+	}
+	s := a.glassScale()
+	r := int(math.Round(float64(glassRadius) * float64(s)))
+	t0 := time.Now()
+	ok := a.shadow.Place(hwnd, win.ShadowSpec{
+		X: x, Y: y, W: w, H: h,
+		Radius:  r,
+		Margin:  a.shadowMargin(),
+		Corners: a.cornerPatches,
+		Border:  a.cornerEdge,
+		BorderW: int(math.Round(float64(s))),
+	})
+	if d := time.Since(t0); d > 3*time.Millisecond {
+		log.Printf("阴影: 重建 %.2fms（位图 %.2f + 上传 %.2f）",
+			float64(d.Microseconds())/1000,
+			float64(a.shadow.BuildCost().Microseconds())/1000,
+			float64(a.shadow.ULWCost().Microseconds())/1000)
+	}
+	if !ok {
+		log.Print("阴影: 图层布局失败")
+	}
+	sx, sy, sw, sh := a.shadow.Bounds()
+	log.Printf("阴影: 面板 %dx%d @ %d,%d → 图层 %dx%d @ %d,%d", w, h, x, y, sw, sh, sx, sy)
+	a.shadow.Show()
+}
+
+// hideShadow 收起阴影层（面板藏起来、或者正在被拖动缩放时）。
+func (a *application) hideShadow() {
+	if a.shadow != nil {
+		a.shadow.Hide()
+	}
+}
+
+// followShadow 面板被拖动时只挪阴影，不重算位图 —— 位图尺寸没变，重算一次要
+// 遍历几十万像素，拖动中间每帧都算就跟不动了。
+func (a *application) followShadow() {
+	if a.shadow == nil || !a.shadow.Shown() {
+		return
+	}
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	x, y, _, _ := win.ClientRectPixels(hwnd)
+	// 拖动中尺寸不变，宽度按上次建好的位图来（由 Place 记着）。
+	a.shadow.Move(x, y, a.shadowMargin())
+}
+
+func (a *application) shadowMargin() int {
+	return int(math.Round(float64(win.ShadowMargin) * float64(a.glassScale())))
 }
 
 // clamp01 把值夹到 [0,1]。
