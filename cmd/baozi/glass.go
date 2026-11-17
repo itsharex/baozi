@@ -28,26 +28,24 @@ import (
 // 显示时放大回去照样是均匀的一片糊。
 const glassStep = 8
 
-// glassRadius 是窗口区域的圆角半径（DIP）。
+// glassRadius 是窗口区域的圆角半径（DIP），也是内容那条弧的半径。
 //
 // 这块窗口带 WS_EX_NOREDIRECTIONBITMAP，圆角以外的像素透不出桌面、DWM 填的是
-// 纯白（实测 #FFFFFF），所以"窗口形状"只能靠 SetWindowRgn 给。区域是 1 位掩码、
-// 没有抗锯齿，但它的硬边看不见：半径比内容圆角大 glassRadius-glassClipRadius，
-// 硬边正好落在四角月牙铺的纯桌面色里，两侧同色。
+// 纯白（实测 #FFFFFF），所以"窗口形状"只能靠 SetWindowRgn 给。
 // 区域同时决定 DWM 阴影的形状 —— 这也是阴影能跟着圆角走的唯一办法。
-const glassRadius = 26
+//
+// 16 DIP 是"不像胶囊、也不像直角"的量：26 DIP 时弧跨了三十多个物理像素，
+// 看着太圆、像把直角削掉一大块；再小到 12 以下又会显出生硬的直角感。
+const glassRadius = 16
 
 // glassClipRadius 是内容（面板底色、边线、四角月牙）的圆角半径（DIP）。
 //
-// 必须比 glassRadius 小一圈：月牙把"桌面色 → 边线 → 玻璃"这三层交界画在
-// glassClipRadius 这条弧上，而窗口区域按 glassRadius 切 —— 弧整个落在区域里面，
-// 区域外全归月牙的不透明部分。反过来（弧比区域大）会出现"弧内却在区域外"的
-// 一小片，那片是白的，就是右下角曾经漏的白点。
-//
-// 差值只留 2 DIP：月牙那块不透明区填的是**单色**（该角窗外读到的桌面色），太厚
-// 就会和真实桌面（有渐变、有细节）拉出一条弧形的色差带，看着像漏光。薄到 2 像素
-// 之后这点色差就看不出来了。
-const glassClipRadius = glassRadius - 2
+// 现在和 glassRadius **相等**：区域和弧同心同半径，弧的端点正好落在区域边界上，
+// 四条直边线的起点接上去不会有缝。早期让弧比区域小 2 DIP（区域外全由月牙的
+// 不透明部分垫着），那是因为当时月牙铺的是"每角一个采样色"，太厚的环会拉出
+// 一条弧形的色差带；现在弧外是逐像素照抄的真实桌面像素（captureCornerPatches），
+// 同色是天然的，不需要再让这一圈了 —— 让出去反而让直边线在角上断出一截。
+const glassClipRadius = glassRadius
 
 // snapshotScreen 抓一次全屏、做成磨砂图。
 // 必须在 Show 之前调用，否则抓到的是面板自己。
@@ -307,6 +305,33 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				}
 				if math.Hypot(float64(region)-bx, float64(region)-by) > float64(region) {
 					al = 1
+				}
+				// 弧上那 1 DIP 的边线：颜色、宽度都和四条直边线一致，两段在弧的
+				// 端点接上，整圈框就是连续的（早期只画了四条直边、跳过圆角段，
+				// 所以四个角看着"没有边框"）。
+				//
+				// 带子放在**弧内侧**：弧半径等于区域半径，带子若以弧线为中心，
+				// 外侧那半边会被窗口区域裁掉，只剩半个像素的线，接不上直边。
+				// 内侧 0..edgeW 正好和直边线的位置对齐（直边也画在内侧 1 DIP）。
+				//
+				// 带宽取 2×edgeW 再开方抬升，是因为弧是斜的：像素中心是离散的，
+				// 一条 1 DIP 宽的斜环扫过像素中心时覆盖率只有 0.3~0.6，线会淡到
+				// 看着"角上没有边框"。放宽 + 开方之后弧上是 0.8~1.0 的覆盖，
+				// 外沿还留着柔化，既不比直边淡，也不会显粗。
+				edgeW := float64(a.glassScale())
+				sdC := math.Hypot(float64(arc)-bx, float64(arc)-by) - float64(arc)
+				if t := -sdC; t > -edgeW && t < edgeW*1.5 {
+					if w := 1 - math.Abs(t-edgeW/2)/edgeW; w > 0 {
+						if w = math.Sqrt(w) * 1.25; w > 1 {
+							w = 1
+						}
+						cr = cr*(1-w) + float64(edge.R)*w
+						cg = cg*(1-w) + float64(edge.G)*w
+						cb = cb*(1-w) + float64(edge.B)*w
+						if w > al {
+							al = w
+						}
+					}
 				}
 				off := img.PixOffset(x, y)
 				img.Pix[off] = uint8(math.Round(cr))

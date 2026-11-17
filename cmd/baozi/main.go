@@ -597,13 +597,10 @@ func (a *application) view(c *ui.Context) {
 				ui.Column(c).Absolute().Left(0).Top(0).
 					Size(float32(pw), float32(ph)).
 					DragWindow().Children(body)
-				// 四条直边。起点必须落在**窗口区域里面**：区域是圆角矩形，
-				// 在 y=0 这一行它只从 x≈region 起才算数，起点若取弧半径（比区域
-				// 小一圈），那开头一小段正好被区域裁掉 —— 线在角上断一截、露出
-				// 底下的白/桌面，看着就是"弧的端点旁边有个缺口"。所以从区域半径
-				// 再往里让 1 DIP 起画；让出来的那一点由月牙的桌面色垫着，同色看不出来。
+				// 四条直边。起点取弧半径（= 窗口区域半径），正好接上圆角段那圈边线；
+				// 直边段和弧上的边线同色同宽，看起来是一整圈框。
 				const edgeDip float32 = 1
-				r0 := float32(glassRadius) + edgeDip
+				r0 := float32(glassRadius)
 				ui.Column(c).Absolute().Left(r0).Top(0).
 					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
 				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-edgeDip).
