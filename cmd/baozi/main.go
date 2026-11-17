@@ -971,13 +971,18 @@ func (a *application) footer(c *ui.Context) {
 		// 图标必须 Shrink(0)：底栏这一行里键帽占地方，空间不够时 flex 会把可压缩的
 		// 子元素一路压到 0 宽——图片就是那个最先被压没的东西（文字有 min-content 兜着，
 		// 图片没有），结果就是按钮只剩字、图标人间蒸发。
-		if btn := ui.Button(c, "").Shrink(0).Children(func() {
+		// 按钮圆角：面板四角是 16 DIP 的弧，按钮却一直是主题默认的 3~4px，
+		// 两者并排时按钮那个几乎成直角的小方角特别扎眼（截图里「互传」按钮
+		// 右下角 x=36、y=32 那个交叉点就是这样）。取 8 DIP，约为按钮高度的
+		// 三分之一，看得出圆、又不至于圆成胶囊。
+		const footerRadius float32 = 8
+		if btn := ui.Button(c, "").Shrink(0).Radius(footerRadius).Children(func() {
 			ui.Image(c, footerIcon(iconGear, t.Text, iconBitmapSize)).Size(16, 16).Shrink(0)
 			ui.Text(c, "设置").FontSize(12)
 		}); btn.Clicked() {
 			a.openSettings()
 		}
-		if btn := ui.Button(c, "").Shrink(0).Children(func() {
+		if btn := ui.Button(c, "").Shrink(0).Radius(footerRadius).Children(func() {
 			ui.Image(c, footerIcon(iconSwitch, t.Text, iconBitmapSize)).Size(16, 16).Shrink(0)
 			ui.Text(c, "互传").FontSize(12)
 		}); btn.Clicked() {
