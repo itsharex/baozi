@@ -23,7 +23,7 @@ func TestSettingsCommandsPageRenders(t *testing.T) {
 	})
 	s := &settingsWindow{app: a}
 	s.load()
-	s.tab = 1
+	s.navSel = secCommands
 	s.cmdSel = len(s.cmds) - 1
 	s.cmdSync = -1
 	tr := ui.NewTester(s.view, 900, 820)

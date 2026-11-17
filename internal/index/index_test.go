@@ -66,7 +66,7 @@ func TestSaveLoad(t *testing.T) {
 		{Parent: 0, Kind: KindDir, NameOff: 8, NameLen: 3},
 		{Parent: 2, Kind: KindFile, SizeKB: 2, NameOff: 11, NameLen: 5},
 	}, Names: []byte(`D:\a.txtsubb.txt`)}
-	if err := Save(path, tab, []string{`D:\`}); err != nil {
+	if _, err := Save(path, tab, []string{`D:\`}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	got, roots, err := Load(path)
@@ -102,7 +102,7 @@ func TestLoadKeepsNodeFields(t *testing.T) {
 	tab.Nodes[0] = Node{Parent: -1, NameOff: 0, NameLen: 3, SizeKB: 7, ModSec: 12345, Kind: KindDir}
 	tab.Nodes[1] = Node{Parent: 0, NameOff: 3, NameLen: 2, SizeKB: 0, ModSec: 0, Kind: KindFile}
 	tab.Nodes[2] = Node{Parent: 0, NameOff: 5, NameLen: 3, SizeKB: 65535, ModSec: -1, Kind: KindFile}
-	if err := Save(path, tab, nil); err != nil {
+	if _, err := Save(path, tab, nil); err != nil {
 		t.Fatal(err)
 	}
 	got, _, err := Load(path)
@@ -160,7 +160,7 @@ func TestPinyinSurvivesStore(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "index.bin")
-	if err := Save(path, tab, []string{root}); err != nil {
+	if _, err := Save(path, tab, []string{root}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 	got, _, err := Load(path)

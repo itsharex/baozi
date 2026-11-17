@@ -21,7 +21,7 @@ func TestRefreshIndexAppliesDelta(t *testing.T) {
 	root := m.Add(`C:\`, -1, index.KindDir, 0, 0, 5)
 	docs := m.Add("docs", root, index.KindDir, 0, 0, 100)
 	m.Add("a.txt", docs, index.KindFile, 0, 0, 101)
-	if err := index.Save(filepath.Join(dir, "index.bin"), tb, []string{`C:\`}); err != nil {
+	if _, err := index.Save(filepath.Join(dir, "index.bin"), tb, []string{`C:\`}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,7 +96,7 @@ func TestRefreshIndexFollowsBatches(t *testing.T) {
 	m := index.NewMutable(tb, index.NewFRNMap(8))
 	root := m.Add(`C:\`, -1, index.KindDir, 0, 0, 5)
 	m.Add("a.txt", root, index.KindFile, 0, 0, 101)
-	if err := index.Save(filepath.Join(dir, "index.bin"), tb, []string{`C:\`}); err != nil {
+	if _, err := index.Save(filepath.Join(dir, "index.bin"), tb, []string{`C:\`}); err != nil {
 		t.Fatal(err)
 	}
 	const base uint64 = 4242
@@ -159,7 +159,7 @@ func TestRefreshIndexSkipsStaleDelta(t *testing.T) {
 	tb := &index.Table{Names: make([]byte, 0, 128), Py: make(map[int32]uint64, 2)}
 	m := index.NewMutable(tb, index.NewFRNMap(4))
 	m.Add(`C:\`, -1, index.KindDir, 0, 0, 5)
-	if err := index.Save(filepath.Join(dir, "index.bin"), tb, []string{`C:\`}); err != nil {
+	if _, err := index.Save(filepath.Join(dir, "index.bin"), tb, []string{`C:\`}); err != nil {
 		t.Fatal(err)
 	}
 	// delta 属于另一代

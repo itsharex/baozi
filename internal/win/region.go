@@ -1,0 +1,158 @@
+package win
+
+// 这里管两件小事：窗口的圆角区域，和从一张全屏快照里裁一小块。
+
+import (
+	"image"
+)
+
+var (
+	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
+	procSetWindowRgn       = user32.NewProc("SetWindowRgn")
+	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
+)
+
+const (
+	smXVirtualScreen  = 76
+	smYVirtualScreen  = 77
+	smCXVirtualScreen = 78
+	smCYVirtualScreen = 79
+)
+
+// RoundRegion 把窗口裁成圆角，radius 是**物理像素**的半径。
+//
+// Windows 10 没有 Win11 那个给窗口圆角的 DWM 属性（DWMWA_WINDOW_CORNER_PREFERENCE
+// 会被直接忽略），只能自己给窗口设一个圆角区域。
+//
+// 这里的关键是**只拿它裁阴影**：窗口是 D3D 合成的（noRedirect），窗口区域裁不掉
+// 交换链里的内容（实测：内容照旧铺满四个角），但 DWM 画阴影时是按窗口区域来的 ——
+// 设了圆角区域之后，阴影的四个角跟着变圆，方角阴影压在圆角内容上的"看着还是直角"
+// 就没了。内容那一层的圆角由 ClipInset 负责，两边各管一件。
+// 尺寸用客户区：GetWindowRect 会多出 DWM 那圈 9px 扩展框，按它设区域会偏大。
+func RoundRegion(hwnd uintptr, radius int) bool {
+	if hwnd == 0 || radius <= 0 {
+		return false
+	}
+	// 区域必须覆盖**整个窗口**，包括那圈边框带。
+	//
+	// 面板是"隐藏标题栏"的窗口，四边各留了一圈缩放热区（1098×638 的窗口里，
+	// 右边和下边那圈是 9px，左边也是 9px，上边 0）。用户拖那圈就是在改面板大小。
+	// 区域若只铺客户区，右边 18px、下边 9px 落在区域外面 —— 区域外的鼠标事件
+	// 不属于这个窗口，热区等于被切掉，表现就是"从面板右侧、下侧拉不动大小，
+	// 上边和左边正常"（左边（上边）从 0 起，正好不缺）。
+	//
+	// 区域圆角在窗口外沿，而内容层的 ClipInset 圆角在客户区，两者圆心差 9px，
+	// 客户区四角会露出一小片月牙。那片月牙用的是 deskColor（从面板四周的桌面
+	// 取样，见 glass.go），所以看不出来。
+	_, _, w, h := WindowRectPixels(hwnd)
+	if w <= 0 || h <= 0 {
+		return false
+	}
+	// 区域取到 +1：右下角那条线要包进来，否则少一像素亮边。
+	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(w+1), uintptr(h+1), uintptr(radius*2), uintptr(radius*2))
+	if rgn == 0 {
+		return false
+	}
+	r, _, _ := procSetWindowRgn.Call(hwnd, rgn, 1)
+	if r == 0 {
+		// 设置失败时区域的归属还在我们手上，得自己释放。
+		procDeleteObject.Call(rgn)
+		return false
+	}
+	// 成功之后区域归系统管，不能删。
+	return true
+}
+
+// VirtualScreenRect 返回所有显示器拼起来的那个矩形（物理像素）。
+func VirtualScreenRect() (x, y, w, h int) {
+	gx, _, _ := procGetSystemMetrics.Call(smXVirtualScreen)
+	gy, _, _ := procGetSystemMetrics.Call(smYVirtualScreen)
+	gw, _, _ := procGetSystemMetrics.Call(smCXVirtualScreen)
+	gh, _, _ := procGetSystemMetrics.Call(smCYVirtualScreen)
+	return int(int32(gx)), int(int32(gy)), int(int32(gw)), int(int32(gh))
+}
+
+// Crop 从 src 里裁出 (x, y) 起的 w×h。
+//
+// 越界不报错，直接按边上的像素补：面板可能被拖到屏幕边缘甚至一半在屏幕外，
+// 那时候裁出来的那块本来就不完整，补边比抛错好 —— 画面总得铺满。
+func Crop(src *image.RGBA, x, y, w, h int) *image.RGBA {
+	return CropDown(src, x, y, w, h, 1)
+}
+
+// CropDown 是 Crop 的降采样版：源图上每隔 step 个像素取一个，输出 w×h。
+//
+// 面板拖动时每一帧都要重裁一次，全尺寸（1290×949）光拷贝就 500 万字节，
+// 加上模糊和色调根本跟不上鼠标。玻璃本来就是糊的，先降到 1/3 再糊，
+// 显示时再放大回去 —— 观感没差，每帧的开销却小了一个数量级。
+func CropDown(src *image.RGBA, x, y, w, h, step int) *image.RGBA {
+	if src == nil || w <= 0 || h <= 0 {
+		return nil
+	}
+	if step < 1 {
+		step = 1
+	}
+	srcW, srcH := src.Rect.Dx(), src.Rect.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for dy := 0; dy < h; dy++ {
+		sy := clampInt(y+dy*step, 0, srcH-1)
+		so := src.PixOffset(0, sy)
+		do := dst.PixOffset(0, dy)
+		for dx := 0; dx < w; dx++ {
+			sx := clampInt(x+dx*step, 0, srcW-1)
+			si := so + sx*4
+			di := do + dx*4
+			dst.Pix[di+0] = src.Pix[si+0]
+			dst.Pix[di+1] = src.Pix[si+1]
+			dst.Pix[di+2] = src.Pix[si+2]
+			dst.Pix[di+3] = 255
+		}
+	}
+	return dst
+}
+
+// RoundCorners 把图像四角切成圆角：圆外的像素变全透明。
+//
+// 面板窗口是 DirectComposition 合成的，给它设窗口区域（SetWindowRgn）只裁得掉
+// DWM 的阴影、裁不掉交换链里的内容 —— 所以圆角得自己画：把背景图四角挖空，
+// 透明的地方 DWM 合成时会露出桌面，看上去就是窗口真的圆了。
+func RoundCorners(img *image.RGBA, radius int) {
+	if img == nil || radius <= 0 {
+		return
+	}
+	w, h := img.Rect.Dx(), img.Rect.Dy()
+	if radius*2 > w {
+		radius = w / 2
+	}
+	if radius*2 > h {
+		radius = h / 2
+	}
+	r := float64(radius)
+	setAlpha := func(x, y int, a uint8) {
+		if x < 0 || y < 0 || x >= w || y >= h {
+			return
+		}
+		img.Pix[img.PixOffset(x, y)+3] = a
+	}
+	for y := 0; y < radius; y++ {
+		for x := 0; x < radius; x++ {
+			// 圆心在 (r, r)，比半径远的点就是圆外；边缘按距离做一点过渡，
+			// 免得放大之后是一圈硬阶梯。
+			dx := r - float64(x) - 0.5
+			dy := r - float64(y) - 0.5
+			d := dx*dx + dy*dy
+			if d <= (r-1)*(r-1) {
+				continue
+			}
+			var a uint8
+			if d < r*r {
+				f := (r*r - d) / (r*r - (r-1)*(r-1))
+				a = uint8(255 * f)
+			}
+			setAlpha(x, y, a)
+			setAlpha(w-1-x, y, a)
+			setAlpha(x, h-1-y, a)
+			setAlpha(w-1-x, h-1-y, a)
+		}
+	}
+}

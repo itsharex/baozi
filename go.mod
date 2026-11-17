@@ -37,3 +37,6 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
+
+// mygo 打了圆角补丁（内容子窗口也要无重定向位图）。
+replace github.com/egoist/mygo => ./.patched-mygo

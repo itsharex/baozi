@@ -140,3 +140,140 @@ func TestAppBeatsExecutable(t *testing.T) {
 		t.Fatalf("应用(%.3f) 应排在 exe(%.3f) 前面", app.Score, exe.Score)
 	}
 }
+
+// TestBandOrder 锁死段顺序：应用 < 命令 < 强匹配 < 中匹配 < 弱匹配。
+func TestBandOrder(t *testing.T) {
+	bApp := BandOf(0.40, KindApp, 0)
+	bCmd := BandOf(1.00, KindCommand, 0)
+	bStrong := BandOf(0.95, KindFile, 0)
+	bMedium := BandOf(0.78, KindFile, 0)
+	bWeak := BandOf(0.40, KindFile, 0)
+	if !(bApp < bCmd && bCmd < bStrong && bStrong < bMedium && bMedium < bWeak) {
+		t.Fatalf("段顺序不对：app=%d cmd=%d strong=%d medium=%d weak=%d", bApp, bCmd, bStrong, bMedium, bWeak)
+	}
+}
+
+// TestBandKeepsAppAboveHistoryFile 是这次改造的靶心。用户的原话：
+// "搜索结果会导致大量无用的文件排列在搜索结果前列，根本找不到自己真正需要的app。"
+// 这里是最狠的一档：一条名字全等、还天天在用的文件，也不能盖过一个只是弱命中的应用。
+func TestBandKeepsAppAboveHistoryFile(t *testing.T) {
+	w := Weights{Frequency: 0.5, Type: 0.3, Accuracy: 0.2}
+	order := []string{".exe", ".lnk"}
+
+	// 名字全等 + 打开过很多次：放在老口径下能拿满频次分。
+	file := Rank(w, order, Result{
+		Item:      Item{Name: "qq", Path: `D:\work\qq`, Ext: ".txt", Kind: KindFile},
+		Frequency: 1.0, Opens: 20, Accuracy: 1.0,
+	})
+	// 只看得出"名字里有 qq" 的应用。
+	app := Rank(w, order, Result{
+		Item:      Item{Name: "QQ音乐", Path: `C:\QQMusic\QQMusic.exe`, Ext: ".exe", Kind: KindApp},
+		Frequency: 0, Opens: 0, Accuracy: 0.66,
+	})
+
+	if app.Band != BandApp {
+		t.Fatalf("应用应固定在 BandApp，得到 %d", app.Band)
+	}
+	if file.Band == BandApp {
+		t.Fatal("文件不该进应用段")
+	}
+	if !Less(app, file) {
+		t.Fatalf("应用(Band %d, %.3f) 应排在文件(Band %d, %.3f) 前面",
+			app.Band, app.Score, file.Band, file.Score)
+	}
+}
+
+// TestMatchQualityBeatsType 是实测抓到的第二个毛病：
+// 搜 code 时前 8 条全是 C:\Program Files 里的 wsdcodegen.exe / frcode.exe，
+// 它们是"名字包含 code"（0.78），靠 .exe 的类型分 0.90 压过"前缀匹配"的项目文件。
+// 匹配质量必须在类型之前。
+func TestMatchQualityBeatsType(t *testing.T) {
+	w := Weights{Frequency: 0.5, Type: 0.3, Accuracy: 0.2}
+	order := []string{".exe", ".lnk"}
+
+	// 包含匹配的第三方工具程序：类型分高、准确度低。
+	junk := Rank(w, order, Result{
+		Item:     Item{Name: "wsdcodegen.exe", Path: `C:\Program Files (x86)\Windows Kits\10\bin\wsdcodegen.exe`, Ext: ".exe", Kind: KindFile},
+		Accuracy: 0.78,
+	})
+	// 前缀匹配的项目文件：类型分低、准确度高。
+	doc := Rank(w, order, Result{
+		Item:     Item{Name: "code-style.md", Path: `D:\work\docs\code-style.md`, Ext: ".md", Kind: KindFile},
+		Accuracy: 0.95,
+	})
+	if !Less(doc, junk) {
+		t.Fatalf("前缀匹配的项目文件(Band %d, %.3f) 应排在包含匹配的 exe(Band %d, %.3f) 前面",
+			doc.Band, doc.Score, junk.Band, junk.Score)
+	}
+}
+
+// TestEscalation：中匹配但常用 → 抬到强档；弱匹配不许借频次上抬。
+func TestEscalationRaisesFamiliarFile(t *testing.T) {
+	w := Weights{Frequency: 0.5, Type: 0.3, Accuracy: 0.2}
+	order := []string{".exe"}
+
+	familiar := Rank(w, order, Result{
+		Item:      Item{Name: "月度复盘.md", Path: `D:\doc\月度复盘.md`, Ext: ".md", Kind: KindFile},
+		Frequency: 0.9, Opens: 5, Accuracy: 0.78,
+	})
+	if familiar.Band != BandStrong {
+		t.Fatalf("常用中匹配应抬到 BandStrong，得到 %d", familiar.Band)
+	}
+	cold := Rank(w, order, Result{
+		Item:      Item{Name: "月度复盘.md", Path: `D:\doc\月度复盘.md`, Ext: ".md", Kind: KindFile},
+		Frequency: 0.4, Opens: 2, Accuracy: 0.78,
+	})
+	if cold.Band != BandMedium {
+		t.Fatalf("只开过 2 次不该抬档，得到 %d", cold.Band)
+	}
+	weak := Rank(w, order, Result{
+		Item:      Item{Name: "会议纪要.md", Path: `D:\doc\会议纪要.md`, Ext: ".md", Kind: KindFile},
+		Frequency: 1.0, Opens: 12, Accuracy: 0.40,
+	})
+	if weak.Band != BandWeak {
+		t.Fatalf("弱命中不该抬档，得到 %d", weak.Band)
+	}
+}
+
+// TestNoise：垃圾后缀与缓存目录降一档、段内降权；Program Files 不算噪声。
+func TestNoise(t *testing.T) {
+	w := Weights{Frequency: 0.5, Type: 0.3, Accuracy: 0.2}
+	order := []string{".log", ".exe"} // 故意把 .log 放进类型顺序
+
+	noisy := Rank(w, order, Result{
+		Item:      Item{Name: "app.log", Path: `D:\work\app.log`, Ext: ".log", Kind: KindFile},
+		Frequency: 1.0, Accuracy: 0.95,
+	})
+	if noisy.Band != BandMedium {
+		t.Fatalf(".log 应被降一档到 BandMedium，得到 %d", noisy.Band)
+	}
+	clean := Rank(w, order, Result{
+		Item:      Item{Name: "app.txt", Path: `D:\work\app.txt`, Ext: ".txt", Kind: KindFile},
+		Frequency: 1.0, Accuracy: 0.95,
+	})
+	if clean.Band != BandStrong {
+		t.Fatalf("同样参数的非噪声文件应在 BandStrong，得到 %d", clean.Band)
+	}
+	if !Less(clean, noisy) {
+		t.Fatalf("非噪声(%.3f) 应排在噪声(%.3f) 前面", clean.Score, noisy.Score)
+	}
+
+	for _, p := range []string{
+		`C:\Users\x\AppData\Local\Temp\a.txt`,
+		`D:\proj\node_modules\a.js`,
+		`C:\Users\x\.bun\install\cache\a.exe`,
+		`D:\work\vendor\pkg\a.go`,
+		`C:\Windows\System32\a.txt`,
+	} {
+		if !IsNoisy(".txt", p) {
+			t.Fatalf("%s 应判为噪声路径", p)
+		}
+	}
+	// Program Files 里是用户真正会用的程序，不许整片拉黑。
+	if IsNoisy(".exe", `C:\Program Files\Git\bin\git.exe`) {
+		t.Fatal("Program Files 不该判噪声")
+	}
+	if IsNoisy(".txt", `D:\work\readme.txt`) {
+		t.Fatal("普通工作目录不该判噪声")
+	}
+}

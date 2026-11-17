@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -501,6 +502,8 @@ func reopenIfNeeded(vols []*usn.Volume, roots []string) ([]*usn.Volume, error) {
 // 只把 index.bin 当唯一真相）。留下它是增量的前提：新条目直接 append 上去，
 // 搜到的就是最新状态，不必等下一次重扫。
 func rebuild(vols []*usn.Volume, cfg *config.Config, dataDir string, first bool) (*index.Mutable, uint64, error) {
+	// 构建期用默认 GC 目标：这 15 秒里分配量有 700MB 量级，压太低会一直 GC 反而变慢。
+	debug.SetGCPercent(100)
 	start := time.Now()
 	ic, _ := ruleFor(cfg, dataDir)
 	tab, frn, prog, err := usn.BuildAll(vols, ic, func(n int) {
@@ -513,7 +516,8 @@ func rebuild(vols []*usn.Volume, cfg *config.Config, dataDir string, first bool)
 		return nil, 0, err
 	}
 	tSave := time.Now()
-	if err := index.Save(filepath.Join(dataDir, "index.bin"), tab, cfg.Index.Roots); err != nil {
+	binPath, err := index.Save(filepath.Join(dataDir, "index.bin"), tab, cfg.Index.Roots)
+	if err != nil {
 		return nil, 0, fmt.Errorf("保存索引: %w", err)
 	}
 	if os.Getenv("BAOZI_IDXPROFILE") != "" {
@@ -530,9 +534,40 @@ func rebuild(vols []*usn.Volume, cfg *config.Config, dataDir string, first bool)
 		log.Printf("清空增量失败: %v", err)
 	}
 
-	// 构建期的 recs/排序/arena 临时候选有几百 MB，表本身是活的不会被回收。
+	// 落盘就绪后，把这张 176 万条的堆表换成刚写出的文件的 mmap 基座。
+	//
+	// 堆表是构建期的产物：Nodes 切片 + 名字 arena + 排序临时数组，实测私有提交
+	// 311MB，而且因为 Mutable 一直握着它，FreeOSMemory 也回收不掉——这是
+	// baozi-index 长期占 300MB 的唯一原因。服务每次启动都会重扫一遍全量，
+	// 留着它没有任何后续用途。
+	//
+	// 换成只读基座后语义不变：基座只读、增量全部走 overlay（appendOverlay /
+	// markDead），和主进程那边是同一套结构。FRN → 下标的映射在 BuildAll 里已经
+	// 建好，而落盘顺序就是内存下标顺序，所以直接复用，不必把 FRN 落盘。
+	//
+	// 顺带的好处：服务端和主进程映射的是同一个文件，Windows 下同一文件的映射区
+	// 共享物理页，常驻的那十几兆不会翻倍。
+	tSave = time.Now()
+	tab = nil
+	mapped, _, err := index.Load(binPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("回映射索引: %w", err)
+	}
+	// 稳态把 GC 目标压到 40%：活堆只有 33MB（其中 26MB 是 FRN 映射表），
+	// 默认 100% 会让 Go 一直留着 66MB 的空闲区不放——实测 HeapSys 759MB、
+	// 已归还 702MB，剩下的 57MB 就是"目标堆"留的余量。服务平时几乎不分配，
+	// 压低目标只多几次可忽略的 GC，却能把这 30 多 MB 直接减掉。
+	// 先设目标再 FreeOSMemory，归还量才按新目标算。
+	debug.SetGCPercent(40)
 	debug.FreeOSMemory()
-	return index.NewMutable(tab, frn), base, nil
+	if os.Getenv("BAOZI_IDXPROFILE") != "" {
+		log.Printf("建索引分段: 回映射 %v", time.Since(tSave).Round(time.Millisecond))
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	log.Printf("索引常驻: 活堆 %d MB / 向系统要了 %d MB / 已归还 %d MB",
+		ms.HeapAlloc/(1<<20), ms.HeapSys/(1<<20), ms.HeapReleased/(1<<20))
+	return index.NewMutable(mapped, frn), base, nil
 }
 
 // ---------------------------------------------------------------- 卷与状态文件

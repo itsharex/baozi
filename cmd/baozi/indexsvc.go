@@ -16,17 +16,18 @@ import (
 )
 
 // 索引服务（baozi-index.exe）以 SYSTEM 跑，只有它能打开卷句柄读 USN Journal。
-// 它每建完一轮索引就写 index.bin，并且每分钟写一次心跳。
-// 主进程这边只做三件事：看心跳决定"要不要自己扫"、盯 index.bin 变化、换了就重载。
+// 它每建完一轮索引就写一份快照（index.bin 或 index-<时间戳>.bin），并且每分钟写一次心跳。
+// 主进程这边只做三件事：看心跳决定"要不要自己扫"、盯目录里有没有更新的一份、换了就重载。
 
 const (
 	// 心跳多久算失效。服务每分钟写一次，3 分钟给了两轮容错（比如它在重建索引时卡住）。
 	serviceHeartbeatTTL = 3 * time.Minute
 	// 主进程后台追增量的间隔。服务那边 5 秒攒一批写盘。
-	// 这里给 30 秒而不是更短，是因为"叠增量"要先复制一份 75MB 的快照
-	// （copy-on-write，见 Table.Clone）——这台机器每两秒就有人动文件，
-	// 10 秒一轮会一直复制，内存峰值翻倍、GC 也跟着忙。
-	// 真正的及时性靠面板唤出时那一次 refresh（见 application.show），
+	//
+	// v4 之前这里是 30 秒，因为"叠增量"要先复制一份 75MB 的快照（copy-on-write，
+	// 见 Table.Clone）——这台机器每两秒就有人动文件，10 秒一轮会一直复制，内存峰值翻倍。
+	// 现在增量只复制几十 KB 的 overlay 尾巴，30 秒这个保守值可以留着当"别太费 CPU"，但
+	// 它已经不再是内存问题。真正的及时性靠面板唤出时那一次 refresh（见 application.show），
 	// 也就是"用户看得见的那一刻，索引一定是最新的"。
 	indexWatchInterval = 30 * time.Second
 )
@@ -46,13 +47,16 @@ func (a *application) serviceAlive() bool {
 
 // watchIndexFile 定时把索引追到服务的最新状态。
 //
-// 两层：index.bin 换代就整份重载（服务每次全量重建都换一代），
-// 没换代就把 index.delta 里新增的那些指令叠上去（copy-on-write，约 15ms）。
-// 没变化时连复制都不做，只是每次 stat 两个文件。
+// 两层：目录里出现新的一份快照就整份重载（服务每次全量重建都换一代），
+// 没换代就把 index.delta 里新增的那些指令叠进 overlay（几十 KB，微秒级）。
+// 没变化时连复制都不做，只是每次 stat 一遍目录
+// —— 要 stat 目录而不是单个文件，见 index.Latest 与 index.Save 的注释。
 func (a *application) watchIndexFile() {
 	go func() {
-		if info, err := os.Stat(a.indexFile()); err == nil {
-			a.idxMtime = info.ModTime()
+		if p, mt, err := index.Latest(a.dataDir); err == nil {
+			a.idxMu.Lock()
+			a.idxPath, a.idxMtime = p, mt
+			a.idxMu.Unlock()
 		}
 		ticker := time.NewTicker(indexWatchInterval)
 		defer ticker.Stop()
@@ -75,9 +79,13 @@ func (a *application) refreshIndex(quiet bool) {
 	a.idxMu.Lock()
 	defer a.idxMu.Unlock()
 
-	// 1) 快照换代：整份重载（19MB，约 90ms）
-	if info, err := os.Stat(a.indexFile()); err == nil && !info.ModTime().Equal(a.idxMtime) {
-		tab, _, err := index.Load(a.indexFile())
+	// 1) 快照换代：整份重载
+	//
+	// 换代检测从 v4 起改成"看目录里有没有更新的一份"，而不是看 index.bin 的 mtime：
+	// 主进程 mmap 着上一代，Windows 不允许服务端替换那个文件，服务端就会写到
+	// index-<时间戳>.bin 里。两边约定：谁新加载谁。
+	if p, mt, err := index.Latest(a.dataDir); err == nil && p != a.indexFile() {
+		tab, _, err := index.Load(p)
 		if err != nil {
 			log.Printf("重载索引: %v", err)
 			return
@@ -85,16 +93,18 @@ func (a *application) refreshIndex(quiet bool) {
 		if tab.Len() == 0 {
 			return
 		}
-		a.idxMtime = info.ModTime()
+		a.idxPath = p
+		a.idxMtime = mt
 		a.idxBase = readStateBase(a.dataDir)
 		a.idxSeq = 0
 		a.idxOps = 0
 		a.idxReplace(tab)
+		index.Prune(a.dataDir, p)
 		if !quiet {
 			a.setStatus(fmt.Sprintf("%d 项 · 索引服务已更新", tab.Len()))
-			log.Printf("索引: 服务已更新快照，重载 %d 项", tab.Len())
+			log.Printf("索引: 服务已更新快照，重载 %d 项（%s）", tab.Len(), filepath.Base(p))
 		}
-		// 重载会临时堆出解压缓冲，还回去
+		// 换下来的旧映射由它自己的 finalizer 解开，这里顺手把空闲页还给系统
 		releaseMemory()
 	}
 
@@ -136,6 +146,9 @@ func (a *application) refreshIndex(quiet bool) {
 	a.idxReplace(next)
 	a.idxOps = len(d.Ops)
 	a.idxSeq = d.Seq
+	// 这次的 Clone 换下来了一整张旧表（几十 MB），不主动还页的话，
+	// 任务管理器会一直挂着那个峰值，直到下次碰巧触发重载。
+	releaseMemory()
 	if !quiet {
 		a.setStatus(fmt.Sprintf("%d 项 · 已同步 %d 条变化", next.Len(), len(ops)))
 		log.Printf("索引: 已同步 %d 条变化，%d 项（累计 %d 条 / %d 批）", len(ops), next.Len(), a.idxOps, d.Seq)

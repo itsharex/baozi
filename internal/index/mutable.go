@@ -208,36 +208,21 @@ func NewMutable(t *Table, frn *FRNMap) *Mutable {
 	if frn == nil {
 		frn = NewFRNMap(t.Len())
 	}
-	return &Mutable{t: t, frn: frn, names0: len(t.Names)}
+	return &Mutable{t: t, frn: frn, names0: 0}
 }
 
 // Table 返回当前（可继续被修改的）表。
 func (m *Mutable) Table() *Table { return m.t }
 
 // Dead 返回墓碑条数。
-func (m *Mutable) Dead() int { return m.dead }
+func (m *Mutable) Dead() int { return len(m.t.dead) }
 
 // NamesOverhead 返回名字 arena 里追加出来的字节数（相对上次全量）。
-func (m *Mutable) NamesOverhead() int { return len(m.t.Names) - m.names0 }
+func (m *Mutable) NamesOverhead() int { return len(m.t.ovNames) - m.names0 }
 
 // Add 追加一个条目并登记 FRN，返回下标。
 func (m *Mutable) Add(name string, parent int32, kind Kind, sizeKB, modSec int32, frn uint64) int32 {
-	off := uint32(len(m.t.Names))
-	m.t.Names = append(m.t.Names, name...)
-	idx := int32(len(m.t.Nodes))
-	m.t.Nodes = append(m.t.Nodes, Node{
-		Parent:  parent,
-		NameOff: off,
-		NameLen: uint16(len(name)),
-		SizeKB:  sizeKB,
-		ModSec:  modSec,
-		Kind:    kind,
-	})
-	if py := pinyin.Initials(name); py != "" {
-		pyOff := uint32(len(m.t.Names))
-		m.t.Names = append(m.t.Names, py...)
-		m.t.Py[idx] = PackPy(pyOff, uint16(len(py)))
-	}
+	idx := m.t.appendOverlay(name, parent, kind, sizeKB, modSec, pinyin.Initials(name))
 	if m.frn != nil {
 		m.frn.Set(frn, idx)
 	}
@@ -246,13 +231,13 @@ func (m *Mutable) Add(name string, parent int32, kind Kind, sizeKB, modSec int32
 
 // Kill 把条目标成墓碑。
 func (m *Mutable) Kill(idx int32) {
-	if idx < 0 || int(idx) >= len(m.t.Nodes) {
+	if idx < 0 || int(idx) >= m.t.Len() {
 		return
 	}
-	if m.t.Nodes[idx].Kind == KindDeleted {
+	if m.t.KindOf(idx) == KindDeleted {
 		return
 	}
-	m.t.Nodes[idx].Kind = KindDeleted
+	m.t.markDead(idx)
 	m.dead++
 }
 
@@ -275,7 +260,7 @@ func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
 		if !ok {
 			return DeltaOp{}, false
 		}
-		if m.t.Nodes[idx].Kind == KindDeleted {
+		if m.t.KindOf(idx) == KindDeleted {
 			return DeltaOp{}, false
 		}
 		m.Kill(idx)
@@ -292,7 +277,7 @@ func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
 	if !ok {
 		return DeltaOp{}, false
 	}
-	if m.t.Nodes[parent].Kind == KindDeleted {
+	if m.t.KindOf(parent) == KindDeleted {
 		return DeltaOp{}, false
 	}
 
@@ -318,9 +303,9 @@ func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
 	// 同一个 FRN 已经有活条目：要么是重复记录（同名同父，忽略），
 	// 要么是改名（旧名字必须失效，否则两个名字都能搜到）。
 	var kill int32
-	if old, ok := m.frn.Get(c.FRN); ok && int(old) < len(m.t.Nodes) {
-		if m.t.Nodes[old].Kind != KindDeleted {
-			if m.t.Nodes[old].Parent == parent && string(m.t.NameBytes(int(old))) == c.Name {
+	if old, ok := m.frn.Get(c.FRN); ok && int(old) < m.t.Len() {
+		if m.t.KindOf(old) != KindDeleted {
+			if n := m.t.At(old); n != nil && n.Parent == parent && string(m.t.NameBytes(int(old))) == c.Name {
 				return DeltaOp{}, false
 			}
 			m.Kill(old)
@@ -364,5 +349,5 @@ func (m *Mutable) Compact(deadLimit, namesLimit int) bool {
 	if namesLimit <= 0 {
 		namesLimit = 8 << 20
 	}
-	return m.dead >= deadLimit || m.NamesOverhead() >= namesLimit
+	return len(m.t.dead) >= deadLimit || m.NamesOverhead() >= namesLimit
 }

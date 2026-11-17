@@ -68,10 +68,6 @@ const (
 
 	// maxPinned 是首页「已固定」区最多显示几个。
 	maxPinned = 12
-
-	// maxAppRun：结果里应用最多连续出现几条，之后就插一条别的类型。
-	// 应用仍然排在最前（类型分 1.00），但不允许把整张榜占满。
-	maxAppRun = 3
 )
 
 var searchIcon = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>`))
@@ -107,10 +103,12 @@ type application struct {
 	apps atomic.Pointer[[]appEntry]
 
 	// 增量同步状态（只由 refreshIndex 读写，用 idxMu 串行化）。
-	// idxMtime 是已载入的那份 index.bin 的修改时间；idxBase 是它的代次标识；
+	// idxPath 是已载入的那份快照文件的完整路径（可能是 index.bin，也可能是
+	// index-<时间戳>.bin 这种"新一代"，见 index.Save）；idxBase 是它的代次标识；
 	// idxSeq 是已经叠到服务写出的第几批；idxOps 是这一代里已经叠了多少条指令
 	// —— 服务每次都整份重写 delta 的 ops，所以进度必须按"条"记，不能按"批"。
 	idxMu    sync.Mutex
+	idxPath  string
 	idxMtime time.Time
 	idxBase  uint64
 	idxSeq   uint64
@@ -125,6 +123,51 @@ type application struct {
 	list        ui.ListState
 	input       ui.Handle
 	icons       map[string]*ui.Bitmap
+	// frost 是整屏的磨砂图：唤出前抓一次全屏、模糊、压白做出来的（见 glass.go）。
+	// 面板里铺的就是这一张，尺寸等于整个虚拟屏，位置给负值 —— 窗口等于在图上取景，
+	// 拖到哪就露出哪块桌面，所以不用每帧重新裁图、重新传纹理。
+	frost  *ui.Bitmap
+	frostW float32
+	frostH float32
+	// glassOffX/Y 是窗口在整屏磨砂图上的取景偏移（DIP，负数），
+	// 面板一移动就重算，通常由 glassOffset() 给出。
+	glassOffX float32
+	glassOffY float32
+	// frostPixW/H 是磨砂图的像素尺寸，用来判断能不能复用同一张纹理。
+	frostPixW int
+	frostPixH int
+	// screenW/H/X/Y 是整屏快照的尺寸与屏幕原点（物理像素），算取景偏移时要用。
+	screenW int
+	screenH int
+	screenX int
+	screenY int
+	// deskColor 是面板外面那块桌面的颜色。圆角裁掉的四个角由它兜底 ——
+	// 窗口是 noRedirect（DirectComposition）合成的，透明的地方透不出桌面，
+	// 只会露出一块白（#FFFFFF），跟桌面的 #FCFCFC 差一点点，看上去就是"四个白角"。
+	deskColor ui.Color
+	deskSet   bool
+	// deskCorners 是窗口**四角各自**的桌面颜色（左上、右上、左下、右下）。
+	//
+	// Win10 的窗口区域是 1 位掩码，`CreateRoundRectRgn` 天生没有抗锯齿：四角那条
+	// 弧永远是阶梯。既然边缘本身柔不了，就让**边界两侧的颜色尽量一样** —— 月牙
+	// 里铺该角附近真实的桌面像素色，台阶就落在同一个颜色里，看不见。
+	// 用一个平均色垫四个角不够：壁纸色调一不均，角上就显出一块和旁边不同的色，
+	// 那条阶梯立刻露出来。
+	deskCorners    [4]ui.Color
+	deskCornersSet bool
+	// cornerBitmaps 是四角那四张"月牙"位图，cornerPx 是它们的边长（物理像素）。
+	// 弧外铺 deskCorners 的桌面色，弧上按覆盖率渐隐到透明 —— 圆角那条内边界
+	// 的抗锯齿就是它们给的。变了桌面色或换了面板尺寸就重建（见 buildCornerBitmaps）。
+	cornerBitmaps [4]*ui.Bitmap
+	cornerPx      int
+	// cornerSize 是上面四张图当前**实际的像素边长**。它和 cornerPx（沿用的大
+	// 尺寸）分开记：尺寸没变时只能 Update 像素、不能换新 Bitmap —— ui.Image
+	// 渲染一次就把纹理缓存住了，换对象屏上不会变。
+	cornerSize int
+	// borderColor 是最后一帧用的面板边线色，四角月牙要把这条边一起画进去
+	// （mygo 画边框的圆角段没有抗锯齿，那正是四角台阶的第二个来源）。
+	borderColor ui.Color
+	borderSet   bool
 	// thumbAsk 记录"已经去要过缩略图的键"（失败的也算），避免每帧重复下单。
 	// thumbSem 限制同时在取的缩略图个数：Shell 那边是 COM 走 explorer 的缩略图
 	// 提供者，一次放几十个进去只会互相拖慢，4 个足够铺满一屏。
@@ -273,6 +316,8 @@ func (a *application) applyPending() {
 	r := a.results[idx]
 	key := resultKey(r)
 	switch op {
+	case "folder":
+		a.openFolderAt(idx)
 	case "delete":
 		if a.hist.Remove(key) {
 			a.status = "已从历史删除：" + r.Name
@@ -402,11 +447,27 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 }
 
 func (a *application) view(c *ui.Context) {
+	// 玻璃上原来那套浅色字读不出来，所以玻璃模式下整块面板走浅色主题：
+	// 深色字 + 浅底。
+	if a.frost != nil {
+		lt := ui.LightTheme()
+		// 圆角裁掉的那四个角要露出桌面，不能露出一块白：清屏色就是
+		// Theme.Background，所以这里必须给一个真透明（alpha=0）的背景。
+		lt.Background = ui.Transparent
+		c.SetTheme(lt)
+	}
 	t := c.Theme()
 	// 面板统一用一套字体，见 panelFont。
 	usePanelFont(t)
 	root := c.Root()
-	if c.Vibrancy() {
+	if a.frost != nil {
+		// 圆角裁掉的四角露的是窗口自己的底：这块窗口是 DirectComposition 合成的
+		// noRedirect 窗口，透明的地方透不出桌面（实测是 #FFFFFF 纯白，桌面是 #FCFCFC），
+		// 于是四角成了四块白斑 —— 这正是"圆角还是方的"的来源。
+		// 既然透不出去，就别留透明：根上铺一层**桌面本来的颜色**（从快照里取的），
+		// 裁掉的角上看到的就是桌面，与真的透出去肉眼无异。
+		root.Background(ui.Transparent)
+	} else if c.Vibrancy() {
 		root.Background(ui.Transparent)
 	} else {
 		root.Background(t.Background)
@@ -457,7 +518,7 @@ func (a *application) view(c *ui.Context) {
 	// 子元素（输入框、卡片、按钮）命中优先，所以打字和点击不受影响；
 	// 拖到哪、松手后位置记进配置（见 panelGeometryChanged），下次唤出照旧复现。
 	// 面板本来就没有标题栏（TitleBarHidden），没有这条就完全拿不动它。
-	ui.Column(c).Fill().DragWindow().Children(func() {
+	body := func() {
 		// 顶栏：放大镜 + 大字输入 + 正则开关 + 右端品牌胶囊（Pane 右上角那个 "Pane" 标）。
 		ui.Row(c).Padding(16, 20).Gap(14).AlignItems(ui.Center).Children(func() {
 			ui.Icon(c, searchIcon).FontSize(20).TextColor(t.TextMuted)
@@ -483,7 +544,105 @@ func (a *application) view(c *ui.Context) {
 		}
 		ui.Divider(c)
 		a.footer(c)
-	})
+	}
+
+	// 玻璃底：窗口自己是 noRedirect（DirectComposition）合成的，Win10 的系统磨砂
+	// 铺不到它后面，所以背景是一张"抓下来再糊过"的整屏图。
+	// 铺法：图按整个虚拟屏的尺寸铺，位置给负的客户区偏移 —— 窗口在图上"取景"。
+	// 面板拖到哪，窗口里露出的就是快照里对应的那块桌面；拖动只改这两个偏移，
+	// 不重裁、不重模糊、不换纹理，所以跟手。
+	// 内容放进 Overlay 才能压在它上面（Absolute 的元素总是画在兄弟之上）。
+	if a.frost != nil {
+		ox, oy := a.glassOffset()
+		// 圆角必须挂在**真正画东西的那一层**上：挂在 c.Root() 上时（root 是框架给的
+		// 窗口根、自身没有内容）实测裁不掉下面这两层，四角照旧是磨砂底色。
+		// 最底一层**不裁圆角**：裁掉的那四个角露出来的就是它 —— 面板外面那块桌面的
+		// 颜色。为什么不干脆留透明：这块窗口是 noRedirect（DirectComposition）合成的，
+		// 没被内容覆盖的地方由 DWM 填白（把根背景设成纯红，四角实测依旧是 #FFFFFF），
+		// 透明在这里换不来桌面，只能把桌面色画上去。
+		// 这一层 Fill 铺满整个窗口，而且**挂着 DragWindow**：内容是铺在 Overlay 里的
+		// 另一层上，万一那层没盖住窗口的右边或下边（实测底栏那一截就跑到它外面了），
+		// 从那块空白按下去时命中的是这条链——它有 DragWindow，面板照样能拖着走。
+		// 没有这条兜底，"从下边拖不动面板"就会跟着内容层的尺寸走，改一次尺寸复发一次。
+		ui.Column(c).Fill().Background(a.deskColor).DragWindow().Children(func() {
+			// 磨砂图铺满整个客户区，不裁圆角：圆角是四角的月牙（下面那几个
+			// ui.Image）和窗口区域一起做出来的，不是把这一层裁出来的。
+			ui.Image(c, a.frost).Absolute().Left(ox).Top(oy).
+				Size(a.frostW, a.frostH)
+			ui.Overlay(c, func() {
+				// 显式给面板的宽高，别指望 Left/Top/Right/Bottom 把四边撑开：
+				// Absolute 元素的高度实测是**按内容算**的（Right/Bottom 不起作用），
+				// 底栏那一截就跑到了这层外面 —— 拖动的命中链落到底下那层面板底色上，
+				// 而它没有 DragWindow，于是"从下边按下去拖不动面板"。
+				// 宽度同理：内容不够宽时右边也是同样一条死区。
+				pw, ph := a.panelSize()
+				// 记住边线色：四角的月牙会把圆弧那一段边一起画（带超采样），见 glass.go。
+				a.borderColor, a.borderSet = t.Border, true
+				// 整圈边分两段画：直边用四条细线（下面），圆角段由四角的月牙画。
+				//
+				// 这里既不能用 Radius、也不能用 BorderWidth：
+				//  · BorderWidth 的圆角段没有抗锯齿，只沿 24 DIP 这条弧画出整像素
+				//    台阶 —— 角上那道白色细刺就是它从月牙的缝里漏出来的；
+				//  · Radius 是靠 GPU 的 clip 裁圆角，而**它把被裁掉的像素填成纯白**
+				//    而不是透明（实测：上边缘从 x=0 起连续 5 行 #FFFFFF）。窗口区域
+				//    已经把角切掉了，这块白正好落在弧内的三角里，于是四角始终有一
+				//    小片白 —— 用户反复说的"漏光"就是它。
+				// 形状现在完全交给月牙（弧）和窗口区域（1 位掩码，藏在月牙底下）。
+				ui.Column(c).Absolute().Left(0).Top(0).
+					Size(float32(pw), float32(ph)).
+					DragWindow().Children(body)
+				// 四条直边：从弧的端点开始画（跳过圆角段），端点正好和月牙的弧接上。
+				const edgeDip float32 = 1
+				r0 := float32(glassClipRadius)
+				ui.Column(c).Absolute().Left(r0).Top(0).
+					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
+				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-edgeDip).
+					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
+				ui.Column(c).Absolute().Left(0).Top(r0).
+					Size(edgeDip, float32(ph)-2*r0).Background(t.Border)
+				ui.Column(c).Absolute().Left(float32(pw)-edgeDip).Top(r0).
+					Size(edgeDip, float32(ph)-2*r0).Background(t.Border)
+			})
+			// 四角的月牙最后画，压住磨砂图、底色和边线：弧外是该角真实的桌面色，
+			// 弧上按覆盖率渐隐，弧内透明露出玻璃 —— 见 glass.go 的
+			// buildCornerBitmaps，那里写了为什么 Win10 只能这么画。
+			//
+			// 位置必须落在**整数物理像素**上。用面板的 DIP 宽高去算偏移是不行的：
+			// 805 DIP × 1.25 = 1006.25，右上、右下两张图就落在半像素的位置，GPU
+			// 采样渗到透明边缘，角上漏出一两个白点（左上、左下从 0 起步，所以没事，
+			// 这就是四个角只有斜对的两个露白的原因）。这里按窗口客户区的真实像素
+			// 宽高算偏移，乘回缩放之后正好是整数。
+			if a.cornerPx > 0 {
+				s := a.glassScale()
+				pw, ph := a.panelSize()
+				cw, ch := int(math.Round(float64(pw)*float64(s))), int(math.Round(float64(ph)*float64(s)))
+				if hwnd := a.panel.NativeHandle(); hwnd != 0 {
+					if _, _, w, h := win.WindowRectPixels(hwnd); w > 0 && h > 0 {
+						cw, ch = w, h
+					}
+				}
+				dip := float32(a.cornerPx) / s
+				leftFar := float32(cw-a.cornerPx) / s
+				topFar := float32(ch-a.cornerPx) / s
+				for i := 0; i < 4; i++ {
+					img := a.cornerBitmaps[i]
+					if img == nil {
+						continue
+					}
+					x, y := float32(0), float32(0)
+					if i == 1 || i == 3 {
+						x = leftFar
+					}
+					if i == 2 || i == 3 {
+						y = topFar
+					}
+					ui.Image(c, img).Absolute().Left(x).Top(y).Size(dip, dip)
+				}
+			}
+		})
+		return
+	}
+	ui.Column(c).Fill().DragWindow().Children(body)
 }
 
 // regexButton 是搜索框右边那个 ".*" 切换按钮：点一下进正则模式，再点回普通搜索。
@@ -712,7 +871,7 @@ func hoverTarget(prev ui.Point, known bool, abs ui.Point, chosen, i int) (int, u
 	return i, abs, true
 }
 
-// itemMenu 是首页卡片和结果行共用的右键菜单：固定 / 取消固定、从历史删除。
+// itemMenu 是首页卡片和结果行共用的右键菜单：固定 / 取消固定、打开所在文件夹、从历史删除。
 func (a *application) itemMenu(m *ui.Menu, i int) {
 	if i < 0 || i >= len(a.results) {
 		return
@@ -728,10 +887,23 @@ func (a *application) itemMenu(m *ui.Menu, i int) {
 			a.pendingOp, a.pendingIdx = "pin", i
 		}
 	}
+	// 命令类结果、shell: 这类没有真实路径，灰掉而不是点了才说"没有文件夹"。
+	// 和 Ctrl+Enter 是同一个动作，菜单里把快捷键也标出来，省得记两套。
+	folder := m.Item("打开所在文件夹").Shortcut(ui.Ctrl, ui.KeyEnter)
+	if !hasContainingFolder(r) {
+		folder.Disabled(true)
+	} else if folder.Chosen() {
+		a.pendingOp, a.pendingIdx = "folder", i
+	}
 	m.Separator()
 	if m.Item("从历史删除").Danger().Chosen() {
 		a.pendingOp, a.pendingIdx = "delete", i
 	}
+}
+
+// hasContainingFolder 说这一条结果有没有真实的所在文件夹。
+func hasContainingFolder(r search.Result) bool {
+	return r.Kind != search.KindCommand && r.Path != "" && !strings.HasPrefix(r.Path, "shell:")
 }
 
 // resultList 是有查询时的结果列表：单列，行式。
@@ -1252,7 +1424,7 @@ func (a *application) searchAll(q string) []search.Result {
 		}
 		dir := a.lastFollowDir()
 		args := expandArgs(cmd.Args, words, dir)
-		results = append(results, search.Result{
+		results = append(results, search.Rank(weights, a.cfg.Search.TypeOrder, search.Result{
 			Item: search.Item{
 				Name:     cmd.Name,
 				Path:     cmd.Exec,
@@ -1263,10 +1435,11 @@ func (a *application) searchAll(q string) []search.Result {
 				Dir:      expandTemplate(cmd.Dir, words, dir),
 				KeepOpen: cmd.KeepOpen,
 			},
-			TypeScore: 1,
+			// 命令不是文件，没有"打开历史"，给一个固定的存在感；
+			// 命令之间本来就在同一段里，这项只影响命令内部的先后。
+			Frequency: 0.5,
 			Accuracy:  1,
-			Score:     search.Combine(weights, 0.5, 1, 1),
-		})
+		}))
 	}
 
 	// 2) 已安装应用：名字（含拼音）一路，产品名一路，取分高的那个。
@@ -1282,9 +1455,8 @@ func (a *application) searchAll(q string) []search.Result {
 			if !ok {
 				continue
 			}
-			freq := a.hist.Score(app.Path)
-			ts := search.TypeScore(".exe", search.KindApp, a.cfg.Search.TypeOrder)
-			results = append(results, search.Result{
+			freq, opens := a.hist.ScoreCount(app.Path)
+			results = append(results, search.Rank(weights, a.cfg.Search.TypeOrder, search.Result{
 				Item: search.Item{
 					Name:     app.Name,
 					Path:     app.Path,
@@ -1294,10 +1466,9 @@ func (a *application) searchAll(q string) []search.Result {
 					AppIndex: i,
 				},
 				Frequency: freq,
-				TypeScore: ts,
+				Opens:     opens,
 				Accuracy:  acc,
-				Score:     search.Combine(weights, freq, ts, acc),
-			})
+			}))
 		}
 	}
 
@@ -1332,22 +1503,20 @@ func (a *application) searchAll(q string) []search.Result {
 		if path == "" {
 			path = tab.PathOf(int32(i))
 		}
-		freq := a.hist.Score(path)
+		freq, opens := a.hist.ScoreCount(path)
 		ext := tab.Ext(i)
-		ts := search.TypeScore(ext, toSearchKind(tab.Nodes[i].Kind), a.cfg.Search.TypeOrder)
-		results = append(results, search.Result{
+		results = append(results, search.Rank(weights, a.cfg.Search.TypeOrder, search.Result{
 			Item: search.Item{
 				Name: name,
 				Path: path,
 				Ext:  ext,
-				Kind: toSearchKind(tab.Nodes[i].Kind),
+				Kind: toSearchKind(tab.KindOf(int32(i))),
 				Hint: tab.Dir(int32(i)),
 			},
 			Frequency: freq,
-			TypeScore: ts,
+			Opens:     opens,
 			Accuracy:  acc,
-			Score:     search.Combine(weights, freq, ts, acc),
-		})
+		}))
 		matched++
 		if matched >= 5000 { // 上限保护：极端宽泛查询不至于卡死
 			break
@@ -1387,7 +1556,7 @@ func (a *application) searchRegex(q string) []search.Result {
 			continue
 		}
 		dir := a.lastFollowDir()
-		results = append(results, search.Result{
+		results = append(results, search.Rank(weights, a.cfg.Search.TypeOrder, search.Result{
 			Item: search.Item{
 				Name:     cmd.Name,
 				Path:     cmd.Exec,
@@ -1398,10 +1567,9 @@ func (a *application) searchRegex(q string) []search.Result {
 				Dir:      expandTemplate(cmd.Dir, nil, dir),
 				KeepOpen: cmd.KeepOpen,
 			},
-			TypeScore: 1,
+			Frequency: 0.5,
 			Accuracy:  acc,
-			Score:     search.Combine(weights, 0.5, 1, acc),
-		})
+		}))
 	}
 
 	// 2) 已安装应用：只认名字。拼音首字母 / 全拼在这条路上一次都不查。
@@ -1411,9 +1579,8 @@ func (a *application) searchRegex(q string) []search.Result {
 			if !rx.Maybe(name) || !rx.Match(name) {
 				continue
 			}
-			freq := a.hist.Score(app.Path)
-			ts := search.TypeScore(".exe", search.KindApp, a.cfg.Search.TypeOrder)
-			results = append(results, search.Result{
+			freq, opens := a.hist.ScoreCount(app.Path)
+			results = append(results, search.Rank(weights, a.cfg.Search.TypeOrder, search.Result{
 				Item: search.Item{
 					Name:     app.Name,
 					Path:     app.Path,
@@ -1423,10 +1590,9 @@ func (a *application) searchRegex(q string) []search.Result {
 					AppIndex: i,
 				},
 				Frequency: freq,
-				TypeScore: ts,
+				Opens:     opens,
 				Accuracy:  acc,
-				Score:     search.Combine(weights, freq, ts, acc),
-			})
+			}))
 		}
 	}
 
@@ -1453,21 +1619,19 @@ func (a *application) searchRegex(q string) []search.Result {
 		}
 		path := tab.PathOf(int32(i))
 		ext := tab.Ext(i)
-		freq := a.hist.Score(path)
-		ts := search.TypeScore(ext, toSearchKind(tab.Nodes[i].Kind), a.cfg.Search.TypeOrder)
-		results = append(results, search.Result{
+		freq, opens := a.hist.ScoreCount(path)
+		results = append(results, search.Rank(weights, a.cfg.Search.TypeOrder, search.Result{
 			Item: search.Item{
 				Name: tab.Name(i),
 				Path: path,
 				Ext:  ext,
-				Kind: toSearchKind(tab.Nodes[i].Kind),
+				Kind: toSearchKind(tab.KindOf(int32(i))),
 				Hint: tab.Dir(int32(i)),
 			},
 			Frequency: freq,
-			TypeScore: ts,
+			Opens:     opens,
 			Accuracy:  acc,
-			Score:     search.Combine(weights, freq, ts, acc),
-		})
+		}))
 		matched++
 		if matched >= maxRegexHits {
 			break
@@ -1498,12 +1662,14 @@ func (a *application) truncate(results []search.Result) []search.Result {
 	return results
 }
 
-// finish 是搜索的最后一步：排序 → 截到 MaxResults → 打散应用的连续块。
-// 打散不够：输入 d 这种宽泛查询时，普通文件（type 0.20）分数天然低于应用，
-// 连前 80 都进不来，用户看到的就是"只显示应用"。所以截断时给非应用留一份保底名额。
+// finish 是搜索的最后一步：排序 → 按配额截到 MaxResults。
+//
+// 这里不再调用 search.Balance（打散应用的连续块）。类型现在是硬分段，
+// 再交错等于把文件硬塞回应用前面，正好和"输 qq 先看到 QQ"相反；
+// "输入 d 只显示应用"由 truncateMixed 的保底名额兜住——80 条里始终留 20 条给非应用。
 func (a *application) finish(results []search.Result) []search.Result {
 	search.Sort(results)
-	return search.Balance(a.truncateMixed(results), maxAppRun)
+	return a.truncateMixed(results)
 }
 
 // truncateMixed 按配额截断：应用最多占 (max - 非应用保底) 条，剩下的名额强制留给文件/目录。
@@ -1696,13 +1862,19 @@ func (a *application) togglePin() {
 	}
 }
 
-// openFolder 打开选中项所在的文件夹（文件开父目录，目录开自身）。
+// openFolder 打开选中项所在的文件夹（Ctrl+Enter）。
 func (a *application) openFolder() {
-	if a.chosen < 0 || a.chosen >= len(a.results) {
+	a.openFolderAt(a.chosen)
+}
+
+// openFolderAt 打开第 i 条结果所在的文件夹（文件开父目录，目录开自身）。
+// 键盘（Ctrl+Enter）走选中项，右键菜单走被点的那一条，所以带 index。
+func (a *application) openFolderAt(i int) {
+	if i < 0 || i >= len(a.results) {
 		return
 	}
-	r := a.results[a.chosen]
-	if r.Kind == search.KindCommand || r.Path == "" || strings.HasPrefix(r.Path, "shell:") {
+	r := a.results[i]
+	if !hasContainingFolder(r) {
 		a.setStatus("这一项没有所在文件夹")
 		return
 	}
@@ -1898,7 +2070,17 @@ func (a *application) show() {
 	// 而这点时间藏在面板动画里，感知不到。
 	a.refreshIndex(true)
 	a.refilter()
+	// 玻璃要在 Show 之前抓：那一刻窗口还没上屏，抓到的才是它后面的画面。
+	a.refreshGlass()
 	a.panel.Show()
+	// 窗口区域：这块窗口是 noRedirect 合成的，圆角以外的像素透不出桌面、DWM 会
+	// 填白，所以形状只能靠区域切。半径比内容圆角大 glassRegionSlack，让那条 1 位
+	// 掩码的硬边落在四角月牙铺的纯桌面色里；弧本身的抗锯齿由月牙的 alpha 给。
+	// 区域同时决定 DWM 阴影的形状，这也是阴影能跟着圆角走的唯一办法。
+	a.applyRoundRegion()
+	// 四角的桌面色要在窗口移到本次位置之后再取（取的是窗外 2px 的实时像素），
+	// 月牙也得跟着重画 —— 这两件事都不能放到 Show 之前。
+	a.refreshCorners()
 	// Show 内部只调 SetForegroundWindow，从任务栏/别的窗口切回来时会被前台锁拒绝，
 	// 所以这里自己带上 AttachThreadInput 再抢一次；拿不到也不影响面板显示。
 	if !forceForeground(a.panel.NativeHandle()) {
@@ -1919,6 +2101,9 @@ func (a *application) toggle() {
 		if a.panel.IsFocused() {
 			log.Print("toggle: 隐藏面板")
 			a.panel.Hide()
+			// 收起面板正是回收的好时机：增量每条都复制一份可写表，
+			// 那些被换下来的旧表要等 GC，而 GC 不会把页还给 OS。
+			releaseMemory()
 			return
 		}
 		log.Print("toggle: 面板可见但未聚焦，取回焦点")
@@ -1937,33 +2122,51 @@ func (a *application) ready() {
 	// 所以放这里算一次缓存住，视图里不再现问。
 	a.scale = screenScale()
 
-	// 面板尺寸不是写死的：首次启动用配置里的值（默认 720×480），之后**拖面板边缘**
-	// 改的大小由 mygo 按 StateKey 记在 window-state.json 里，下次启动照旧。
+	// 面板尺寸用配置里的值（默认 720×480）。它不再能靠拖边缘改 —— 见下面
+	// Resizable 的说明；要改大小直接改配置。
 	pw, ph := a.cfg.PanelSize()
 	a.panel = mygo.NewWindow(mygo.WindowOptions{
 		Title:  "Baozi",
 		Panel:  true,
 		Hidden: true,
-		// 不用 Frameless：Windows 上无边框窗口**没有缩放边缘**（拖不了），
-		// 换成"隐藏标题栏 + 隐藏窗口按钮"，保留阴影、圆角和四边（含顶边）的缩放边缘。
+		// 不用 Frameless：Windows 上无边框窗口既没有缩放边缘，也拿不到 DWM 的
+		// 阴影和圆角。这里用"隐藏标题栏 + 隐藏窗口按钮"把阴影和圆角拿到手。
+		// 保留四边（含顶边）的缩放边缘：这是"面板大小拖边改"的唯一入口。
+		// 注意 internal/win 的窗口区域必须铺满**整个窗口**（含这圈边框带），
+		// 否则右边和下边的缩放热区会被切掉，那里就拉不动大小了。
 		TitleBarStyle:     mygo.TitleBarHidden,
 		HideWindowButtons: true,
 		Transparent:       true,
-		Vibrancy:          mygo.VibrancyGlass,
-		CornerRadius:      16,
-		Width:             pw,
-		Height:            ph,
-		MinWidth:          config.MinPanelWidth,
-		MinHeight:         config.MinPanelHeight,
-		Content:           ui.View(a.view),
+		// Win11 22H2 起 mygo 的 vibrancy 走系统 backdrop（DWMWA_SYSTEMBACKDROP_TYPE），
+		// 那边由 DWM 实时出材质；Win10 上它没有任何视觉作用，面板的玻璃是自己抓屏做的
+		// 静态底（见 glass.go 的说明：只要窗口带 Content，noRedirect 就跑不掉）。
+		Vibrancy:     mygo.VibrancyGlass,
+		CornerRadius: glassRadius,
+		Width:        pw,
+		Height:       ph,
+		MinWidth:     config.MinPanelWidth,
+		MinHeight:    config.MinPanelHeight,
+		Content:      ui.View(a.view),
 	})
 	// 用户拖着面板边缘改大小：停手 800ms 后把尺寸写进 config.json，
 	// 下次启动按这个尺寸建窗。不用 mygo 的 StateKey——那个只在窗口真正关闭时落盘，
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
-	a.panel.OnResize(func() { a.panelGeometryChanged() })
+	a.panel.OnResize(func() {
+		// 玻璃的取景偏移在 build 时按客户区重算，窗口一变只要重建一帧。
+		// 圆角：窗口区域不会自己跟着变大变圆（DWM 的阴影也按它画），尺寸一改必须
+		// 重设；四角那几张月牙也得按新尺寸重画，否则弧和区域对不上。
+		a.applyRoundRegion()
+		a.refreshCorners()
+		a.panel.Update(func() {})
+		a.panelGeometryChanged()
+	})
 	// 拖面板本身（见 view 里给根容器挂的 DragWindow）同样停手 800ms 后记位置。
-	// 拖面板本身（见 view 里给根容器挂的 DragWindow）同样停手 800ms 后记位置。
-	a.panel.OnMove(func() { a.panelGeometryChanged() })
+	a.panel.OnMove(func() {
+		// 玻璃跟着面板走：整屏磨砂图不动，只改窗口在图上取景的偏移。
+		// 每帧只是一次重建，没有裁图、模糊、纹理上传，所以跟手。
+		a.panel.Update(func() {})
+		a.panelGeometryChanged()
+	})
 	a.panel.OnClose(func(e *mygo.CloseEvent) {
 		// 真正退出时不能拦：mygo 的 Quit 是一个个关窗口，
 		// 只要有窗口在 OnClose 里 PreventDefault，整个 Quit 就被取消，
@@ -2090,23 +2293,39 @@ func (a *application) ready() {
 	}
 }
 
-// indexFile 是索引快照文件。从 v3 起不再用 gob，改叫 .bin 以免和老文件混淆。
-func (a *application) indexFile() string   { return filepath.Join(a.dataDir, "index.bin") }
+// indexFile 返回当前这一代索引快照的路径。
+// 从 v4 起服务端每重建一次就可能写到新文件（index-<时间戳>.bin）：
+// 主进程用 mmap 长期映射着上一代，Windows 不允许替换被映射的文件，
+// 所以"哪一份是最新的"要靠目录里按 mtime 挑，而不是写死 index.bin。
+func (a *application) indexFile() string {
+	if a.idxPath != "" {
+		return a.idxPath
+	}
+	if p, _, err := index.Latest(a.dataDir); err == nil {
+		return p
+	}
+	return filepath.Join(a.dataDir, "index.bin")
+}
 func (a *application) historyFile() string { return filepath.Join(a.dataDir, "history.json") }
 
 func (a *application) bootIndex() {
 	alive := a.serviceAlive()
-	tab, roots, err := index.Load(a.indexFile())
+	path := a.indexFile()
+	tab, roots, err := index.Load(path)
 	n := 0
 	if tab != nil {
 		n = tab.Len()
 	}
 	if err == nil && n > 0 {
 		a.idxReplace(tab)
+		a.idxPath = path
 		// 记下这份快照的"代次"，好让增量知道能不能往上叠
-		if info, e := os.Stat(a.indexFile()); e == nil {
+		if info, e := os.Stat(path); e == nil {
 			a.idxMtime = info.ModTime()
 		}
+		// 顺手收掉更老的代次：映射正被自己占用的删不掉，那没关系，
+		// 下次启动时（还没映射）就能删干净
+		index.Prune(a.dataDir, path)
 		a.idxBase = readStateBase(a.dataDir)
 		a.idxSeq = 0
 		a.idxOps = 0
@@ -2220,8 +2439,10 @@ func (a *application) rescan() {
 		return
 	}
 	a.idxReplace(tab)
-	if err := index.Save(a.indexFile(), tab, a.cfg.Index.Roots); err != nil {
+	if path, err := index.Save(a.indexFile(), tab, a.cfg.Index.Roots); err != nil {
 		log.Printf("保存索引: %v", err)
+	} else {
+		a.idxPath = path
 	}
 	a.setStatus(fmt.Sprintf("%d 项 · 扫描 %s", tab.Len(), time.Since(start).Round(time.Second)))
 	releaseMemory()

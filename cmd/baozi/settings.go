@@ -58,8 +58,6 @@ type settingsWindow struct {
 	srcTessoa   bool
 
 	// 自定义命令：结构化编辑（左列选中哪条，右列就改哪条）。
-	// tab 0 = 常规，1 = 自定义命令。
-	tab      int
 	cmds     []config.Command
 	cmdSel   int
 	cmdList  ui.ListState
@@ -67,11 +65,24 @@ type settingsWindow struct {
 	cmdArgs  string // 编辑器里的"参数"，一行一个
 	cmdSync  int    // 编辑器上次从哪一条同步来的，-1 表示要重新同步
 
+	// 左栏导航：navSel 是选中的那一项，navList 是它的列表状态（键盘上下也能选）。
+	// navPrev 记上一帧选中的是谁，只有变了才滚；navJump 是"这一帧要滚到哪一段"，
+	// -1 表示不动——ScrollIntoView 每帧都调会让人没法手动滚走。
+	navSel  int
+	navList ui.ListState
+	navPrev int
+	navJump int
+
 	message string
 }
 
 func newSettingsWindow(a *application) *settingsWindow {
 	s := &settingsWindow{app: a}
+	// 左栏默认停在第一项，navPrev 跟它一样，免得一打开就滚一下；
+	// navJump 用 -1 起，表示"这帧别动"。
+	s.navPrev = secHotkey
+	s.navJump = -1
+	s.navList.Selected = &s.navSel
 	s.win = mygo.NewWindow(mygo.WindowOptions{
 		Title: "Baozi 设置",
 		// 必须 Hidden：窗口创建即显示，不带这一项的话 Baozi 一启动就弹一个设置窗口，
@@ -151,37 +162,59 @@ func (s *settingsWindow) show() {
 	s.win.Focus()
 }
 
+// settingsNavItems 是左栏的设置项，顺序和右栏的段落一一对应。
+// 「自定义命令」要一整屏（左清单 + 右表单），所以它是单独一页；其余四项同在一页，
+// 点哪一项就把右栏滚到哪一段——不切页，别的段还在原地，想接着往下看不用点回来。
+var settingsNavItems = []string{"唤出", "文件对话框跟随", "排序", "索引", "自定义命令"}
+
+const (
+	secHotkey = iota
+	secFollow
+	secRank
+	secIndex
+	secCommands
+)
+
 func (s *settingsWindow) view(c *ui.Context) {
 	t := c.Theme()
 	// 和面板同一套字体，切窗口时不换字形。
 	usePanelFont(t)
 	c.Root().Background(t.Background)
 
+	// 测试里是直接 &settingsWindow{app: a} 构造的，未必走过 newSettingsWindow，
+	// 这里补一次，保证左栏能选、选中项就是 navSel。
+	if s.navList.Selected == nil {
+		s.navList.Selected = &s.navSel
+	}
+
+	// 左栏换了项：这一帧把右栏滚过去，随即清掉标记，免得每帧都把人拽回某一段。
+	if s.navSel != s.navPrev {
+		s.navPrev = s.navSel
+		s.navJump = s.navSel
+	}
+
 	ui.Column(c).Fill().Children(func() {
 		// 顶栏
-		ui.Row(c).Padding(20, 24, 8, 24).Gap(10).AlignItems(ui.Center).Children(func() {
+		ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "Baozi 设置").FontSize(20).Bold()
 				ui.Text(c, "改动保存后立即生效；配置文件在 "+s.app.cfgPath).FontSize(11).TextColor(t.TextMuted)
 			})
 		})
-		ui.Row(c).Padding(0, 24, 8, 24).Children(func() {
-			ui.Tabs(c, &s.tab, "常规", "自定义命令")
-		})
 		ui.Divider(c)
 
-		if s.tab == 1 {
-			s.commandsPage(c, t)
-		} else {
-			ui.Scroll(c).Grow(1).Children(func() {
-				ui.Column(c).Padding(24, 24).Gap(22).Children(func() {
-					s.hotkeySection(c, t)
-					s.followSection(c, t)
-					s.rankSection(c, t)
-					s.indexSection(c, t)
-				})
+		// 左右两栏：左边是设置项，右边是实际内容。
+		ui.Row(c).Grow(1).Children(func() {
+			s.navColumn(c, t)
+			ui.Column(c).Width(1).FillHeight().Background(t.Border)
+			ui.Column(c).Grow(1).FillHeight().Children(func() {
+				if s.navSel == secCommands {
+					s.commandsPage(c, t)
+				} else {
+					s.sectionsColumn(c, t)
+				}
 			})
-		}
+		})
 
 		ui.Divider(c)
 		ui.Row(c).Padding(12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
@@ -194,6 +227,44 @@ func (s *settingsWindow) view(c *ui.Context) {
 			}
 		})
 	})
+}
+
+// navColumn 是左栏：一列设置项，选中的那一条由 List 画成和结果列表一样的选中块。
+func (s *settingsWindow) navColumn(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Width(212).FillHeight().Padding(14, 12).Gap(6).Children(func() {
+		ui.Text(c, "设置项").FontSize(11).TextColor(t.TextMuted).Padding(8, 8, 2, 4)
+		s.navList.Key = func(i int) any { return settingsNavItems[i] }
+		s.navList.Label = func(i int) string { return settingsNavItems[i] }
+		ui.List(c, &s.navList, len(settingsNavItems), func(i int) {
+			ui.Text(c, settingsNavItems[i]).FontSize(12).Padding(8, 9).SingleLine()
+		}).Grow(1)
+	})
+}
+
+// sectionsColumn 是右栏正文：四个大项目一段接一段，段与段之间用分隔线断开来。
+func (s *settingsWindow) sectionsColumn(c *ui.Context, t *ui.Theme) {
+	ui.Scroll(c).Grow(1).Children(func() {
+		ui.Column(c).Gap(0).Children(func() {
+			s.section(c, secHotkey, func() { s.hotkeySection(c, t) })
+			ui.Divider(c)
+			s.section(c, secFollow, func() { s.followSection(c, t) })
+			ui.Divider(c)
+			s.section(c, secRank, func() { s.rankSection(c, t) })
+			ui.Divider(c)
+			s.section(c, secIndex, func() { s.indexSection(c, t) })
+			ui.Divider(c)
+		})
+	})
+}
+
+// section 给一段设置套上留白；左栏刚点中这一段时，在这一帧把它滚进视野。
+// ScrollIntoView 只在调用那一帧生效，否则用户自己滚走会被一直拽回来。
+func (s *settingsWindow) section(c *ui.Context, idx int, build func()) {
+	wrap := ui.Column(c).Padding(24, 24).Gap(0).Children(build)
+	if s.navJump == idx {
+		s.navJump = -1
+		wrap.ScrollIntoView(ui.ScrollIntoViewOptions{Block: ui.ScrollStart, Animation: &ui.Smooth})
+	}
 }
 
 func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {

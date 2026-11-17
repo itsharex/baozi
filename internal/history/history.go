@@ -195,25 +195,44 @@ func (s *Store) Count(path string) int {
 	return 0
 }
 
-// Score 返回 0..1 的频次得分：次数占七成、最近使用占三成（7 天半衰）。
+// 频次刻度。以前是"除以历史里次数最多的那条"，等于相对化：只要最常用的
+// 才 2 次，任何打开过 1 次的东西 freq 就有 0.63，配上 0.5 权重就是 0.31 分，
+// 足够压过"从没打开过、但名字就是你敲的那几个字母"的应用（0.30 分）。
+// 改成绝对刻度后，打开 1 次只值 0.29，打开 10 次才满分——"随手开过"
+// 和"天天在用"才分得开。
+const (
+	scoreFreqFull = 10
+	// scoreHalfLifeDays 从 7 改成 30：7 天太短，前天开的今天就掉没了，
+	// 反而让刚开的临时文件在那一两天里霸榜。
+	scoreHalfLifeDays = 30
+)
+
+// Score 返回 0..1 的频次得分：次数占七成、最近使用占三成（30 天半衰）。
 func (s *Store) Score(path string) float64 {
+	score, _ := s.ScoreCount(path)
+	return score
+}
+
+// ScoreCount 同时返回频次得分和历史打开次数。
+// 排序要次数判"越级"（见 search.Rank），分开查会对同一条 entry 加两次锁。
+func (s *Store) ScoreCount(path string) (float64, int) {
 	s.mu.RLock()
 	e, ok := s.entries[path]
-	maxCount := s.maxCount
 	s.mu.RUnlock()
-	if !ok || maxCount == 0 {
-		return 0
+	if !ok {
+		return 0, 0
 	}
-	freq := math.Log1p(float64(e.Count)) / math.Log1p(float64(maxCount))
-	if maxCount <= 1 {
+	count := e.Count
+	freq := math.Log1p(float64(count)) / math.Log1p(scoreFreqFull)
+	if freq > 1 {
 		freq = 1
 	}
 	age := time.Since(time.Unix(0, e.LastUsed))
 	if age < 0 { // 单调时间戳可能比真实时间略超前，钳到 0 以免得分越界
 		age = 0
 	}
-	recency := math.Exp(-age.Hours() / (24 * 7))
-	return 0.7*freq + 0.3*recency
+	recency := math.Exp(-age.Hours() / (24 * scoreHalfLifeDays))
+	return 0.7*freq + 0.3*recency, count
 }
 
 // Recent 返回按时间倒序的最近使用，用于空查询时的历史列表。

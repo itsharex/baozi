@@ -574,6 +574,51 @@ func TestHomeCardContextMenuDelete(t *testing.T) {
 	}
 }
 
+// 右键菜单里要有「打开所在文件夹」：和 Ctrl+Enter 是同一个动作，
+// 只是这里走被右键点中的那一条，而不是当前选中项。
+func TestContextMenuHasOpenFolder(t *testing.T) {
+	a := testApp(t)
+	a.hist.TouchEntry(history.Entry{Path: `C:\Windows\notepad.exe`, Name: "记事本", Kind: history.KindApp})
+	a.refilter()
+	stubAllIcons(a)
+	tr := ui.NewTester(a.view, panelWidth, panelHeight)
+	tr.Frame()
+
+	if err := tr.RightClick("记事本"); err != nil {
+		t.Fatalf("右键记事本：%v", err)
+	}
+	menu := tr.Menu()
+	found := false
+	for _, label := range menu {
+		if label == "打开所在文件夹" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("右键菜单里没有「打开所在文件夹」，实际菜单：%v", menu)
+	}
+	// 只确认在菜单里，不真的选它：那会去壳里开资源管理器。
+}
+
+// 命令类结果没有真实路径，那一项要灰着不能点。
+func TestCommandResultOpenFolderDisabled(t *testing.T) {
+	a := testApp(t)
+	a.query = "lock"
+	a.results = []search.Result{{Name: "锁屏", Kind: search.KindCommand}}
+	a.chosen = 0
+	stubAllIcons(a)
+	tr := ui.NewTester(a.view, panelWidth, panelHeight)
+	tr.Frame()
+	rect, ok := tr.Find("锁屏")
+	if !ok {
+		t.Fatal("渲染后找不到「锁屏」这一行")
+	}
+	tr.RightClickAt(rect.X+rect.W/2, rect.Y+rect.H/2)
+	if err := tr.ChooseMenuItem("打开所在文件夹"); err == nil {
+		t.Fatal("命令类结果也能选「打开所在文件夹」，应被禁用")
+	}
+}
+
 // 固定项可以从菜单里取消固定，取消后回到「最近使用」。
 func TestPinnedCardUnpin(t *testing.T) {
 	a := testApp(t)
