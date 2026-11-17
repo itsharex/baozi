@@ -63,6 +63,19 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 	return true
 }
 
+// ClearRegion 撤掉窗口区域，窗口恢复成整个矩形。
+//
+// 缩放过程中用它：SetWindowRgn 改的是 DWM 算阴影和重定向表面时用的形状，每帧
+// 改一次代价很实（实测把一帧的 SetWindowPos 从 3ms 拖到 7ms）。而形状本身由四角
+// 月牙铺的桌面色撑着，缩放时看不出差别，所以整段拖动期间撤掉、停手再设回去。
+func ClearRegion(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	r, _, _ := procSetWindowRgn.Call(hwnd, 0, 1)
+	return r != 0
+}
+
 // VirtualScreenRect 返回所有显示器拼起来的那个矩形（物理像素）。
 func VirtualScreenRect() (x, y, w, h int) {
 	gx, _, _ := procGetSystemMetrics.Call(smXVirtualScreen)

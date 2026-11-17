@@ -170,6 +170,18 @@ type application struct {
 	// 尺寸）分开记：尺寸没变时只能 Update 像素、不能换新 Bitmap —— ui.Image
 	// 渲染一次就把纹理缓存住了，换对象屏上不会变。
 	cornerSize int
+	// maskKey / maskCache 缓存四角月牙的覆盖率掩码（每个角 size² 个 float64，
+	// 40×40 一共 51 KB）。掩码只跟圆角半径和位图边长有关，缩放时反复重建的是
+	// 桌面色，掩码根本不用重算 —— 每次重算要 40 万次 hypot 加八遍 3×3 柔化。
+	maskKey   cornerMaskKey
+	maskCache [4][]float64
+	// cornerTimer 把缩放过程中连珠炮般的月牙重建攒成一次：WM_SIZE 一帧来一次，
+	// 每帧都重画四张图（外加四张 GPU 纹理）就是"缩放卡卡的"另一半原因。
+	// 月牙的边长只跟圆角半径有关，和面板多大无关，所以缩放期间沿用旧图完全正确。
+	cornerTimer *time.Timer
+	// inResize 记"正在连续缩放"。缩放期间窗口区域被撤掉（见 ClearRegion），
+	// 停手后由 finishResize 设回去，避免拖动中每帧都让 DWM 重算形状。
+	inResize bool
 	// borderColor 是最后一帧用的面板边线色，四角月牙要把这条边一起画进去
 	// （mygo 画边框的圆角段没有抗锯齿，那正是四角台阶的第二个来源）。
 	borderColor ui.Color
@@ -2001,6 +2013,17 @@ func (a *application) placePanel(x, y int) {
 	time.AfterFunc(panelSettle/2, func() { a.panel.SetPosition(x, y) })
 }
 
+// finishResize 是缩放停手后的一次收尾：把窗口区域设回去，再按新位置重画四角月牙。
+//
+// 顺序不能反：先有区域（DWM 才按圆角裁阴影），月牙再盖到四角上补抗锯齿。
+func (a *application) finishResize() {
+	a.panelMu.Lock()
+	a.inResize = false
+	a.panelMu.Unlock()
+	a.applyRoundRegion()
+	a.refreshCorners()
+}
+
 // panelGeometryChanged 是窗口尺寸/位置变化的回调：攒到用户停手再落盘。
 // 拖动时这个回调会连着来几十次（每帧一次），每次都写 config.json 太重。
 // 尺寸和位置走同一个定时器：两件事都要写同一个文件，分开定定时器会互相覆盖。
@@ -2189,12 +2212,35 @@ func (a *application) ready() {
 	// 下次启动按这个尺寸建窗。不用 mygo 的 StateKey——那个只在窗口真正关闭时落盘，
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
 	a.panel.OnResize(func() {
+		t0 := time.Now()
 		// 玻璃的取景偏移在 build 时按客户区重算，窗口一变只要重建一帧。
-		// 圆角：窗口区域不会自己跟着变大变圆（DWM 的阴影也按它画），尺寸一改必须
-		// 重设；四角那几张月牙也得按新尺寸重画，否则弧和区域对不上。
-		a.applyRoundRegion()
-		a.refreshCorners()
-		a.panel.Update(func() {})
+		//
+		// 圆角和月牙在缩放过程中都**先不动**，等停手 160ms 一次做掉：
+		//   · 窗口区域：SetWindowRgn 改的是 DWM 算阴影和重定向表面用的形状，
+		//     每帧改一次很实 —— 实测把一帧的 SetWindowPos 从 3ms 拖到 7ms。
+		//     而且区域是按窗口坐标记的，窗口变大时旧区域还会把新长出来的部分
+		//     裁掉。所以一进缩放就把区域整个撤掉，用四角月牙铺的桌面色撑着形状；
+		//   · 四角月牙：每帧重画四个角要合成四张图、上传四张 GPU 纹理。月牙的
+		//     边长只由圆角半径决定，和面板尺寸无关，缩放期间沿用旧图完全正确。
+		// 这两件事都是"稳下来才有意义"的活，压在拖动帧里只会让人手等着。
+		a.panelMu.Lock()
+		if !a.inResize {
+			a.inResize = true
+			win.ClearRegion(a.panel.NativeHandle())
+		}
+		if a.cornerTimer != nil {
+			a.cornerTimer.Stop()
+		}
+		a.cornerTimer = time.AfterFunc(160*time.Millisecond, a.finishResize)
+		a.panelMu.Unlock()
+		if d := time.Since(t0); d > 6*time.Millisecond {
+			log.Printf("缩放: 回调 %.2fms（超过 6ms 才记）", float64(d.Microseconds())/1000)
+		}
+		// 这里**不再调 panel.Update**：mygo 的 surface 收到 WM_SIZE 就自己
+		// drawNow 了（surface.go："Draw at once, so the content follows the
+		// window while it is resized"），玻璃的取景偏移也是在那一趟布局里按新
+		// 客户区重算的。之前这里多调一次 Update，等于一帧画两遍 —— 一次布局加
+		// 一次合成，缩放时两个都排在 UI 线程上，手就跟着卡。
 		a.panelGeometryChanged()
 	})
 	// 拖面板本身（见 view 里给根容器挂的 DragWindow）同样停手 800ms 后记位置。

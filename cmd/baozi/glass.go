@@ -228,6 +228,13 @@ func (a *application) refineCornerColors() {
 	}
 }
 
+// cornerMaskKey 是月牙覆盖率掩码的缓存键。掩码只由这三个量决定：弧半径、
+// 区域半径、位图边长（都是物理像素）。桌面色和面板尺寸都不参与 —— 桌面色是
+// 合成时才乘上去的，面板尺寸只影响位图摆在哪。
+type cornerMaskKey struct {
+	arc, region, size int
+}
+
 // cornerOuterSide 报一个越界坐标是不是落在"窗口之外"的那一侧。
 //
 // 四角位图的四个方向不是同一种东西：两条边贴着窗口边（再往外就是桌面/白），
@@ -297,13 +304,26 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 	// 约 3 像素的过渡。柔化发生在图像里，跟弧的方向无关，所以切点也不会被拉长。
 	const ss = 4
 	sub := 1.0 / ss
-	masks := make([]float64, size*size)
-	blur := make([]float64, size*size)
+	// 覆盖率掩码只跟 (arc, region, size) 有关 —— 和桌面色无关，也和面板尺寸无关。
+	// 缩放的时候 OnResize 每帧都会走到这里，而每个角要算 size²×16 次 hypot 再
+	// 加两遍 3×3 柔化：40×40 就是 10 万次 hypot 加两轮柔化、两块临时切片，四个角
+	// 乘四，全砸在 UI 线程上 —— 这就是"缩放时卡卡的"主因（半径从 16 DIP 提到
+	// 24 DIP 之后 size 从 30 涨到 40，这一项的代价翻了将近一倍）。
+	// 缓存后一帧只剩合成：四个角一共 6400 个像素。
+	key := cornerMaskKey{arc: arc, region: region, size: size}
+	fresh := a.maskKey != key
+	var masks, blur []float64
 	for corner := 0; corner < 4; corner++ {
 		c := a.deskCorners[corner]
 		patch := a.cornerPatches[corner]
-		// 1) 覆盖率 mask。
-		for y := 0; y < size; y++ {
+		// 1) 覆盖率 mask，只在缓存失效时算。
+		if fresh {
+			masks = make([]float64, size*size)
+			blur = make([]float64, size*size)
+		} else {
+			masks = a.maskCache[corner]
+		}
+		for y := 0; fresh && y < size; y++ {
 			for x := 0; x < size; x++ {
 				// Mirror into the top-left corner's own frame.
 				bx, by := float64(x), float64(y)
@@ -350,7 +370,7 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 		//     左右，于是位图的内边缘沿着整个 40 像素铺出一条"桌面色"带 ——
 		//     因为位图是方的，这条带在面板内部就是一条水平、一条垂直的边。
 		//     用户看到并描出来的那两条框线，就是它。
-		for pass := 0; pass < 2; pass++ {
+		for pass := 0; fresh && pass < 2; pass++ {
 			for y := 0; y < size; y++ {
 				for x := 0; x < size; x++ {
 					var sum float64
@@ -370,6 +390,9 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				}
 			}
 			copy(masks, blur)
+		}
+		if fresh {
+			a.maskCache[corner] = masks
 		}
 		// 3) 合成：颜色是该像素真实的桌面色（patch 里连壁纸的渐变一起搬过来），
 		//    alpha 用柔化后的 mask。
@@ -440,6 +463,9 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 			}
 		}
 		a.cornerBitmaps[corner] = ui.NewBitmap(img)
+	}
+	if fresh {
+		a.maskKey = key
 	}
 	a.cornerSize = size
 	log.Printf("玻璃: 月牙重造 arc=%d region=%d size=%d 角0=%02X%02X%02X", arc, region, size, a.deskCorners[0].R, a.deskCorners[0].G, a.deskCorners[0].B)

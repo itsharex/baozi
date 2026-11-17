@@ -1925,3 +1925,33 @@ Ctrl（`baozi-hook` 认这个），或者手动按。注意双击两次会切到
 判"缩放还是移动"只看 `GetWindowRect`：`Left/Top` 变是移动，只有 `Right/Bottom` 变是缩放
 （左边缘缩放会同时改 Left 和宽度，所以不能只看 Left）。
 
+
+## 17. 缩放（拖边改尺寸）为什么会卡，以及三处代价
+
+用户报的现象是"缩放时卡卡的"。逐层量下来，一帧的代价分成三块，只有第一块是我们的：
+
+1. **`OnResize` 里重建四角月牙**（原来是每帧都做）。每一帧四角各跑一遍
+   `40×40` 掩码（约 1600 次 `hypot` × 4 角）＋两遍 3×3 柔化＋合成四张图，
+   再用 `ui.NewBitmap` 上传四张 GPU 纹理。圆角半径从 16 DIP 提到 24 DIP 之后
+   掩码边长从 30 涨到 40，这一项的绝对量又大了近一倍 —— 这就是"现在才觉得卡"。
+   修法：掩码与柔化按 `cornerMaskKey{arc, region, size}` 缓存，尺寸不变时直接复用。
+   月牙的边长只由圆角半径决定、和面板尺寸无关，缩放期间完全没必要重造。
+2. **一帧画两遍**。mygo 的 `surface` 收到 `WM_SIZE` 就自己 `s.drawNow()`
+   （`surface.go`：*"Draw at once, so the content follows the window while it is
+   resized"*），玻璃的取景偏移也是在那一趟布局里按新客户区重算的。`OnResize`
+   里再调一次 `panel.Update` 等于又走一遍布局与合成。删掉之后少整整一层。
+3. **每一帧重设窗口区域**。`SetWindowRgn` 改的是 DWM 算阴影、重分配重定向表面
+   时用的形状，尺寸一变就要重算一次；而且区域按窗口坐标记，窗口变大时旧区域
+   还会把新长出来的部分裁掉。现在一进缩放就 `ClearRegion`（`SetWindowRgn(h, 0)`），
+   整段拖动期间窗口是矩形、形状靠四角月牙铺的桌面色撑着，停手 160ms 后
+   `finishResize` 再一次性 `applyRoundRegion() + refreshCorners()`（顺序不能反：
+   先有区域 DWM 才按圆角裁阴影，月牙再盖上去补抗锯齿）。
+
+实测（外部探针从另一个进程 `SetWindowPos`，它会把 `WM_SIZE` **同步**投递到 UI 线程，
+所以耗时包含 app 侧处理）：一帧 5~6ms、最大 9~11ms；`OnResize` 回调本身几乎每帧
+都 <1ms（探针阈值 1ms 时 25 帧只有一帧记到 1.02ms）。也就是说剩下的 4~5ms 在
+mygo 的 `drawNow`（全量布局 + GPU 合成 + present）与 DWM 同步里，我们能改的只有上面三块。
+
+验收也一起做了：拖动中 `GetWindowRgn` 返回 0（无区域＝矩形），停手后返回 3
+（复杂区域＝圆角）；复位后左下角落弧外是桌面色、弧上有 1px 边框、弧内是玻璃，
+没有横向或纵向的色带。
