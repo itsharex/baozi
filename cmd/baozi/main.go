@@ -597,10 +597,20 @@ func (a *application) view(c *ui.Context) {
 				ui.Column(c).Absolute().Left(0).Top(0).
 					Size(float32(pw), float32(ph)).
 					DragWindow().Children(body)
-				// 四条直边。起点取弧半径（= 窗口区域半径），正好接上圆角段那圈边线；
-				// 直边段和弧上的边线同色同宽，看起来是一整圈框。
+				// 四条直边。直边段和弧上的边线同色同宽，拼成一整圈框。
+				//
+				// 起点不能精确取弧半径（r0 = glassRadius）。精确相接时，直边线的
+				// 终点由"面板 DIP 宽度"算出来，弧的端点却落在"窗口像素宽度"上，
+				// 两者差 1~2 像素，接缝处就露出一小段缝：看上去是一条直边线
+				// 孤零零地断在角旁边（截图实测 71×58 那块，底边线画到 x=37，
+				// x=38-39 空了两像素，弧从 x=40 才接上）。
+				//
+				// 所以两端各多画 2 DIP，主动压进弧段。压进弧内的部分和弧上的边线
+				// 同色，看不出重叠；压到弧外的那一点点由最后绘制的四角月牙盖住
+				// （月牙的弧外区域铺的是该角的真实桌面色，alpha 不透明）。
 				const edgeDip float32 = 1
-				r0 := float32(glassRadius)
+				const edgeOverlap float32 = 2
+				r0 := float32(glassRadius) - edgeOverlap
 				ui.Column(c).Absolute().Left(r0).Top(0).
 					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
 				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-edgeDip).
