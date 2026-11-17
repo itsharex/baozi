@@ -51,10 +51,53 @@ const glassClipRadius = glassRadius - 2
 
 // snapshotScreen 抓一次全屏、做成磨砂图。
 // 必须在 Show 之前调用，否则抓到的是面板自己。
+// captureCornerPatches 在窗口显示**之前**把四角那一小块桌面逐像素抓下来。
+//
+// 月牙外侧那一圈铺的是什么色，直接决定圆角看不看得出来。以前每角只存一个
+// "角上取色"（deskCorners），壁纸在那块只要有渐变，月牙就成了壁纸上一道亮带：
+// 实测左上角弧外铺的是 #79C5F7，紧挨着的真桌面是 #15A4F2，差出一整条弧线，
+// 用户说的"还能看出来"就是它。现在直接照抄屏幕上的原始像素，弧外与真桌面
+// 1:1 同色，想看出边界也没有色差可看。
+//
+// 只能在 Show 之前抓：显示之后那块位置就是面板自己了（抓到的是自己的玻璃）。
+// 四张 size×size、43×43 一共不到 30 KB。
+func (a *application) captureCornerPatches() {
+	if a.panel == nil {
+		return
+	}
+	s := float64(a.glassScale())
+	size := int(math.Round(float64(glassRadius)*s)) + 10
+	if size <= 0 {
+		return
+	}
+	cx, cy, cw, ch := win.WindowRectPixels(a.panel.NativeHandle())
+	if cw < size || ch < size {
+		return
+	}
+	origins := [4][2]int{
+		{cx, cy},
+		{cx + cw - size, cy},
+		{cx, cy + ch - size},
+		{cx + cw - size, cy + ch - size},
+	}
+	for i := 0; i < 4; i++ {
+		img, err := win.CaptureRect(origins[i][0], origins[i][1], size, size)
+		if err != nil {
+			a.cornerPatches[i] = nil
+			log.Printf("玻璃: 四角 patch 抓取失败 角%d %v", i, err)
+			continue
+		}
+		a.cornerPatches[i] = img
+	}
+	log.Printf("玻璃: 四角 patch %dx%d 已抓（窗口 %d,%d %dx%d）", size, size, cx, cy, cw, ch)
+}
+
 func (a *application) snapshotScreen() {
 	if a.panel == nil {
 		return
 	}
+	// 四角那小块桌面顺手抓下来，给月牙弧外当底色（此刻窗口还没显示）。
+	a.captureCornerPatches()
 	if win.SystemGlass() {
 		// Win11 22H2 起这层材质由 DWM 自己画（mygo 的 vibrancy 走系统 backdrop），
 		// 用不上我们这张图。
@@ -150,9 +193,8 @@ func (a *application) refineCornerColors() {
 // DirectComposition 的 CreateRectangleClip 是几何裁剪、边缘照样是硬的；GPU 那套
 // ClipInset 把弧画得很圆，但它画在窗口自己的像素里，弧外依旧是一片白。
 //
-// 每个像素做 4×4 超采样再合成，而不是按"覆盖率"直接算 alpha：沿对角线方向，
-// 圆的覆盖率每像素变化 1.4，按覆盖率算出来的渐变只有 1 个像素宽 —— 看起来就是
-// 一圈台阶。超采样给出的是真正按面积加权的边缘，任何方向的斜边都同样平滑。
+// 每个像素做 8×8 子采样，alpha 就是"子采样里有多少落在弧外"的覆盖率。这给出
+// 真正按面积加权的边缘：任何方向的斜边都只过渡 1 个像素，弧与四条边的切点也一样。
 //
 // arc 是月牙那条弧的半径（物理像素），region 是窗口区域的半径。两者圆心不同
 // （区域大一圈），"弧内"和"区域外"有小片重叠 —— 那片必须也铺满桌面色，否则
@@ -177,14 +219,26 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 	// 白色圆弧。圆角的分界现在完全靠"桌面色 → 玻璃"这个色差本身，弧上只有
 	// 超采样给出的柔和过渡。
 	_ = edge
-	const ss = 4 // 每像素 4×4 超采样
-	// fade：弧上 alpha 过渡带的半宽（物理像素）。2.0 → 整条过渡带 4 像素宽，
-	// 弧上大概能踩出 3~4 个中间色像素，远看就是一条干净的弧、没有台阶。
-	const fade = 2.0
+	// 三件套：4×4 子采样算出"这个像素有多少面积在弧外"，再在 mask 上做两遍 3×3
+	// 柔化，最后按 mask 把桌面色铺上去。
+	//
+	// 为什么要绕这一圈，两步都不能省：
+	//   · 只用"到圆弧的有符号距离做 ±2 像素线性渐变"—— 在弧与四条边的**切点**
+	//     处，这个距离随坐标几乎不变，过渡被拖成十几个像素长的一条竖带（实测
+	//     x=1 列从 y=25 一直混到 y=35），成了用户看到的那枚"亮刺"。
+	//   · 只用覆盖率 —— 各方向都只过渡 1 像素，可壁纸是深蓝、玻璃是浅灰，一个
+	//     像素跨 165 级亮度，那就是一道硬台阶，还是锯齿（实测 (0,30)→(0,31)，
+	//     #15A4F2 直接跳到 #A2D4F5）。
+	// 覆盖率保证"形状正确、各向同性"，mask 上的 3×3 柔化再把 1 像素的硬边摊成
+	// 约 3 像素的过渡。柔化发生在图像里，跟弧的方向无关，所以切点也不会被拉长。
+	const ss = 4
 	sub := 1.0 / ss
+	masks := make([]float64, size*size)
+	blur := make([]float64, size*size)
 	for corner := 0; corner < 4; corner++ {
 		c := a.deskCorners[corner]
-		img := image.NewNRGBA(image.Rect(0, 0, size, size))
+		patch := a.cornerPatches[corner]
+		// 1) 覆盖率 mask。
 		for y := 0; y < size; y++ {
 			for x := 0; x < size; x++ {
 				// Mirror into the top-left corner's own frame.
@@ -195,39 +249,70 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				if corner == 2 || corner == 3 {
 					by = float64(size - 1 - y)
 				}
-				var sr, sg, sb, sa float64
+				hit := 0
 				for sy := 0; sy < ss; sy++ {
 					for sx := 0; sx < ss; sx++ {
 						fx := bx + (float64(sx)+0.5)*sub
 						fy := by + (float64(sy)+0.5)*sub
 						// >0 在弧外（该角这一侧），<0 在弧内（面板这一侧）。
 						sd := math.Hypot(float64(arc)-fx, float64(arc)-fy) - float64(arc)
-						// 窗口区域之外一律桌面色：那一圈是 DWM 填的白。
-						outside := math.Hypot(float64(region)-fx, float64(region)-fy) > float64(region)
-						var al float64
-						switch {
-						case outside:
-							al = 255 // 区域外必须不透明
-						default:
-							// 弧上不是"一刀切"，而是让 alpha 在弧两侧 ±fade 像素内线性走完
-							// 255 → 0：几何覆盖率本身只给 1 像素的混合（对角线方向圆的
-							// 覆盖率每像素变 1.4），肉眼看就是细台阶；把过渡带撑到 2.8 像素
-							// 宽，弧的内边界才真的柔和。
-							al = 255 * clamp01((sd+fade)/(2*fade))
+						// 区域外一律铺满桌面色：那一圈是 DWM 填的白。
+						if sd > 0 || math.Hypot(float64(region)-fx, float64(region)-fy) > float64(region) {
+							hit++
 						}
-						sr += float64(c.R) * al
-						sg += float64(c.G) * al
-						sb += float64(c.B) * al
-						sa += al
 					}
 				}
-				off := img.PixOffset(x, y)
-				if sa > 0 {
-					img.Pix[off] = uint8(math.Round(sr / sa))
-					img.Pix[off+1] = uint8(math.Round(sg / sa))
-					img.Pix[off+2] = uint8(math.Round(sb / sa))
-					img.Pix[off+3] = uint8(math.Round(sa / (ss * ss)))
+				masks[y*size+x] = float64(hit) / float64(ss*ss)
+			}
+		}
+		// 2) 两遍 3×3 柔化。图外按 1（不透明）处理，免得边缘的 alpha 被拉低、
+		//    在区域边上露出一圈半透明的白。
+		for pass := 0; pass < 2; pass++ {
+			for y := 0; y < size; y++ {
+				for x := 0; x < size; x++ {
+					var sum float64
+					for dy := -1; dy <= 1; dy++ {
+						for dx := -1; dx <= 1; dx++ {
+							xx, yy := x+dx, y+dy
+							if xx < 0 || yy < 0 || xx >= size || yy >= size {
+								sum += 1
+								continue
+							}
+							sum += masks[yy*size+xx]
+						}
+					}
+					blur[y*size+x] = sum / 9
 				}
+			}
+			copy(masks, blur)
+		}
+		// 3) 合成：颜色是该像素真实的桌面色（patch 里连壁纸的渐变一起搬过来），
+		//    alpha 用柔化后的 mask。
+		img := image.NewNRGBA(image.Rect(0, 0, size, size))
+		for y := 0; y < size; y++ {
+			for x := 0; x < size; x++ {
+				cr, cg, cb := float64(c.R), float64(c.G), float64(c.B)
+				if patch != nil && x < patch.Rect.Dx() && y < patch.Rect.Dy() {
+					o := patch.PixOffset(x, y)
+					cr, cg, cb = float64(patch.Pix[o]), float64(patch.Pix[o+1]), float64(patch.Pix[o+2])
+				}
+				al := masks[y*size+x]
+				// 区域外必须完全不透明：那里是 DWM 的白，透出来就是漏光。
+				bx, by := float64(x)+0.5, float64(y)+0.5
+				if corner == 1 || corner == 3 {
+					bx = float64(size) - bx
+				}
+				if corner == 2 || corner == 3 {
+					by = float64(size) - by
+				}
+				if math.Hypot(float64(region)-bx, float64(region)-by) > float64(region) {
+					al = 1
+				}
+				off := img.PixOffset(x, y)
+				img.Pix[off] = uint8(math.Round(cr))
+				img.Pix[off+1] = uint8(math.Round(cg))
+				img.Pix[off+2] = uint8(math.Round(cb))
+				img.Pix[off+3] = uint8(math.Round(al * 255))
 			}
 		}
 		a.cornerBitmaps[corner] = ui.NewBitmap(img)

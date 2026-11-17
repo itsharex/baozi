@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"image"
 	"io"
 	"log"
 	"math"
@@ -155,6 +156,11 @@ type application struct {
 	// 那条阶梯立刻露出来。
 	deskCorners    [4]ui.Color
 	deskCornersSet bool
+	// cornerPatches 是四角那一小块**真实桌面**的逐像素副本，在窗口显示之前抓。
+	// 月牙弧外就照抄它，于是弧外和真桌面 1:1 同色 —— 只用一个"角上取色"时，
+	// 壁纸在那里有渐变（实测弧外铺 #79C5F7、紧挨着的真桌面是 #15A4F2），
+	// 月牙就成了壁纸上一道亮带。取不到（尺寸对不上、抓图失败）就退回 deskCorners。
+	cornerPatches [4]*image.RGBA
 	// cornerBitmaps 是四角那四张"月牙"位图，cornerPx 是它们的边长（物理像素）。
 	// 弧外铺 deskCorners 的桌面色，弧上按覆盖率渐隐到透明 —— 圆角那条内边界
 	// 的抗锯齿就是它们给的。变了桌面色或换了面板尺寸就重建（见 buildCornerBitmaps）。
@@ -591,9 +597,13 @@ func (a *application) view(c *ui.Context) {
 				ui.Column(c).Absolute().Left(0).Top(0).
 					Size(float32(pw), float32(ph)).
 					DragWindow().Children(body)
-				// 四条直边：从弧的端点开始画（跳过圆角段），端点正好和月牙的弧接上。
+				// 四条直边。起点必须落在**窗口区域里面**：区域是圆角矩形，
+				// 在 y=0 这一行它只从 x≈region 起才算数，起点若取弧半径（比区域
+				// 小一圈），那开头一小段正好被区域裁掉 —— 线在角上断一截、露出
+				// 底下的白/桌面，看着就是"弧的端点旁边有个缺口"。所以从区域半径
+				// 再往里让 1 DIP 起画；让出来的那一点由月牙的桌面色垫着，同色看不出来。
 				const edgeDip float32 = 1
-				r0 := float32(glassClipRadius)
+				r0 := float32(glassRadius) + edgeDip
 				ui.Column(c).Absolute().Left(r0).Top(0).
 					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
 				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-edgeDip).
