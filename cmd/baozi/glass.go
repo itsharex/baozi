@@ -325,27 +325,32 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 				// 外侧那半边会被窗口区域裁掉，只剩半个像素的线，接不上直边。
 				// 内侧 0..edgeW 正好和直边线的位置对齐（直边也画在内侧 1 DIP）。
 				//
-				// 带宽取 2×edgeW 再开方抬升，是因为弧是斜的：像素中心是离散的，
-				// 一条 1 DIP 宽的斜环扫过像素中心时覆盖率只有 0.3~0.6，线会淡到
-				// 看着"角上没有边框"。放宽 + 开方之后弧上是 0.8~1.0 的覆盖，
-				// 外沿还留着柔化，既不比直边淡，也不会显粗。
+				// 0..edgeW 这段取**满覆盖**，不做"距弧远近"的衰减：衰减会让弧上
+				// 那条线比直边淡一档（实测弧上 #CDD6DD、直边 #D9D9DE），在角上
+				// 看起来就是"边框到了弧就变浅了"。现在只在带子的内外各留 1 DIP
+				// 的柔化，弧上和直边是同一条实线。
 				//
-				// 和上面一样必须限定在角象限里：否则边线会沿着整个圆再画一圈，
-				// 面板内部就多出一段弧形边线。
+				// 必须限定在角象限里，否则边线会沿着整个圆再画一圈，面板内部
+				// 就多出一段弧形边线。
 				if inCorner {
 					edgeW := float64(a.glassScale())
 					sdC := math.Hypot(float64(arc)-bx, float64(arc)-by) - float64(arc)
-					if t := -sdC; t > -edgeW && t < edgeW*1.5 {
-						if w := 1 - math.Abs(t-edgeW/2)/edgeW; w > 0 {
-							if w = math.Sqrt(w) * 1.25; w > 1 {
-								w = 1
-							}
-							cr = cr*(1-w) + float64(edge.R)*w
-							cg = cg*(1-w) + float64(edge.G)*w
-							cb = cb*(1-w) + float64(edge.B)*w
-							if w > al {
-								al = w
-							}
+					t := -sdC // 弧内为正
+					w := 0.0
+					switch {
+					case t >= 0 && t <= edgeW:
+						w = 1
+					case t > edgeW && t < edgeW*2:
+						w = 1 - (t-edgeW)/edgeW
+					case t < 0 && t > -edgeW:
+						w = 1 + t/edgeW
+					}
+					if w > 0 {
+						cr = cr*(1-w) + float64(edge.R)*w
+						cg = cg*(1-w) + float64(edge.G)*w
+						cb = cb*(1-w) + float64(edge.B)*w
+						if w > al {
+							al = w
 						}
 					}
 				}
