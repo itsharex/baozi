@@ -609,16 +609,31 @@ func (a *application) view(c *ui.Context) {
 				// 同色，看不出重叠；压到弧外的那一点点由最后绘制的四角月牙盖住
 				// （月牙的弧外区域铺的是该角的真实桌面色，alpha 不透明）。
 				const edgeDip float32 = 1
-				const edgeOverlap float32 = 2
+				const edgeOverlap float32 = 1
+				// 内侧柔化：弧带是"1 DIP 满覆盖 + 内外各 1 DIP 柔化"，视觉宽度约 2 DIP；
+				// 直边线只是一条 1 DIP 的实心矩形，没有柔化。两者在弧的端点接上时，
+				// 接口处宽度从 1 DIP 突变到 2 DIP，看上去就是"一条细直线接到一段较粗的
+				// 弧上"——用户描出来的那个 Γ，左边距面板右边正好 30px（= 弧半径）、
+				// 上边距底边 29px，标的就是这个交界点。给直边线内侧补一条同宽的
+				// 30% 边线，两边视觉宽度一致，接口就平了。
+				edgeSoft := t.Border.Alpha(0.3)
 				r0 := float32(glassRadius) - edgeOverlap
 				ui.Column(c).Absolute().Left(r0).Top(0).
 					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
+				ui.Column(c).Absolute().Left(r0).Top(edgeDip).
+					Size(float32(pw)-2*r0, edgeDip).Background(edgeSoft)
 				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-edgeDip).
 					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
+				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-2*edgeDip).
+					Size(float32(pw)-2*r0, edgeDip).Background(edgeSoft)
 				ui.Column(c).Absolute().Left(0).Top(r0).
 					Size(edgeDip, float32(ph)-2*r0).Background(t.Border)
+				ui.Column(c).Absolute().Left(edgeDip).Top(r0).
+					Size(edgeDip, float32(ph)-2*r0).Background(edgeSoft)
 				ui.Column(c).Absolute().Left(float32(pw)-edgeDip).Top(r0).
 					Size(edgeDip, float32(ph)-2*r0).Background(t.Border)
+				ui.Column(c).Absolute().Left(float32(pw)-2*edgeDip).Top(r0).
+					Size(edgeDip, float32(ph)-2*r0).Background(edgeSoft)
 			})
 			// 四角的月牙最后画，压住磨砂图、底色和边线：弧外是该角真实的桌面色，
 			// 弧上按覆盖率渐隐，弧内透明露出玻璃 —— 见 glass.go 的

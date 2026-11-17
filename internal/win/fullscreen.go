@@ -28,6 +28,19 @@ var (
 // RECT 是 Win32 矩形。
 type RECT struct{ Left, Top, Right, Bottom int32 }
 
+// IsVisible 报窗口当前是否可见。
+//
+// 抓四角桌面像素前必须先问：这块窗口带 WS_EX_NOREDIRECTIONBITMAP，可见的时候
+// 它自己就是那块屏幕上的内容，抓下来的"桌面"其实是面板自己（或它没画完时的
+// DWM 白），月牙照抄之后四角的弧外就是一整块和真桌面不一样的色斑。
+func IsVisible(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	vis, _, _ := procIsWindowVisible.Call(hwnd)
+	return vis != 0
+}
+
 // MONITORINFO 只取需要的字段，cbSize 由调用方填。
 type MONITORINFO struct {
 	CbSize    uint32

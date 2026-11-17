@@ -67,12 +67,22 @@ func (a *application) captureCornerPatches() {
 	if a.panel == nil {
 		return
 	}
+	hwnd := a.panel.NativeHandle()
+	// 窗口已经可见的时候不要抓：这块窗口是 noRedirect 合成的，它可见时屏幕上
+	// 那块就是它自己，抓下来的"桌面色"实际上是面板本身（或者它还没画完时 DWM
+	// 填的白）。月牙把它照抄到弧外，四角就出现一块和真桌面不一样的色斑 ——
+	// 因为那块是矩形 patch，色斑的内侧会留下一条水平、一条垂直的边，
+	// 看上去就是角上凭空多了两直线。宁可用上一次隐藏时抓的那一份。
+	if win.IsVisible(hwnd) {
+		log.Printf("玻璃: 四角 patch 跳过（窗口已可见，抓到的会是面板自己）")
+		return
+	}
 	s := float64(a.glassScale())
 	size := int(math.Round(float64(glassRadius)*s)) + 10
 	if size <= 0 {
 		return
 	}
-	cx, cy, cw, ch := win.WindowRectPixels(a.panel.NativeHandle())
+	cx, cy, cw, ch := win.WindowRectPixels(hwnd)
 	if cw < size || ch < size {
 		return
 	}
@@ -82,6 +92,7 @@ func (a *application) captureCornerPatches() {
 		{cx, cy + ch - size},
 		{cx + cw - size, cy + ch - size},
 	}
+	kept := 0
 	for i := 0; i < 4; i++ {
 		img, err := win.CaptureRect(origins[i][0], origins[i][1], size, size)
 		if err != nil {
@@ -89,9 +100,41 @@ func (a *application) captureCornerPatches() {
 			log.Printf("玻璃: 四角 patch 抓取失败 角%d %v", i, err)
 			continue
 		}
+		if patchLooksBlank(img) {
+			// 兜底：整块近乎纯白基本可以断定抓错了（DWM 白 / 面板自己），
+			// 保留上一次那张，不要拿它去铺弧外。
+			log.Printf("玻璃: 四角 patch 角%d 近乎纯白，判无效，沿用上一次", i)
+			continue
+		}
 		a.cornerPatches[i] = img
+		kept++
 	}
-	log.Printf("玻璃: 四角 patch %dx%d 已抓（窗口 %d,%d %dx%d）", size, size, cx, cy, cw, ch)
+	log.Printf("玻璃: 四角 patch %dx%d 已抓 %d/4（窗口 %d,%d %dx%d）", size, size, kept, cx, cy, cw, ch)
+}
+
+// patchLooksBlank 判断抓下来的角块是不是"一片白"。
+//
+// 采样点里绝大多数都接近 #FFFFFF 时当作无效：真桌面上确实可能有白色窗口，
+// 但那种情况下月牙退回 deskCorners 铺的同样是白，结果一样，所以这个判断
+// 不会误伤 —— 它只在"抓错人"的时候起作用。
+func patchLooksBlank(img *image.RGBA) bool {
+	if img == nil || len(img.Pix) == 0 {
+		return true
+	}
+	white, total := 0, 0
+	for y := 0; y < img.Rect.Dy(); y += 2 {
+		for x := 0; x < img.Rect.Dx(); x += 2 {
+			o := (y-img.Rect.Min.Y)*img.Stride + (x-img.Rect.Min.X)*4
+			if o+3 >= len(img.Pix) {
+				continue
+			}
+			total++
+			if img.Pix[o] > 245 && img.Pix[o+1] > 245 && img.Pix[o+2] > 245 {
+				white++
+			}
+		}
+	}
+	return total > 0 && white*100/total > 70
 }
 
 func (a *application) snapshotScreen() {
