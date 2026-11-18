@@ -366,13 +366,18 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 					o := patch.PixOffset(ix, iy)
 					cr, cg, cb := float64(patch.Pix[o]), float64(patch.Pix[o+1]), float64(patch.Pix[o+2])
 					// 这块桌面色同样被阴影压暗，才和紧挨着的外圈接得上。
-					// 涂实（alpha=1）：这块本来就在面板轮廓**外**，桌面是原样可见的，
-					// 半透明会把边界那一格的白漏出来。
 					sa := cov.shade[ly*k+lx]
 					keep := 1 - sa
-					s.bits[off+0] = byte(cb * keep)
-					s.bits[off+1] = byte(cg * keep)
-					s.bits[off+2] = byte(cr * keep)
+					// 边界那一个像素必须按 cc（"这个像素有多少面积在弧外"）把两侧
+					// 颜色混起来：弧外那一份是压暗的桌面色，剩下那一份是紧挨着的
+					// 边框线。以前是不管 cc 多大都整块铺桌面色 —— 覆盖率算了却只当
+					// 布尔用，边界实际是 1 位掩码，弧上就是一串 1 像素台阶，也就是
+					// 用户说的"角的毛边"。alpha 仍必须是 255：这块在面板轮廓外，
+					// 桌面是原样可见的，半透明会把边界那格的白漏出来。
+					t := cc
+					s.bits[off+0] = byte(cb*keep*t + bb*(1-t))
+					s.bits[off+1] = byte(cg*keep*t + bg*(1-t))
+					s.bits[off+2] = byte(cr*keep*t + br*(1-t))
 					s.bits[off+3] = 255
 				}
 			}
@@ -465,7 +470,7 @@ func (s *Shadow) DumpAlpha(path string) error {
 // （用它做抗锯齿），shade 是该点应叠加的阴影黑度（和外圈同一条曲线）。
 type cornerCoverageT struct {
 	size  int
-	cov   []float64 // 弧外覆盖率：这块是"面板没盖到"的缺口
+	cov   []float64 // 边界软化系数：1=完全在弧外、0=完全在弧内
 	shade []float64 // 同一位置该压多黑（和外圈阴影同曲线）
 	band  []float64 // 弧内侧 borderW 像素的边框覆盖率
 	seam  []float64 // 紧贴弧边界的 1px（弧内侧），要涂实遮住面板漏的白
@@ -484,7 +489,7 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 		return cornerCovVal
 	}
 	size := radius + margin + 2
-	const ss = 4
+	const ss = 8
 	sub := 1.0 / float64(ss)
 	cov := cornerCoverageT{
 		size:  size,
@@ -499,27 +504,35 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 	if bw < 1 {
 		bw = 1
 	}
-	const seamW = 1.5
+	// seamW 是"弧内侧要涂实遮白"的宽度。1.0 而不是 1.5：面板自己那条 1px 边线
+	// 就在紧邻的一列里，涂到 1.5 会把它盖成第二列，内侧就和玻璃撞出一个
+	// 1 像素的台阶（弧上一个像素的台阶在视觉上就是"毛边"）。
+	const seamW = 1.0
+	// aaW 是边界软化宽度（物理像素）。这里**不用**面积覆盖率：面积法的过渡带
+	// 天生只有 1 个像素宽，弧上每一行的混合值随角度抖一抖，看上去就是一串
+	// 1 像素台阶（用户说的"角的毛边"）。改成以弧为中线、宽 aaW 的线性软边：
+	// 相邻像素的系数连续变化，弧看起来是"虚"的，台阶就看不出来了。
+	const aaW = 2.0
 	for ly := 0; ly < size; ly++ {
 		for lx := 0; lx < size; lx++ {
-			out, inBand, inSeam := 0, 0, 0
+			inBand, inSeam := 0, 0
 			for sy := 0; sy < ss; sy++ {
 				for sx := 0; sx < ss; sx++ {
 					fx := float64(lx) + (float64(sx)+0.5)*sub
 					fy := float64(ly) + (float64(sy)+0.5)*sub
 					id := insideDistance(fx, fy, r)
-					if id < 0 {
-						out++
-					} else if id < bw {
-						inBand++
-					}
-					if id >= 0 && id < seamW {
-						inSeam++
+					if id >= 0 {
+						if id < bw {
+							inBand++
+						}
+						if id < seamW {
+							inSeam++
+						}
 					}
 				}
 			}
 			i := ly*size + lx
-			cov.cov[i] = float64(out) / float64(ss*ss)
+			cov.cov[i] = math.Max(0, math.Min(1, 0.5-insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)/aaW))
 			cov.band[i] = float64(inBand) / float64(ss*ss)
 			cov.seam[i] = float64(inSeam) / float64(ss*ss)
 			d := -insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)
