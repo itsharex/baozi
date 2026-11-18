@@ -920,6 +920,7 @@ func (a *application) refreshShadow() {
 		Corners: patches,
 		Border:  a.cornerEdge,
 		BorderW: int(math.Round(float64(s))),
+		Desk:    uint32(a.deskColor.R)<<16 | uint32(a.deskColor.G)<<8 | uint32(a.deskColor.B),
 	})
 	if d := time.Since(t0); d > 3*time.Millisecond {
 		log.Printf("阴影: 重建 %.2fms（位图 %.2f + 上传 %.2f）",
@@ -929,6 +930,14 @@ func (a *application) refreshShadow() {
 	}
 	if !ok {
 		log.Print("阴影: 图层布局失败")
+	}
+	// 诊断：把这一帧真正交给 DWM 的位图存成 PNG（分层窗口用 GetPixel 拍不到，
+	// 想量四角的抗锯齿只能看这份原始数据）。
+	//   BAOZI_SHADOWDUMP=<路径>  每次重建覆盖一次
+	if p := os.Getenv("BAOZI_SHADOWDUMP"); p != "" {
+		if err := a.shadow.DumpRGBA(p); err != nil {
+			log.Printf("阴影: 导出失败 %v", err)
+		}
 	}
 	a.shadow.Show()
 }

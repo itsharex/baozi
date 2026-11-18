@@ -174,6 +174,9 @@ type ShadowSpec struct {
 	// Border 是圆角边框弧的颜色（0xRRGGBB），BorderW 是线宽（物理像素）。
 	Border  uint32
 	BorderW int
+	// Desk 是"抓不到四角桌面图块时"用的兜底底色（0xRRGGBB）。给 0 表示不兜底，
+	// 弧外留空（只有阴影压着，边缘会发毛、还会漏 DWM 的白）。
+	Desk uint32
 }
 
 func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
@@ -310,14 +313,21 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 		br := float64((sp.Border >> 16) & 0xFF)
 		bg := float64((sp.Border >> 8) & 0xFF)
 		bb := float64(sp.Border & 0xFF)
+		// 兜底色：抓不到角的桌面图块时用它顶。以前这里直接 continue，弧外就留成
+		// 透明 —— 那一小片既漏 DWM 的白，又只有阴影的半透明黑压着，弧边看上去
+		// 就是"毛边 + 漏光"，而且四个角各缺一块、缺的还不一样（patch 常常只抓到
+		// 1/4），越看越不齐。
+		dr := float64((sp.Desk >> 16) & 0xFF)
+		dg := float64((sp.Desk >> 8) & 0xFF)
+		db := float64(sp.Desk & 0xFF)
 		for c := 0; c < 4; c++ {
 			patch := corners[c]
-			if patch == nil {
-				continue
+			pw, ph := 0, 0
+			if patch != nil {
+				pw, ph = patch.Rect.Dx(), patch.Rect.Dy()
 			}
-			pw, ph := patch.Rect.Dx(), patch.Rect.Dy()
-			for ly := 0; ly < k && ly < ph; ly++ {
-				for lx := 0; lx < k && lx < pw; lx++ {
+			for ly := 0; ly < k; ly++ {
+				for lx := 0; lx < k; lx++ {
 					cc := cov.cov[ly*k+lx]
 					// band 是圆角边框弧那一条（弧**内侧** borderW 像素）的覆盖率：
 					// 直边的边框线由面板自己画，弧这一段以前靠月牙描，现在也归这层。
@@ -366,11 +376,11 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 					if c == 2 || c == 3 {
 						iy = ph - 1 - ly
 					}
-					if ix < 0 || ix >= pw || iy < 0 || iy >= ph {
-						continue
+					cr, cg, cb := dr, dg, db
+					if patch != nil && ix >= 0 && ix < pw && iy >= 0 && iy < ph {
+						o := patch.PixOffset(ix, iy)
+						cr, cg, cb = float64(patch.Pix[o]), float64(patch.Pix[o+1]), float64(patch.Pix[o+2])
 					}
-					o := patch.PixOffset(ix, iy)
-					cr, cg, cb := float64(patch.Pix[o]), float64(patch.Pix[o+1]), float64(patch.Pix[o+2])
 					// 这块桌面色同样被阴影压暗，才和紧挨着的外圈接得上。
 					sa := cov.shade[ly*k+lx]
 					keep := 1 - sa
@@ -495,6 +505,28 @@ func CornerDarken(bx, by, radius, margin int) float64 {
 	}
 	f := 1 - d/float64(margin)
 	return constMaxAlpha * f * f * f
+}
+
+// DumpRGBA 把当前位图原样导成 PNG（BGRA → RGBA），诊断用：量四角抗锯齿、
+// 查弧内侧有没有被涂成纯白，都得看这份真数据，屏幕截图会被别的窗口干扰。
+func (s *Shadow) DumpRGBA(path string) error {
+	if s == nil {
+		return fmt.Errorf("nil shadow")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.bits) == 0 {
+		return fmt.Errorf("no bits")
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, int(s.w), int(s.h)))
+	for i, o := 0, 0; i < int(s.w)*int(s.h); i, o = i+1, o+4 {
+		img.Pix[o+0] = s.bits[o+2]
+		img.Pix[o+1] = s.bits[o+1]
+		img.Pix[o+2] = s.bits[o+0]
+		img.Pix[o+3] = s.bits[o+3]
+	}
+	img.Stride = int(s.w) * 4
+	return pngEncode(path, img)
 }
 
 // DumpAlpha 把当前的 alpha 图导成 PNG（诊断用：分层窗口 GetPixel 拍不到，
