@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"image"
@@ -22,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"slices"
 	"strings"
 	"sync"
@@ -188,6 +190,26 @@ type application struct {
 	// 每帧都重画四张图（外加四张 GPU 纹理）就是"缩放卡卡的"另一半原因。
 	// 月牙的边长只跟圆角半径有关，和面板多大无关，所以缩放期间沿用旧图完全正确。
 	cornerTimer *time.Timer
+	// resizeFrames/resizeSum/resizeMax/resizeGapMax 只用来回答一个问题：用户拖得
+	// 很快的时候，到底是我们的回调慢，还是 Windows 把事件并掉了。停手时
+	// finishResize 打一行"缩放: 本轮 N 帧 …"，N 远小于鼠标移动次数就说明
+	// 是事件被并了（面板自己的绘制跟不上），而不是我们的回调。
+	resizeFrames    int
+	resizeSum       time.Duration
+	resizeMax       time.Duration
+	resizeGapMax    time.Duration
+	resizePrev      time.Time
+	resizeStartedAt time.Time
+	// lastMoveAt / moveTimer 给拖动（移动）那条路径节流用：见 OnMove。
+	lastMoveAt       time.Time
+	moveTimer        *time.Timer
+	moveUpdateQueued bool
+	// uiTick / dragUntil / hangDumped 是看门狗用的（见 startWatchdog）：拖动期间
+	// UI 线程若真有几百毫秒不响应，就把所有 goroutine 的栈打进日志 —— 光看回调
+	// 耗时抓不到死锁，栈才说得清它卡在哪一行。
+	uiTick     atomic.Int64
+	dragUntil  atomic.Int64
+	hangDumped atomic.Bool
 	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
 	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
 	// internal/win/shadow.go）。
@@ -2042,9 +2064,29 @@ func (a *application) hidePanel() {
 // 之前重画，因为月牙里那块"窗外桌面色"是从面板外侧实时取的，阴影已经亮起来的话
 // 会把那几个取样点压暗。
 func (a *application) finishResize() {
-	a.applyRoundRegion()
-	a.refreshCorners()
-	a.refreshShadow()
+	// 收尾走主线程：buildCornerBitmaps 要造 ui.Bitmap（GPU 纹理），而
+	// time.AfterFunc 的回调跑在普通 goroutine 上 —— 和渲染线程同时碰 D3D
+	// 设备是没保证的。RunOnMain 会在主线程上等它跑完（本来就在主线程时直接跑）。
+	mygo.RunOnMain(func() {
+		a.applyRoundRegion()
+		a.refreshCorners()
+		a.refreshShadow()
+	})
+	// 一轮拖动的数据留一行日志：帧数、回调耗时、帧间隔峰值。
+	// 帧数远小于鼠标移动次数（比如 400 次移动只来了 15 帧）就说明事件是被系统
+	// 或面板绘制并掉的，不是我们的回调慢；反过来回调 max 高就得先抠这里。
+	a.panelMu.Lock()
+	n, sum, max, gap := a.resizeFrames, a.resizeSum, a.resizeMax, a.resizeGapMax
+	span := time.Since(a.resizeStartedAt)
+	a.resizeFrames, a.resizeSum, a.resizeMax, a.resizeGapMax = 0, 0, 0, 0
+	a.resizePrev = time.Time{}
+	a.panelMu.Unlock()
+	if n > 0 {
+		avg := float64(sum.Microseconds()) / 1000 / float64(n)
+		log.Printf("缩放: 本轮 %d 帧，跨度 %.0fms，回调 avg %.2fms max %.2fms，帧间隔 max %.0fms",
+			n, float64(span.Microseconds())/1000, avg,
+			float64(max.Microseconds())/1000, float64(gap.Microseconds())/1000)
+	}
 }
 
 // panelGeometryChanged 是窗口尺寸/位置变化的回调：攒到用户停手再落盘。
@@ -2133,6 +2175,42 @@ func clampPanelTo(x, y, w, h int, wa mygo.Rectangle) (int, int) {
 }
 
 // show 在鼠标所在显示器居中偏上位置显示面板。
+// startWatchdog 盯着 UI 线程。拖动期间它每 200ms 检查一次心跳（OnMove/OnResize
+// 会更新 uiTick）；超过 1.2 秒没有心跳就把所有 goroutine 的栈打进日志。
+//
+// 之所以要这个：用户报的"快速拖动卡死"在合成拖动里复现不出来（实测 750 次/秒
+// 的移动，回调 0.5~1ms），那就得让真机上的下一次卡顿自己把现场留下来 ——
+// 栈里能看出是阻塞在 WaitMessage、D3D 提交，还是我们自己的锁上。
+func (a *application) startWatchdog() {
+	go func() {
+		for {
+			time.Sleep(200 * time.Millisecond)
+			if a.panel == nil || !a.panel.IsVisible() {
+				a.hangDumped.Store(false)
+				continue
+			}
+			until := a.dragUntil.Load()
+			tick := a.uiTick.Load()
+			if until == 0 || time.Now().UnixNano() > until {
+				a.hangDumped.Store(false)
+				continue
+			}
+			idle := time.Since(time.Unix(0, tick))
+			if idle < 1200*time.Millisecond {
+				a.hangDumped.Store(false)
+				continue
+			}
+			if !a.hangDumped.CompareAndSwap(false, true) {
+				continue
+			}
+			var buf bytes.Buffer
+			_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
+			log.Printf("看门狗: 拖动中 UI 线程 %dms 没有心跳，goroutine 栈：\n%s",
+				int(idle.Milliseconds()), buf.String())
+		}
+	}()
+}
+
 func (a *application) show() {
 	if a.cfg.Hotkey.DisableInFullscreen && win.ForegroundInfo().Fullscreen {
 		log.Print("前台是全屏应用，忽略唤出")
@@ -2248,6 +2326,22 @@ func (a *application) ready() {
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
 	a.panel.OnResize(func() {
 		t0 := time.Now()
+		a.uiTick.Store(t0.UnixNano())
+		a.dragUntil.Store(t0.Add(600 * time.Millisecond).UnixNano())
+		// 先把这一帧的节奏记下来（见 resizeFrames 的注释）。
+		a.panelMu.Lock()
+		if a.resizeFrames == 0 {
+			a.resizeStartedAt = t0
+			a.resizeGapMax = 0
+		}
+		if !a.resizePrev.IsZero() {
+			if gap := t0.Sub(a.resizePrev); gap > a.resizeGapMax {
+				a.resizeGapMax = gap
+			}
+		}
+		a.resizePrev = t0
+		a.resizeFrames++
+		a.panelMu.Unlock()
 		// 缩放期间把阴影层收起来（只留面板自己 + 每帧重设的圆角区域）。
 		//
 		// 也试过"每帧重建"，两个问题：
@@ -2274,6 +2368,12 @@ func (a *application) ready() {
 		if d := time.Since(t0); d > 6*time.Millisecond {
 			log.Printf("缩放: 回调 %.2fms（超过 6ms 才记）", float64(d.Microseconds())/1000)
 		}
+		a.panelMu.Lock()
+		if d := time.Since(t0); d > a.resizeMax {
+			a.resizeMax = d
+		}
+		a.resizeSum += time.Since(t0)
+		a.panelMu.Unlock()
 		// 这里**不再调 panel.Update**：mygo 的 surface 收到 WM_SIZE 就自己
 		// drawNow 了（surface.go："Draw at once, so the content follows the
 		// window while it is resized"），玻璃的取景偏移也是在那一趟布局里按新
@@ -2283,9 +2383,44 @@ func (a *application) ready() {
 	})
 	// 拖面板本身（见 view 里给根容器挂的 DragWindow）同样停手 800ms 后记位置。
 	a.panel.OnMove(func() {
+		a.uiTick.Store(time.Now().UnixNano())
+		a.dragUntil.Store(time.Now().Add(600 * time.Millisecond).UnixNano())
 		// 玻璃跟着面板走：整屏磨砂图不动，只改窗口在图上取景的偏移。
-		// 每帧只是一次重建，没有裁图、模糊、纹理上传，所以跟手。
-		a.panel.Update(func() {})
+		//
+		// 但**不能每帧都重建**：panel.Update 是"整棵内容树重新布局 + 重新栅格化
+		// + 上传纹理"，1100×724 的面板一次就是几毫秒到十几毫秒，全砸在 UI 线程上；
+		// 鼠标每秒能报几百次位移，那就等于把 UI 线程占满 —— 用户说的"快速拖动
+		// 卡死"就出在这里。磨砂图的取景偏移差个几像素肉眼看不出来，所以按 50ms
+		// 节流，松手后再补一帧把位置对齐。
+		now := time.Now()
+		a.panelMu.Lock()
+		// 一次只排一个：拖面板走的是系统的模态拖动循环（mygo 的 DragWindow 就是
+		// SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)），那段循环里队列跑得比平时慢，
+		// 每帧无条件 post 一个"整树重建"只会在队列里堆起来。排队了就不再排。
+		queued := false
+		if !a.moveUpdateQueued && now.Sub(a.lastMoveAt) >= 50*time.Millisecond {
+			a.lastMoveAt = now
+			a.moveUpdateQueued = true
+			queued = true
+		}
+		a.panelMu.Unlock()
+		if queued {
+			a.panel.Update(func() {
+				a.panelMu.Lock()
+				a.moveUpdateQueued = false
+				a.panelMu.Unlock()
+			})
+		}
+		a.panelMu.Lock()
+		if a.moveTimer != nil {
+			a.moveTimer.Stop()
+		}
+		a.moveTimer = time.AfterFunc(120*time.Millisecond, func() {
+			if a.panel != nil && a.panel.IsVisible() {
+				a.panel.Update(func() {})
+			}
+		})
+		a.panelMu.Unlock()
 		// 阴影层也要跟着挪，否则松手前它会停在原地。只挪位置、不重算位图
 		// （尺寸没变），所以开销就是一次 UpdateLayeredWindow。
 		a.followShadow()
@@ -2310,6 +2445,7 @@ func (a *application) ready() {
 	a.bootIndex()
 
 	// 2) 应用列表：读开始菜单，几十毫秒。拼音串在这里一次算好。
+	a.startWatchdog()
 	go func() {
 		raw, err := mygo.Shell.InstalledApps()
 		if err != nil {

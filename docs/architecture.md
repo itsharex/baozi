@@ -2059,3 +2059,29 @@ mygo 的 `drawNow`（全量布局 + GPU 合成 + present）与 DWM 同步里，�
 - `tools\shadowprobe`：不依赖 app，单独把阴影层摆到指定矩形并 dump alpha 图（`dist\shadow_alpha.png`）。
 
 > 注意：`GetPixel(GetDC(0))` 之类的屏幕抓取**拍不到分层窗口**，验证渲染只能截图。
+### 18.5.1 "快速拖动会卡死"：合成拖动复现不出来，但真机上的重活在移动那条路上
+
+`tools\drag_probe.ps1` 用 `SetCursorPos` + `mouse_event` 合成拖动，同时在每一步
+`SendMessageTimeout(WM_NULL, 40ms)` 探 UI 线程是否卡住。实测（面板 1838×778）：
+
+- 移动 600 步、每步之间不睡（≈1300 次/秒）：卡死 0 次，松手后 2.5 秒内也 0 次；
+- 右边缘缩放 400 步（≈750 次/秒）：`缩放: 本轮 41 帧，跨度 447ms，回调 avg 0.50ms
+  max 1.01ms` —— 我们的回调根本不是瓶颈。
+
+真正的重活在**移动**（不是缩放）那条路：`OnMove` 原来每来一次 `WM_MOVE` 就
+`panel.Update()`，那是"整棵内容树重新布局 + 重新栅格化 + 上传纹理"，1100×724 一次
+几毫秒到十几毫秒。而拖面板走的是系统模态拖动循环（mygo 的 `DragWindow` =
+`SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)`），每秒几百次位移就是几百个重建排进主线程
+队列 —— 手感是"拖着不动"，松手后再用几秒钟把队列啃完，观感就是卡死。
+
+现在：
+
+- `OnMove` 里按 **50ms** 节流，并且**一次只排一个**（`moveUpdateQueued` 闸门）：
+  队列里已经有一个就不再加。松手 120ms 后补一帧，把磨砂图的取景位置对齐；
+- `finishResize`（自治区圆角区域 + 重造四角位图 + 重建阴影）改走
+  `mygo.RunOnMain`：`buildCornerBitmaps` 要造 `ui.Bitmap`（GPU 纹理），而
+  `time.AfterFunc` 的回调跑在普通 goroutine 上，和渲染线程同时动 D3D 设备没保证；
+- 加了**看门狗**（`startWatchdog`）：拖动期间每 200ms 检查一次心跳
+  （`OnMove`/`OnResize` 更新 `uiTick`），超过 1.2 秒没心跳就把所有 goroutine 的栈
+  打进日志（`看门狗: 拖动中 UI 线程 NNNms 没有心跳`）。合成拖动抓不到的死锁，
+  真机上再发生时日志会直接说是卡在哪一行。
