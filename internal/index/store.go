@@ -281,17 +281,21 @@ func Latest(dataDir string) (string, time.Time, error) {
 	return best, bestTime, nil
 }
 
-// Prune 删掉除 keep 之外的旧索引代次。被人映射着的文件删不掉（这正是它还在的原因），
-// 那种情况留着下次再删，不当成错误。
+// Prune 删掉除 keep 之外的旧索引代次（连同它那一代的 .frn 旁挂表）。
+// 被人映射着的文件删不掉（这正是它还在的原因），那种情况留着下次再删，不当成错误。
 func Prune(dataDir, keep string) {
 	entries, err := os.ReadDir(dataDir)
 	if err != nil {
 		return
 	}
-	keepName := filepath.Base(keep)
+	keepBin := filepath.Base(keep)
+	keepFRN := filepath.Base(FRNPathFor(keep))
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || name == keepName || !strings.HasPrefix(name, "index") || !strings.HasSuffix(name, ".bin") {
+		if e.IsDir() || name == keepBin || name == keepFRN || !strings.HasPrefix(name, "index") {
+			continue
+		}
+		if !strings.HasSuffix(name, ".bin") && !strings.HasSuffix(name, ".frn") {
 			continue
 		}
 		_ = os.Remove(filepath.Join(dataDir, name))

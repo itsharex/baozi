@@ -193,14 +193,17 @@ func (m *FRNMap) grow() {
 // Mutable 是服务进程里实时维护的索引。
 // 全量重建后拿到 *Table（Nodes 是普通切片，可 append），之后按 USN 增量改它。
 type Mutable struct {
-	t    *Table
+	t *Table
+	// frn 只放"基座里没有的"那一小撮（重建之后新增/改名过的条目）。
+	// 基座那 177 万条在 base 里（映射文件，零堆占用，见 frnfile.go）。
 	frn  *FRNMap
+	base *FRNFile
 	dead int // 墓碑条数
 	// names0 是建立映射时名字 arena 的长度，用来估算"追加了多少垃圾"。
 	names0 int
 }
 
-// NewMutable 把一张刚建好的快照包装成可增量维护的形式。
+// NewMutable 把一张刚建好的快照包装成可增量维护的形式（堆上的 FRN 表）。
 func NewMutable(t *Table, frn *FRNMap) *Mutable {
 	if t.Py == nil {
 		t.Py = make(map[int32]uint64, 1<<13)
@@ -209,6 +212,79 @@ func NewMutable(t *Table, frn *FRNMap) *Mutable {
 		frn = NewFRNMap(t.Len())
 	}
 	return &Mutable{t: t, frn: frn, names0: 0}
+}
+
+// NewMutableBase 用**映射进来的** FRN 表当基座：增量新增的条目走堆上的小表，
+// 基座那 177 万条直接查文件。服务端稳态用这个，把原来那 30MB 堆换成文件页。
+func NewMutableBase(t *Table, base *FRNFile) *Mutable {
+	m := &Mutable{t: t, base: base, names0: 0}
+	if t.Py == nil {
+		t.Py = make(map[int32]uint64, 1<<13)
+	}
+	// 增量表按"预计几百条"起步，重建周期内够用；超了会自己长。
+	m.frn = NewFRNMap(1024)
+	return m
+}
+
+// FRNCount 返回基座 + 增量两部分的条目数（日志/诊断用）。
+func (m *Mutable) FRNCount() int {
+	return m.FRNBaseLen() + m.FRNOvLen()
+}
+
+// FRNBaseLen 返回映射基座里的条目数。
+func (m *Mutable) FRNBaseLen() int {
+	if m == nil {
+		return 0
+	}
+	return m.base.Len()
+}
+
+// FRNOvLen 返回堆上增量表里的条目数。
+func (m *Mutable) FRNOvLen() int {
+	if m == nil {
+		return 0
+	}
+	return m.frn.Len()
+}
+
+// LookupFRN 是 lookupFRN 的导出外壳，只给诊断工具用（tools/frnreplay）。
+func (m *Mutable) LookupFRN(frn uint64) (int32, bool) { return m.lookupFRN(frn) }
+
+// lookupFRN 先查增量（改名会把老条目指向新下标，所以增量必须优先），再查基座。
+func (m *Mutable) lookupFRN(frn uint64) (int32, bool) {
+	if m == nil || frn == 0 {
+		return -1, false
+	}
+	if m.frn != nil {
+		if idx, ok := m.frn.Get(frn); ok {
+			return idx, true
+		}
+	}
+	if m.base != nil {
+		return m.base.Get(frn)
+	}
+	return -1, false
+}
+
+// setFRN 只往增量表里记（基座是只读映射，改不了也不该改）。
+func (m *Mutable) setFRN(frn uint64, idx int32) {
+	if m == nil || frn == 0 {
+		return
+	}
+	if m.frn == nil {
+		m.frn = NewFRNMap(1024)
+	}
+	m.frn.Set(frn, idx)
+}
+
+// Close 解开基座映射。换代次时由服务端调用（旧表可能还有搜索线程在用，
+// 但服务端这边只在自己手里握着，换完就没人查了）。
+func (m *Mutable) Close() {
+	if m == nil || m.base == nil {
+		return
+	}
+	m.base.Close()
+	m.base = nil
 }
 
 // Table 返回当前（可继续被修改的）表。
@@ -223,8 +299,8 @@ func (m *Mutable) NamesOverhead() int { return len(m.t.ovNames) - m.names0 }
 // Add 追加一个条目并登记 FRN，返回下标。
 func (m *Mutable) Add(name string, parent int32, kind Kind, sizeKB, modSec int32, frn uint64) int32 {
 	idx := m.t.appendOverlay(name, parent, kind, sizeKB, modSec, pinyin.Initials(name))
-	if m.frn != nil {
-		m.frn.Set(frn, idx)
+	if frn != 0 {
+		m.setFRN(frn, idx)
 	}
 	return idx
 }
@@ -247,7 +323,7 @@ func (m *Mutable) Kill(idx int32) {
 // 隐藏文件不收（隐藏目录照收）、reparse point 不跟进、排除规则照跑、
 // 父节点不在索引里就不收（父目录被排除或被删，整棵子树都不可达）。
 func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
-	if m.t == nil || m.frn == nil || c.FRN == 0 {
+	if m.t == nil || c.FRN == 0 {
 		return DeltaOp{}, false
 	}
 	// 改名会出两条记录（旧名/新名），旧名那条什么都不做：
@@ -256,7 +332,7 @@ func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
 		return DeltaOp{}, false
 	}
 	if c.Delete {
-		idx, ok := m.frn.Get(c.FRN)
+		idx, ok := m.lookupFRN(c.FRN)
 		if !ok {
 			return DeltaOp{}, false
 		}
@@ -273,7 +349,7 @@ func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
 		return DeltaOp{}, false
 	}
 
-	parent, ok := m.frn.Get(c.ParentFRN)
+	parent, ok := m.lookupFRN(c.ParentFRN)
 	if !ok {
 		return DeltaOp{}, false
 	}
@@ -303,7 +379,7 @@ func (m *Mutable) Apply(c Change, rule Rule) (DeltaOp, bool) {
 	// 同一个 FRN 已经有活条目：要么是重复记录（同名同父，忽略），
 	// 要么是改名（旧名字必须失效，否则两个名字都能搜到）。
 	var kill int32
-	if old, ok := m.frn.Get(c.FRN); ok && int(old) < m.t.Len() {
+	if old, ok := m.lookupFRN(c.FRN); ok && int(old) < m.t.Len() {
 		if m.t.KindOf(old) != KindDeleted {
 			if n := m.t.At(old); n != nil && n.Parent == parent && string(m.t.NameBytes(int(old))) == c.Name {
 				return DeltaOp{}, false

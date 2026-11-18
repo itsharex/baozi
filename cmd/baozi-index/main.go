@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -324,6 +325,13 @@ func runIndexLoop(ctx context.Context) {
 	lastFlush := time.Now()
 	lastFull := time.Now()
 	lastCfg := time.Now()
+	// 空闲判定：最近一次"真的有变化"的时刻，以及最近一次交回工作集的时刻。
+	lastChangeAt := time.Now()
+	lastTrimAt := time.Now()
+	// rejectOnce 让"读到但没用上"的详单只打一次，免得刷满日志。
+	rejectOnce := false
+	// lastRejectLog 给那条汇总行做限流（一分钟一行）。
+	var lastRejectLog time.Time
 
 	// flush 把攒下的增量写盘。主进程读它把自己的快照追平。
 	flush := func() {
@@ -369,6 +377,7 @@ func runIndexLoop(ctx context.Context) {
 			if nl, nb, e := rebuild(vols, cfg, dataDir, false); e != nil {
 				log.Printf("重建失败: %v", e)
 			} else {
+				live.Close() // 解开上一代的 .frn 映射，否则写新代次会被占用挡住
 				live, base = nl, nb
 			}
 			st = loadState(dataDir)
@@ -381,10 +390,18 @@ func runIndexLoop(ctx context.Context) {
 		// 每卷读一小段增量，不等内核（见 usn.Read 的注释：内核等待会整轮卡死）。
 		// 读到就立刻应用——这就是"实时"的全部。
 		applied := 0
+		read := 0
+		var firstSample *index.Change
 		for _, v := range vols {
 			next, _, err := v.Read(st.nextUsn(v.Letter()), st.journalID(v.Letter()), 0,
 				func(r *usn.Record) bool {
-					if op, ok := live.Apply(r.Change(v.Letter()), rule); ok {
+					read++
+					c := r.Change(v.Letter())
+					if firstSample == nil {
+						cc := c
+						firstSample = &cc
+					}
+					if op, ok := live.Apply(c, rule); ok {
 						ops = append(ops, op)
 						applied++
 					}
@@ -396,9 +413,37 @@ func runIndexLoop(ctx context.Context) {
 			}
 			st.setNext(v.Letter(), next)
 		}
+		// 读到了却一条都没用上：绝大多数情况下是"被排除目录里的变动"（Temp、数据目录自己
+		// 的心跳文件等），属于正常噪音，所以一分钟最多记一行；第一次额外打一份详单，
+		// 用来定位"父节点查不到 / 基座没挂上"这类真故障。
+		if read > 0 && applied == 0 {
+			if !rejectOnce {
+				rejectOnce = true
+				firstC := firstSample
+				if firstC != nil {
+					pIdx, pOK := live.LookupFRN(firstC.ParentFRN)
+					log.Printf("增量诊断: 表 %d 项 / 基座 %d 条；样本 name=%q frn=%016x parent=%016x 父命中=%v 下标=%d 父种类=%v",
+						live.Table().Len(), live.FRNBaseLen(), firstC.Name, firstC.FRN,
+						firstC.ParentFRN, pOK, pIdx,
+						func() index.Kind {
+							if !pOK {
+								return 0
+							}
+							return live.Table().KindOf(pIdx)
+						}())
+				}
+			}
+			if time.Since(lastRejectLog) >= time.Minute {
+				lastRejectLog = time.Now()
+				log.Printf("增量: 读到 %d 条 USN 记录，但一条都没用上", read)
+			}
+		}
 		if applied > 0 && time.Since(lastFlush) >= deltaFlushInterval {
 			log.Printf("增量 %d 条已应用（本代累计 %d 条）", applied, len(ops))
 			flush()
+		}
+		if applied > 0 {
+			lastChangeAt = time.Now()
 		}
 
 		// 收拾的必要性：墓碑让搜索多跳指针，arena 追加是纯占内存，
@@ -415,6 +460,7 @@ func runIndexLoop(ctx context.Context) {
 			if nl, nb, e := rebuild(vols, cfg, dataDir, false); e != nil {
 				log.Printf("重建失败: %v", e)
 			} else {
+				live.Close() // 解开上一代的 .frn 映射，否则写新代次会被占用挡住
 				live, base = nl, nb
 				st = loadState(dataDir)
 				st.Base = base
@@ -427,6 +473,19 @@ func runIndexLoop(ctx context.Context) {
 		// 不放在别处——持续有变化时会变成忙转，CPU 反而更难看。
 		time.Sleep(readPollInterval)
 		writeHeartbeat(dataDir)
+
+		// 空闲就把工作集交回系统（"空闲"＝这一小段时间一条增量都没有）。
+		//
+		// 这个进程的常驻大部分是**文件映射页**（索引本体 74MB + FRN 表 21MB），
+		// 它们本来就是干净的、可以随时丢掉再读回来；只要进程一直活着，Windows
+		// 不会主动去收一个"安静"的进程的页，于是任务管理器上就一直显示一百多兆。
+		// 每 idleTrimInterval 交回一次，数字立刻回到十几兆，而下次真要用到时只是
+		// 一次软缺页（同一次读盘的量，几十微秒）。
+		if applied == 0 && time.Since(lastChangeAt) >= idleTrimInterval &&
+			time.Since(lastTrimAt) >= idleTrimInterval {
+			trimWorkingSet()
+			lastTrimAt = time.Now()
+		}
 
 		// 配置每 5 分钟重新读一次（根目录/排除规则变了要尽快生效）
 		if time.Since(lastCfg) >= 5*time.Minute {
@@ -442,6 +501,7 @@ func runIndexLoop(ctx context.Context) {
 					if nl, nb, e := rebuild(vols, cfg, dataDir, false); e != nil {
 						log.Printf("重建失败: %v", e)
 					} else {
+						live.Close() // 解开上一代的 .frn 映射，否则写新代次会被占用挡住
 						live, base = nl, nb
 						st = loadState(dataDir)
 						st.Base = base
@@ -455,6 +515,25 @@ func runIndexLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// idleTrimInterval 是"空闲多久就把工作集交回系统"。
+const idleTrimInterval = 60 * time.Second
+
+// procSetProcessWorkingSetSize 是 kernel32 的进程工作集接口。
+var procSetProcessWorkingSetSize = windows.NewLazySystemDLL("kernel32.dll").
+	NewProc("SetProcessWorkingSetSize")
+
+// trimWorkingSet 把可回收的页交回系统。
+// 调用时传 -1/-1：由系统按当前可用内存决定，效果等同于 EmptyWorkingSet ——
+// 把这些只读文件映射（索引本体 + FRN 表）从工作集里摘出去。页不会被丢弃，
+// 只是回到 standby 列表，下次访问是软缺页（几十微秒）。
+func trimWorkingSet() {
+	if procSetProcessWorkingSetSize.Find() != nil {
+		return
+	}
+	// 伪句柄 -1 就是当前进程，省掉 GetCurrentProcess 的两个返回值。
+	procSetProcessWorkingSetSize.Call(^uintptr(0), ^uintptr(0), ^uintptr(0))
 }
 
 // rootsChanged 判断索引根目录集合是否变了。
@@ -543,31 +622,56 @@ func rebuild(vols []*usn.Volume, cfg *config.Config, dataDir string, first bool)
 	//
 	// 换成只读基座后语义不变：基座只读、增量全部走 overlay（appendOverlay /
 	// markDead），和主进程那边是同一套结构。FRN → 下标的映射在 BuildAll 里已经
-	// 建好，而落盘顺序就是内存下标顺序，所以直接复用，不必把 FRN 落盘。
-	//
-	// 顺带的好处：服务端和主进程映射的是同一个文件，Windows 下同一文件的映射区
-	// 共享物理页，常驻的那十几兆不会翻倍。
+	// 建好，而落盘顺序就是内存下标顺序，所以下标可以直接复用，不必把 FRN 落盘
+	// 进 bin —— 但那张堆表本身要落成旁挂文件（见下），否则它就是这个进程里
+	// 最大的一块常驻内存。
 	tSave = time.Now()
 	tab = nil
 	mapped, _, err := index.Load(binPath)
 	if err != nil {
 		return nil, 0, fmt.Errorf("回映射索引: %w", err)
 	}
-	// 稳态把 GC 目标压到 40%：活堆只有 33MB（其中 26MB 是 FRN 映射表），
-	// 默认 100% 会让 Go 一直留着 66MB 的空闲区不放——实测 HeapSys 759MB、
-	// 已归还 702MB，剩下的 57MB 就是"目标堆"留的余量。服务平时几乎不分配，
-	// 压低目标只多几次可忽略的 GC，却能把这 30 多 MB 直接减掉。
-	// 先设目标再 FreeOSMemory，归还量才按新目标算。
-	debug.SetGCPercent(40)
+	// 把 177 万对 (FRN, 下标) 排好序写成 index-<代>.frn，再映射回来当基座：
+	// 那张 30MB 的开放寻址表（2.6M 槽 × 12 字节）换成 file-backed 页。
+	// 写不出来就退回堆上那份 —— 宁可多占 30MB，也不能让增量查不到 FRN。
+	var mut *index.Mutable
+	frnPath, ferr := index.SaveFRNFile(index.FRNPathFor(binPath), frn)
+	if ferr != nil {
+		log.Printf("FRN 表落盘失败（退回堆表 %d 条）: %v", frn.Len(), ferr)
+		mut = index.NewMutable(mapped, frn)
+	} else if ff, lerr := index.LoadFRNFile(frnPath); lerr != nil {
+		log.Printf("FRN 表映射失败（退回堆表 %d 条）: %v", frn.Len(), lerr)
+		mut = index.NewMutable(mapped, frn)
+	} else {
+		frn = nil // 堆表到此可以回收
+		mut = index.NewMutableBase(mapped, ff)
+	}
+	// 稳态把 GC 目标压到 30%：FRN 改成映射后活堆只剩增量尾巴和拼音表（几 MB），
+	// 默认 100% 会让 Go 留着几倍的空闲区不放。服务平时几乎不分配，压低目标
+	// 只多几次可忽略的 GC，却能把这几十 MB 直接减掉。先设目标再 FreeOSMemory，
+	// 归还量才按新目标算。
+	debug.SetGCPercent(30)
 	debug.FreeOSMemory()
 	if os.Getenv("BAOZI_IDXPROFILE") != "" {
 		log.Printf("建索引分段: 回映射 %v", time.Since(tSave).Round(time.Millisecond))
 	}
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
-	log.Printf("索引常驻: 活堆 %d MB / 向系统要了 %d MB / 已归还 %d MB",
-		ms.HeapAlloc/(1<<20), ms.HeapSys/(1<<20), ms.HeapReleased/(1<<20))
-	return index.NewMutable(mapped, frn), base, nil
+	log.Printf("索引常驻: 活堆 %d MB / 向系统要了 %d MB / 已归还 %d MB / FRN %d 条（基座 %d 映射 + 增量 %d 堆）",
+		ms.HeapAlloc/(1<<20), ms.HeapSys/(1<<20), ms.HeapReleased/(1<<20),
+		mut.FRNCount(), mut.FRNBaseLen(), mut.FRNOvLen())
+	// BAOZI_IDXHEAP=<路径> 时落一份堆快照，用来回答"这几十 MB 到底是谁占的"。
+	if p := os.Getenv("BAOZI_IDXHEAP"); p != "" {
+		if f, e := os.Create(p); e == nil {
+			_ = pprof.WriteHeapProfile(f)
+			f.Close()
+			log.Printf("堆快照已写入 %s", p)
+		}
+	}
+	// 注意返回的是 mut：它要么握着映射基座（正常路径），要么握着堆表（落盘失败时的退路）。
+	// 这里绝不能重新 NewMutable(mapped, frn)——frn 成功落盘时已经被置 nil，
+	// 那样返回的 Mutable 就一个 FRN 也查不到，所有增量会被静默丢弃。
+	return mut, base, nil
 }
 
 // ---------------------------------------------------------------- 卷与状态文件

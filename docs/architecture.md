@@ -1592,7 +1592,7 @@ binPath, err := index.Save(...)
 total := tab.Len()
 tab = nil                        // 300 MB 的活表在这里放手
 mapped, _, err := index.Load(binPath)
-return index.NewMutable(mapped, frn), base, nil
+return mut, base, nil            // mut 是握映射基座（或退回堆表）的那个，见第四轮
 ```
 
 三件事让这个改动几乎零成本：
@@ -1640,6 +1640,55 @@ GC 反复打断。
 `gc=65` 之后曲线完全躺平（`heap=97 inuse=111 sys=264`，几十轮采样不变）。
 第三轮之后 `heap=8MB sys=16MB`——索引已经不在堆里了，剩下的 WS 是玻璃的全屏快照、
 图标缩略图缓存和 D3D 表面，跟索引规模无关。
+
+### 第四轮：FRN 表落成旁挂文件 + 空闲交回工作集（WS 29 MB）
+
+第三轮把索引本体换成了映射，但 WS 仍在 100 MB 上下，而且 Go 活堆里还压着 33 MB。
+`go tool pprof -top -inuse_space`（`BAOZI_IDXHEAP=<路径>` 落快照）一眼就能看出是谁：
+`FRNMap.alloc` 30720 kB，占活堆 83%。
+
+那是 `FRN → 下标` 的开放寻址表：177 万条按 0.8 装载率得开 2.6M 槽 × 12 B ≈ 30 MB。
+它和索引本体一样是**只读数据**，没有任何理由常驻堆。
+
+改法（`internal/index/frnfile.go` 新增）：
+
+1. 重建末尾把 `(frn, idx)` **按 frn 升序**写成旁挂文件 `index-<代>.frn`
+   （头 16 B：`BZFR` / ver=1 / count；记录 12 B：frn u64 + idx u32），177 万条 21 MB。
+2. 服务端 `LoadFRNFile` 映射进来，查一次是**二分**（21 步、局部性好，比原来那趟随机探针
+   还便宜），堆里只剩"重建之后新增/改名的那几十上百条"。
+3. `Mutable` 加 `base *FRNFile`，`NewMutableBase` 用它当基座；`lookupFRN` **增量优先、
+   再查基座**（改名会把老 FRN 指向新下标，顺序不能反）；`setFRN` 只写增量。
+4. 落盘/映射失败就退回堆表（日志 `FRN 表落盘失败（退回堆表 N 条）`）——宁可多占 30 MB，
+   也不能让增量查不到 FRN。
+
+再加一手"空闲就把工作集交回系统"：`idleTrimInterval=60s`，条件满足时调
+`SetProcessWorkingSetSize(-1, -1)`（效果等同 `EmptyWorkingSet`）。它**不丢数据**，
+只是把干净页从工作集摘回 standby，下次访问是软缺页。之所以要做：这些页是只读文件映射，
+进程安静时 Windows 从不主动收，任务管理器就一直挂着一百多兆。
+
+| 指标 | 第三轮 | 第四轮 |
+|---|---|---|
+| WorkingSet | 102 MB | **28.6 MB**（空闲后） |
+| 私有提交 | 108 MB | 68.5 MB |
+| Go 活堆 | 33 MB | **3 MB** |
+| `.bin` + `.frn` 映射 | 73.8 MB | 73.8 + 20.2 MB（按需驻留） |
+
+**这一轮踩的坑（值得单独记住）**：`rebuild()` 末尾当时还是
+`return index.NewMutable(mapped, frn), base, nil`。FRN 成功落盘后 `frn` 被置 nil，
+于是返回给 `runIndexLoop` 的 `Mutable` **一个 FRN 也查不到**——所有 USN 记录都在
+`Apply` 里被静默丢掉（副作用是进程全程"空闲"，WS 反而一直是被 trim 过的 3 MB 假象）。
+症状只有两行：服务日志 `增量: 读到 N 条 USN 记录，但一条都没用上`、面板日志停在
+`服务已更新快照` 之后再没有 `已同步 N 条变化`。诊断靠两个小工具：
+
+- `go run ./tools/frnreplay -bin <index-xxx.bin> -frn <index-xxx.frn> -vol C -state <index.progress.json> -data <数据目录> -limit 30`
+  用服务端那套结构（映射表 + 映射基座 + 覆盖层）回放一段 USN，逐条打出
+  `frn / parent / create / del / dir / reparse / hidden / 应用结果`，
+  哪道判断挡住的、父节点到底在不在基座里，一眼就看见（这个工具反而证明 Apply 本身没问题）。
+- `go run ./tools/frnprobe -file <index-xxx.frn> -key 0x00020000000b083a`
+  直接查某个文件号在旁挂表里能不能命中，并打印表头几条记录的键
+  （键的高 16 位是盘符：`volKey` 把"卷内唯一"的 FRN 提升成全局唯一）。
+
+教训：**"进程不干活"和"进程内存低"是两件事**，前者永远先查链路有没有断，再谈优化。
 
 ### 踩过的坑
 
