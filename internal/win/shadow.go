@@ -328,18 +328,29 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 			}
 			for ly := 0; ly < k; ly++ {
 				for lx := 0; lx < k; lx++ {
-					cc := cov.cov[ly*k+lx]
-					// band 是圆角边框弧那一条（弧**内侧** borderW 像素）的覆盖率：
-					// 直边的边框线由面板自己画，弧这一段以前靠月牙描，现在也归这层。
-					bb2 := cov.band[ly*k+lx]
-					// seam 是紧贴弧边界的那 1 像素（弧内侧 1px）。
-					// 为什么必须把它涂实：面板在区域边界上会漏一格 #FFFFFF
-					// （mygo 那套圆角是"给客户端画个白底再裁形"，边界那一列没被内容盖住），
-					// 半透明地叠什么色都会透出那道白 —— 用户看到的就是"角上一道白线/漏光"。
-					// 涂成不透明的边框色，白线就彻底没了，观感也和四条直边的边框线一致。
-					sm := cov.seam[ly*k+lx]
-					if cc <= 0 && bb2 <= 0 && sm <= 0 {
-						continue // 弧内深处：面板自己的玻璃，别插手
+					idc := cov.idc[ly*k+lx]
+					// 判断"这个像素在弧内还是弧外"必须用**像素中心的几何位置**，
+					// 不能用 cc：cc 是个 2px 宽的软边系数（0.5 - 距离/2），所以弧内侧
+					// 还有 1px 落进 cc>0 —— 那一段被当成弧外刷成了桌面色，弧上的
+					// 亮边线因此断成一截截短划（放大看就是"毛边"）。
+					//
+					// 现在的分法：
+					//   弧内深处（距离 > borderW）→ 玻璃，不插手
+					//   弧内 1px（0 < 距离 ≤ borderW）→ 边框弧，不透明
+					//   弧外（距离 < 0）→ 桌面色，边界那一格按**面积覆盖率**掺边框色
+					bwF := float64(sp.BorderW)
+					if bwF < 1 {
+						bwF = 1
+					}
+					// 弧带往弧内多铺到 2.5px：面板自己的圆角裁剪和画出来的弧不完全
+					// 同心，两者之间会留下 1~2px 的缝，缝里两层窗口都是透明的，透出来
+					// 的就是壁纸本身（深色照片上表现为弧内侧一道暗色月牙）。
+					// 把弧带加厚正好盖住这条缝，也让弧看起来更像一条连续的线。
+					if bwF < 2.5 {
+						bwF = 2.5
+					}
+					if idc > bwF {
+						continue // 弧内深处：面板自己的玻璃
 					}
 					px, py := m+lx, m+ly
 					switch c {
@@ -357,16 +368,12 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 						continue
 					}
 					off := (py*int(tw) + px) * 4
-					if cc <= 0 {
-						// 边框弧：seam 段涂实，band 段按覆盖率做抗锯齿。
-						a := bb2
-						if sm > 0 {
-							a = 1
-						}
-						s.bits[off+0] = byte(bb * a)
-						s.bits[off+1] = byte(bg * a)
-						s.bits[off+2] = byte(br * a)
-						s.bits[off+3] = byte(a*255 + 0.5)
+					if idc > 0 {
+						// 边框弧：整圈不透明，遮住面板在区域边界上漏的那格白。
+						s.bits[off+0] = byte(bb)
+						s.bits[off+1] = byte(bg)
+						s.bits[off+2] = byte(br)
+						s.bits[off+3] = 255
 						continue
 					}
 					ix, iy := lx, ly
@@ -384,16 +391,15 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 					// 这块桌面色同样被阴影压暗，才和紧挨着的外圈接得上。
 					sa := cov.shade[ly*k+lx]
 					keep := 1 - sa
-					// 边界那一个像素必须按 cc（"这个像素有多少面积在弧外"）把两侧
-					// 颜色混起来：弧外那一份是压暗的桌面色，剩下那一份是紧挨着的
-					// 边框线。以前是不管 cc 多大都整块铺桌面色 —— 覆盖率算了却只当
-					// 布尔用，边界实际是 1 位掩码，弧上就是一串 1 像素台阶，也就是
-					// 用户说的"角的毛边"。alpha 仍必须是 255：这块在面板轮廓外，
-					// 桌面是原样可见的，半透明会把边界那格的白漏出来。
-					t := cc
-					s.bits[off+0] = byte(cb*keep*t + bb*(1-t))
-					s.bits[off+1] = byte(cg*keep*t + bg*(1-t))
-					s.bits[off+2] = byte(cr*keep*t + br*(1-t))
+					// 边界那一格按**面积**混：inside 是这个像素有多少面积落在弧内
+					// （8×8 超采样得到），弧外那一份是压暗的桌面色，弧内那一份是
+					// 紧挨着的边框线。这样弧的边界是真正的 1px 抗锯齿斜坡，而不是
+					// 一条 1 位掩码的台阶。alpha 必须 255：这块在轮廓外，桌面原样
+					// 可见，半透明会把边界那格的白漏出来。
+					bs := cov.inside[ly*k+lx]
+					s.bits[off+0] = byte(cb*keep*(1-bs) + bb*bs)
+					s.bits[off+1] = byte(cg*keep*(1-bs) + bg*bs)
+					s.bits[off+2] = byte(cr*keep*(1-bs) + br*bs)
 					s.bits[off+3] = 255
 				}
 			}
@@ -554,11 +560,13 @@ func (s *Shadow) DumpAlpha(path string) error {
 // 镜像之后形状完全一样，所以一份就够。cov 是"这个像素有多少面积在圆角矩形之外"
 // （用它做抗锯齿），shade 是该点应叠加的阴影黑度（和外圈同一条曲线）。
 type cornerCoverageT struct {
-	size  int
-	cov   []float64 // 边界软化系数：1=完全在弧外、0=完全在弧内
-	shade []float64 // 同一位置该压多黑（和外圈阴影同曲线）
-	band  []float64 // 弧内侧 borderW 像素的边框覆盖率
-	seam  []float64 // 紧贴弧边界的 1px（弧内侧），要涂实遮住面板漏的白
+	size   int
+	cov    []float64 // 边界软化系数：1=完全在弧外、0=完全在弧内
+	shade  []float64 // 同一位置该压多黑（和外圈阴影同曲线）
+	band   []float64 // 弧内侧 borderW 像素的边框覆盖率
+	seam   []float64 // 紧贴弧边界的 1px（弧内侧），要涂实遮住面板漏的白
+	idc    []float64 // 像素中心到弧的有符号距离（正=弧内），内外判定用它
+	inside []float64 // 像素有多少面积在弧内（8×8 超采样），做边界抗锯齿
 }
 
 var (
@@ -577,11 +585,13 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 	const ss = 8
 	sub := 1.0 / float64(ss)
 	cov := cornerCoverageT{
-		size:  size,
-		cov:   make([]float64, size*size),
-		shade: make([]float64, size*size),
-		band:  make([]float64, size*size),
-		seam:  make([]float64, size*size),
+		size:   size,
+		cov:    make([]float64, size*size),
+		shade:  make([]float64, size*size),
+		band:   make([]float64, size*size),
+		seam:   make([]float64, size*size),
+		idc:    make([]float64, size*size),
+		inside: make([]float64, size*size),
 	}
 	r := float64(radius)
 	mf := float64(margin)
@@ -600,13 +610,14 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 	const aaW = 2.0
 	for ly := 0; ly < size; ly++ {
 		for lx := 0; lx < size; lx++ {
-			inBand, inSeam := 0, 0
+			inBand, inSeam, inAll := 0, 0, 0
 			for sy := 0; sy < ss; sy++ {
 				for sx := 0; sx < ss; sx++ {
 					fx := float64(lx) + (float64(sx)+0.5)*sub
 					fy := float64(ly) + (float64(sy)+0.5)*sub
 					id := insideDistance(fx, fy, r)
 					if id >= 0 {
+						inAll++
 						if id < bw {
 							inBand++
 						}
@@ -617,10 +628,13 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 				}
 			}
 			i := ly*size + lx
-			cov.cov[i] = math.Max(0, math.Min(1, 0.5-insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)/aaW))
+			idc := insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)
+			cov.idc[i] = idc
+			cov.inside[i] = float64(inAll) / float64(ss*ss)
+			cov.cov[i] = math.Max(0, math.Min(1, 0.5-idc/aaW))
 			cov.band[i] = float64(inBand) / float64(ss*ss)
 			cov.seam[i] = float64(inSeam) / float64(ss*ss)
-			d := -insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)
+			d := -idc
 			if d > 0 && d < mf {
 				f := 1 - d/mf
 				cov.shade[i] = constMaxAlpha * f * f * f
