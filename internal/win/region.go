@@ -13,11 +13,32 @@ var (
 	// gdi32 / user32 在 thumb.go、fullscreen.go 里已经建过，同一个包共用。
 	dwmapi                 = windows.NewLazySystemDLL("dwmapi.dll")
 	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
+	procCreateRectRgn      = gdi32.NewProc("CreateRectRgn")
 	procSetWindowRgn       = user32.NewProc("SetWindowRgn")
+	procGetWindowRgn       = user32.NewProc("GetWindowRgn")
 	procGetSystemMetrics   = user32.NewProc("GetSystemMetrics")
 	procDwmSetWindowAttr   = dwmapi.NewProc("DwmSetWindowAttribute")
 	procDwmExtendFrame     = dwmapi.NewProc("DwmExtendFrameIntoClientArea")
 )
+
+// HasRegion 判断窗口当前是否真的带着剪裁区域。
+//
+// GetWindowRgn 返回 ERROR（0）就是"没有区域"，1/2/3 都是"有"（空/简单/复杂）。
+// 用途只有一个：面板的四角偶尔会变回四个直角，说明句柄上的区域被系统清掉了，
+// 这时候补设一次就好（见 cmd/baozi 的 ensureShell）。
+func HasRegion(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	// GetWindowRgn 要把结果写进一个区域句柄里，随便造一个 1×1 的当容器。
+	rgn, _, _ := procCreateRectRgn.Call(0, 0, 1, 1)
+	if rgn == 0 {
+		return false
+	}
+	defer procDeleteObject.Call(rgn)
+	r, _, _ := procGetWindowRgn.Call(hwnd, rgn)
+	return r != 0
+}
 
 // effectWindow 是 DWM 画非客户区时的策略。没有它，这个窗口**根本没有阴影**：
 // 实测空闲时窗口外侧整条带全是桌面底色（#FFFFFF），拖动时才临时出现一圈

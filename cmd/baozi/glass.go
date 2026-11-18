@@ -814,6 +814,12 @@ func (a *application) applyRoundRegion() {
 		log.Print("玻璃: 设置窗口圆角区域失败")
 		return
 	}
+	// 设完立刻复查一次：这一行有两个用处 —— 一是证明"查得到区域"（ensureShell 的
+	// 判断就靠这个），二是把句柄记进日志，排查时能直接用外部工具对它做手脚。
+	if !win.HasRegion(hwnd) && !a.regionQueryLogged {
+		a.regionQueryLogged = true
+		log.Printf("玻璃: 区域设完复查不到（hwnd=0x%X），GetWindowRgn 可能不认这个窗口", hwnd)
+	}
 	// 这里**不再**给子窗口设区域。
 	//
 	// SetWindowRgn 是真的改变窗口形状，不只是画法：区域之外的鼠标事件不属于这个
@@ -912,6 +918,64 @@ func (a *application) followShadow() {
 
 func (a *application) shadowMargin() int {
 	return int(math.Round(float64(win.ShadowMargin) * float64(a.glassScale())))
+}
+
+// dragging 判断"刚才这几百毫秒里窗口正在被拖动/缩放"。
+// OnMove/OnResize 每来一条就把 dragUntil 往后推 600ms，停手之后它自然过期。
+func (a *application) dragging() bool {
+	until := a.dragUntil.Load()
+	return until != 0 && time.Now().UnixNano() < until
+}
+
+// ensureShell 检查"圆角区域 + 阴影层"这两件外观状态还在不在，缺了立刻补。
+//
+// 要这么一个兜底，是因为它们都是**别人手里**的状态：
+//
+//   - 圆角区域挂在面板的 HWND 上。Show/Hide、被别的窗口顶掉再拉回来、
+//     mygo 内部重建窗口时，系统都可能把这个区域清掉；区域一没，四角就是四个
+//     半透明的直角（玻璃一直铺到角上），看起来像"圆角坏了"。
+//   - 阴影层是另一个独立窗口，可能没上屏或被压到面板下面。
+//
+// 一次检查就是两次廉价的 Win32 查询（GetWindowRgn + IsWindowVisible），
+// 所以唤出之后可以按节拍复查；只有真的缺了才会付重画的代价。
+func (a *application) ensureShell(reason string) {
+	if a.frost == nil || a.shadow == nil {
+		return
+	}
+	// 用程序自己的开关当门，而不是问系统"窗口可见吗"：面板是 noRedirect 的
+	// 合成窗口，IsWindowVisible 在这类窗口上不可靠（实测会报 false），拿它当门
+	// 会让这里永远不干活 —— 那正是"偶尔四个直角、要再激活一次才好"活下来的原因。
+	if !a.panelUp.Load() {
+		return
+	}
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	hasRegion := win.HasRegion(hwnd)
+	shadowShown := a.shadow.Shown()
+	// 每次唤出后的前三次复查各记一行：这样"圆角/阴影什么时候丢、过了多久补上"
+	// 在日志里是可见的，不用等用户报现象再猜。三次之后只在真的补的时候记。
+	if a.shellProbes < 3 {
+		a.shellProbes++
+		log.Printf("外观复查 %s: 窗口区域=%v 阴影上屏=%v", reason, hasRegion, shadowShown)
+	}
+	if !hasRegion {
+		log.Printf("玻璃: 圆角区域丢了（%s），补设一次", reason)
+		a.applyRoundRegion()
+	}
+	// 拖动/缩放那 0.x 秒本来就要收起阴影层（见 OnResize 的注释），别在这里叫醒它。
+	if a.dragging() {
+		return
+	}
+	// 这里**每次复查都真的推一次** ShowWindow，而不是先问"它可见吗"：
+	// 状态标记和系统状态都可能骗人（实测出现过"标记说开着、窗口其实被藏了"，
+	// 于是这个自愈一次都不跑，四个直角就一直留着）。推一次的成本可以忽略，
+	// 返回值是"推之前是否已可见"，false 才说明真被藏过，这时重建一次位图。
+	if !a.shadow.ForceShow() {
+		log.Printf("阴影: 层被藏过（%s），强制补回", reason)
+		a.refreshShadow()
+	}
 }
 
 // clamp01 把值夹到 [0,1]。

@@ -688,40 +688,78 @@ func (s *Shadow) Move(x, y, m int) {
 	s.x, s.y = dst.X, dst.Y
 }
 
+// Show 让阴影层上屏。
+//
+// 这里**不能**只看缓存里的 shown 标志：窗口可能被系统或别的程序藏起来（隐藏/显示
+// 面板来回切、被任务栏预览、"显示桌面"之类的动作都会碰到），而我们手里的标志还是
+// true —— 那样 Show 会一直空转，阴影和四角那块桌面色就再也不回来，屏幕上就是
+// "四个半透明的直角"，只有下次先 Hide 再 Show 才好（这正是用户报的那个偶发毛病）。
 func (s *Shadow) Show() {
 	if s == nil || s.hwnd == 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.shown {
-		return
-	}
 	s.shown = true
+	if vis, _, _ := procIsWindowVisible.Call(s.hwnd); vis != 0 {
+		return // 已经真的在屏上，不必再 ShowWindow
+	}
 	procShowWindow.Call(s.hwnd, swShowNoActivate)
 }
 
+// ForceShow 无条件把阴影层推上屏，并把状态标记拉回"开着"。
+//
+// 和 Show 的区别：它不因为缓存标志或可见性查询而提前返回 —— 每次真的调一次
+// ShowWindow(SW_SHOWNOACTIVATE)（这个调用本身是幂等的，成本可以忽略）。
+// 返回值是"推之前它是不是已经可见"：false 说明确实被藏过（系统、别的程序、或者
+// 我们自己在缩放里收起来之后没补回来），调用方值得记一行日志、并且重建一次位图。
+func (s *Shadow) ForceShow() bool {
+	if s == nil || s.hwnd == 0 {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shown = true
+	// 先问一句"现在可见吗"只是为了给调用方一个日志用的返回值，
+	// ShowWindow 本身**每次都调** —— 它的可见性查询在这类分层窗口上会撒谎
+	// （实测窗口明明在合成、IsWindowVisible 却报 false），拿它当门就等于门永远打不开。
+	wasVisible := false
+	if vis, _, _ := procIsWindowVisible.Call(s.hwnd); vis != 0 {
+		wasVisible = true
+	}
+	procShowWindow.Call(s.hwnd, swShowNoActivate)
+	return wasVisible
+}
+
+// Hide 收起阴影层。同样按**真实可见性**决定要不要调 ShowWindow：
+// 缓存标志说"已经藏起来了"、窗口其实还亮着的话，就会在桌面上留一块孤零零的影
+// （面板藏了、影还在，用户会以为程序没退干净）。
 func (s *Shadow) Hide() {
 	if s == nil || s.hwnd == 0 {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.shown {
+	s.shown = false
+	if vis, _, _ := procIsWindowVisible.Call(s.hwnd); vis == 0 {
 		return
 	}
-	s.shown = false
 	procShowWindow.Call(s.hwnd, swHide)
 }
 
-// Shown 报告阴影现在是不是可见的。
+// Shown 报告阴影现在是不是**真的**可见（缓存标志 + 系统实际状态，两者都成立才算）。
 func (s *Shadow) Shown() bool {
-	if s == nil {
+	if s == nil || s.hwnd == 0 {
 		return false
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.shown
+	flag := s.shown
+	s.mu.Unlock()
+	if !flag {
+		return false
+	}
+	vis, _, _ := procIsWindowVisible.Call(s.hwnd)
+	return vis != 0
 }
 
 // Close 销毁阴影窗口。

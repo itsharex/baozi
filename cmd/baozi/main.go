@@ -192,6 +192,16 @@ type application struct {
 	// 每帧都重画四张图（外加四张 GPU 纹理）就是"缩放卡卡的"另一半原因。
 	// 月牙的边长只跟圆角半径有关，和面板多大无关，所以缩放期间沿用旧图完全正确。
 	cornerTimer *time.Timer
+	// regionQueryLogged 保证"设完区域却查不到"这条诊断只记一次（它一旦成立就是
+	// 每帧都成立，重复记只会刷日志）。
+	regionQueryLogged bool
+	// panelUp 是"面板此刻应该是开着的"这个事实（show 里置 true，hidePanel 里置 false）。
+	// 为什么不用 panel.IsVisible()：面板是 noRedirect 的合成窗口，系统的
+	// IsWindowVisible 在它身上会撒谎（实测报 false），而定期复查外观（ensureShell）
+	// 必须有个可靠的开关，否则一次都不跑。
+	panelUp atomic.Bool
+	// shellProbes 数"每次唤出之后已经记过几次外观复查"，用来给诊断行限流。
+	shellProbes int
 	// resizeFrames/resizeSum/resizeMax/resizeGapMax 只用来回答一个问题：用户拖得
 	// 很快的时候，到底是我们的回调慢，还是 Windows 把事件并掉了。停手时
 	// finishResize 打一行"缩放: 本轮 N 帧 …"，N 远小于鼠标移动次数就说明
@@ -2052,6 +2062,7 @@ func (a *application) placePanel(x, y int) {
 // hidePanel 收起面板时连阴影层一起收：阴影是另一个独立窗口，面板藏起来它不会
 // 自己消失（实测会孤零零留在桌面上，还会被下一次唤出的桌面取色采进去）。
 func (a *application) hidePanel() {
+	a.panelUp.Store(false)
 	a.hideShadow()
 	a.panel.Hide()
 	// 半分辨率整屏快照只在"面板开着"这段时间有用（四角弧外要按当前位置裁），
@@ -2205,11 +2216,21 @@ func clampPanelTo(x, y, w, h int, wa mygo.Rectangle) (int, int) {
 // 栈里能看出是阻塞在 WaitMessage、D3D 提交，还是我们自己的锁上。
 func (a *application) startWatchdog() {
 	go func() {
+		// 顺带当外观的定期复查：面板可见时每 5 拍（约 1 秒）验一次"圆角区域还在、
+		// 阴影层上屏了"，缺了就补。检查本身是两次廉价的 Win32 查询，不占 CPU；
+		// 之所以敢每秒查，是因为"偶尔变直角"这种毛病没法靠一次性的时序修复兜住。
+		beats := 0
 		for {
 			time.Sleep(200 * time.Millisecond)
-			if a.panel == nil || !a.panel.IsVisible() {
+			// 面板开着的判断用 panelUp（见它的注释），不用系统的 IsWindowVisible。
+			if a.panel == nil || !a.panelUp.Load() {
 				a.hangDumped.Store(false)
+				beats = 0
 				continue
+			}
+			beats++
+			if beats%5 == 0 && !a.dragging() {
+				mygo.RunOnMain(func() { a.ensureShell("空闲复查") })
 			}
 			until := a.dragUntil.Load()
 			tick := a.uiTick.Load()
@@ -2238,6 +2259,9 @@ func (a *application) show() {
 		log.Print("前台是全屏应用，忽略唤出")
 		return
 	}
+	// 先把这个开关立起来：后面的定期外观复查（ensureShell）以它为准。
+	a.panelUp.Store(true)
+	a.shellProbes = 0
 	// 上一次收起时阴影层可能还亮着（面板藏了，阴影是另一个窗口，不会自己消失），
 	// 这里先收掉：下面的桌面底色取样是从面板外侧实时取的，自己的阴影会把那几
 	// 个点压暗（实测角上取到 #D4D4D4 而不是真桌面）。
@@ -2259,11 +2283,19 @@ func (a *application) show() {
 	a.refilter()
 	// 玻璃要在 Show 之前抓：那一刻窗口还没上屏，抓到的才是它后面的画面。
 	a.refreshGlass()
+	// 圆角区域要在 Show **之前**就设好。
+	//
+	// 这个窗口是 noRedirect 合成的：第一帧如果按矩形合成，四角就是四块半透明的
+	// 直角；而 SetWindowRgn 的 bRedraw=0（为了缩放跟手，见 region.go）不会让窗口
+	// 重画，所以那一帧会一直留在屏幕上，直到下一次 Show 把它换掉 —— 用户看到的
+	// 就是"偶尔出现四个直角，再激活一次面板又消失了"。
+	a.applyRoundRegion()
 	a.panel.Show()
 	// 窗口区域：这块窗口是 noRedirect 合成的，圆角以外的像素透不出桌面、DWM 会
 	// 填白，所以形状只能靠区域切。半径比内容圆角大 glassRegionSlack，让那条 1 位
 	// 掩码的硬边落在四角月牙铺的纯桌面色里；弧本身的抗锯齿由月牙的 alpha 给。
 	// 区域同时决定 DWM 阴影的形状，这也是阴影能跟着圆角走的唯一办法。
+	// Show 内部会动窗口样式/尺寸，所以上屏后再设一次（两次都只是 1ms 级的调用）。
 	a.applyRoundRegion()
 	// 四角的桌面色要在窗口移到本次位置之后再取（取的是窗外 2px 的实时光片，
 	// 现在优先从刚刚抓的那张半分辨率快照里读，见 glass.go 的 colorAt）—— 这
@@ -2285,7 +2317,12 @@ func (a *application) show() {
 	a.panel.Update(func() { a.input.Focus() })
 	// 弹出过程结束后把最终位置记一次：这时它要么是配置里的值，要么是用户已经
 	// 拖过的新位置，两种都该落盘。（等于配置时 savePanelGeometry 会跳过写盘。）
-	time.AfterFunc(panelSettle+100*time.Millisecond, a.panelGeometryChanged)
+	// 顺便在这一刻复查一次外观状态：弹出动画里 mygo 会反复调 SetWindowPos、动窗口
+	// 样式，区域偶尔就是在这段时间被清掉的 —— 那正是"四个直角"出现的现场。
+	time.AfterFunc(panelSettle+100*time.Millisecond, func() {
+		a.panelGeometryChanged()
+		mygo.RunOnMain(func() { a.ensureShell("唤出动画结束后") })
+	})
 	log.Print("toggle: 显示面板")
 }
 
