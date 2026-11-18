@@ -165,7 +165,6 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 	}
 
 	outer := newRoundRect(cw, ch, 0, float64(r))
-	inner := newRoundRect(cw, ch, bw, float64(r))
 
 	halfW := float64(cw) / 2
 	halfH := float64(ch) / 2
@@ -320,13 +319,54 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 			}
 
 			sdOut := outer.sd(px, py)
-			// 覆盖率：距离边界 0.5px 以内线性过渡（外正内负），也就是 1 像素宽的
-			// 抗锯齿带 —— 弧上每一行因此有 2~3 个半覆盖像素，不再是 1 位台阶。
-			cOut := 0.5 - sdOut
-			if cOut >= 1 {
+			// 覆盖率。
+			//
+			// 以前是"距离边界 0.5px 以内线性过渡"——那只是**直边**的正确抗锯齿模型：
+			// 直边上一行像素的覆盖率确实只跟一个坐标有关，线性就准。但弧上不是：
+			// 弧在一个像素里转了十几度，像素中心到边界的那点距离推不出真正被盖住了
+			// 多少面积，于是每个像素差一两档、排成肉眼能数出来的台阶（"毛边"）。
+			//
+			// 现在贴着边界的那一圈（|sd| < 1.2px）改成 4×4 超采样：把像素切成 16 个
+			// 子格，各自判内/外，覆盖率是"数出来的面积"而不是"中心的距离"——这就是
+			// iced/cairo 那套覆盖率抗锯齿的做法，弧上也是 16 档过渡，不再有台阶。
+			// 只对边界那一圈做（整块 1136×660 里约 1 万像素），代价 ~1ms。
+			const sub = 4
+			var cOut, ringC float64
+			switch {
+			case sdOut < -1.2:
+				// 离边界超过一个像素，必为 1/1，不用算。
 				cOut = 1
-			} else if cOut <= 0 {
+				if sdOut > -1 {
+					ringC = 1 // 正好落在边框那 1px 里
+				}
+			case sdOut > 1.2:
 				cOut = 0
+			default:
+				o16 := 0
+				r16 := 0
+				for sy := 0; sy < sub; sy++ {
+					oy := (float64(sy)+0.5)/sub - 0.5
+					yy := py + oy
+					for sx := 0; sx < sub; sx++ {
+						xx := px + (float64(sx)+0.5)/sub - 0.5
+						d := outer.sd(xx, yy)
+						if d < 0 {
+							o16++
+							// 边框环单独数：只数"边界往里 1px"那一窄条。
+							//
+							// 以前用 cOut - cIn 当环的覆盖率 —— 那是"两个面积之差"，
+							// 直边上正好 1，弧上却被抗锯齿摊薄了：一条 45° 的弧，
+							// 1px 宽的带子在每个像素里只占七成，于是直边的线是实的、
+							// 弧上的线是虚的，看起来就是"圆角的地方没有边框了"。
+							// 现在直接数这条带子压住了多少子格，弧上也能到满格。
+							if d > -1 {
+								r16++
+							}
+						}
+					}
+				}
+				cOut = float64(o16) / (sub * sub)
+				ringC = float64(r16) / (sub * sub)
 			}
 			if cOut <= 0 {
 				// 完全在形状外面（四角三角）：铺桌面像素，和窗口外面的桌面同源。
@@ -352,21 +392,14 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 				out.Pix[o+3] = 255
 				continue
 			}
-			sdIn := inner.sd(px, py)
-			cIn := 0.5 - sdIn
-			if cIn >= 1 {
-				cIn = 1
-			} else if cIn <= 0 {
-				cIn = 0
-			}
 
-			// 边框带 = 外覆盖率 - 内覆盖率：它就是那条 1px 边线，跟着弧走、
-			// 自带覆盖率，所以弧和直边是同一根线，没接缝。
-			ring := cOut - cIn
-			if ring < 0 {
-				ring = 0
+			// 边框带：宽度 1px、贴着形状边界、覆盖率是数出来的（见上面 r16），
+			// 所以直边和弧上是同一条实线，弧上不会再"淡掉""断掉"。
+			ring := ringC
+			if ring > cOut {
+				ring = cOut
 			}
-			wGlass := cIn
+			wGlass := cOut - ring
 			wDesk := 1 - cOut
 
 			if testBacking != 0 {
