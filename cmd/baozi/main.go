@@ -344,6 +344,13 @@ type pinMove struct {
 // 没有，写进去只会静默回退成别的。
 const panelFont = "Microsoft YaHei UI"
 
+// panelBorder 是面板要不要那一圈 1px 边线。
+//
+// 现在关掉：整圈边线（直边那八条细线 + 自绘层那条环）都不画，面板只剩玻璃到
+// 壁纸的柔和过渡。要恢复边框把它改回 true，并把 glass.go 里的 BorderW 一起
+// 改回去。
+const panelBorder = false
+
 // fontOn 让视图测试能跳过设字体。mygo 解析字体族要回 native 主线程，
 // 而 ui.Tester 下没有主循环，设了会永久阻塞——和 Shell.* / mygo.App.* 在测试里
 // 卡死的毛病一样。测试环境本来也不需要看字形。
@@ -671,8 +678,7 @@ func (a *application) view(c *ui.Context) {
 				// 同色，看不出重叠；压到弧外的那一点点由最后绘制的四角月牙盖住
 				// （月牙的弧外区域铺的是该角的真实桌面色，alpha 不透明）。
 				const edgeDip float32 = 1
-				const edgeOverlap float32 = 1
-				// 内侧柔化：弧带是"1 DIP 满覆盖 + 内外各 1 DIP 柔化"，视觉宽度约 2 DIP；
+				const edgeOverlap float32 = 1 // 内侧柔化：弧带是"1 DIP 满覆盖 + 内外各 1 DIP 柔化"，视觉宽度约 2 DIP；
 				// 直边线只是一条 1 DIP 的实心矩形，没有柔化。两者在弧的端点接上时，
 				// 接口处宽度从 1 DIP 突变到 2 DIP，看上去就是"一条细直线接到一段较粗的
 				// 弧上"——用户描出来的那个 Γ，左边距面板右边正好 30px（= 弧半径）、
@@ -698,22 +704,24 @@ func (a *application) view(c *ui.Context) {
 				r0 := float32(glassRadius) - edgeOverlap
 				innerW := wDip - 2*r0
 				innerH := hDip - 2*r0
-				ui.Column(c).Absolute().Left(r0).Top(0).
-					Size(innerW, one).Background(t.Border)
-				ui.Column(c).Absolute().Left(r0).Top(one).
-					Size(innerW, soft).Background(edgeSoft)
-				ui.Column(c).Absolute().Left(r0).Top(hDip-one).
-					Size(innerW, one).Background(t.Border)
-				ui.Column(c).Absolute().Left(r0).Top(hDip-one-soft).
-					Size(innerW, soft).Background(edgeSoft)
-				ui.Column(c).Absolute().Left(0).Top(r0).
-					Size(one, innerH).Background(t.Border)
-				ui.Column(c).Absolute().Left(one).Top(r0).
-					Size(soft, innerH).Background(edgeSoft)
-				ui.Column(c).Absolute().Left(wDip-one).Top(r0).
-					Size(one, innerH).Background(t.Border)
-				ui.Column(c).Absolute().Left(wDip-one-soft).Top(r0).
-					Size(soft, innerH).Background(edgeSoft)
+				if panelBorder {
+					ui.Column(c).Absolute().Left(r0).Top(0).
+						Size(innerW, one).Background(t.Border)
+					ui.Column(c).Absolute().Left(r0).Top(one).
+						Size(innerW, soft).Background(edgeSoft)
+					ui.Column(c).Absolute().Left(r0).Top(hDip-one).
+						Size(innerW, one).Background(t.Border)
+					ui.Column(c).Absolute().Left(r0).Top(hDip-one-soft).
+						Size(innerW, soft).Background(edgeSoft)
+					ui.Column(c).Absolute().Left(0).Top(r0).
+						Size(one, innerH).Background(t.Border)
+					ui.Column(c).Absolute().Left(one).Top(r0).
+						Size(soft, innerH).Background(edgeSoft)
+					ui.Column(c).Absolute().Left(wDip-one).Top(r0).
+						Size(one, innerH).Background(t.Border)
+					ui.Column(c).Absolute().Left(wDip-one-soft).Top(r0).
+						Size(soft, innerH).Background(edgeSoft)
+				}
 			})
 			// 四角的月牙最后画，压住磨砂图、底色和边线：弧外是该角真实的桌面色，
 			// 弧上按覆盖率渐隐，弧内透明露出玻璃 —— 见 glass.go 的

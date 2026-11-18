@@ -697,6 +697,38 @@ func (a *application) colorAt(x, y int) (win.PointColor, bool) {
 // 角上的月牙要铺的是**这个角附近**的色 —— 用一个平均色垫四个角，壁纸色调一不均
 // 就显出一块和旁边不一样的色，圆角的硬边（窗口区域是 1 位掩码、没有抗锯齿）
 // 立刻露出来。
+// pickEdgeGlass 取四条直边**中点**内侧的玻璃色（上、右、下、左）。
+//
+// 最外那一圈像素要用玻璃色补齐（右边、下边那半格不补就被 DWM 补成白色），
+// 只拿四角颜色插值会在边中点偏色（实测右侧边中点真实玻璃 (181,191,201)，
+// 插出来 (167,174,177)，深了一档，看着就是一条细边）。磨砂在面板上是随壁纸
+// 渐变的，所以每条边中间也得采一个点。
+func (a *application) pickEdgeGlass(x, y, w, h int) [4]uint32 {
+	var out [4]uint32
+	small := a.frostSmall
+	if small == nil || small.Rect.Dx() == 0 || a.screenW <= 0 || a.screenH <= 0 {
+		return out
+	}
+	sw, sh := small.Rect.Dx(), small.Rect.Dy()
+	const inset = 12
+	pts := [4][2]int{
+		{x + w/2, y + inset},
+		{x + w - 1 - inset, y + h/2},
+		{x + w/2, y + h - 1 - inset},
+		{x + inset, y + h/2},
+	}
+	for i, p := range pts {
+		sx := (p[0] - a.screenX) * sw / a.screenW
+		sy := (p[1] - a.screenY) * sh / a.screenH
+		if sx < 0 || sy < 0 || sx >= sw || sy >= sh {
+			continue
+		}
+		o := small.PixOffset(sx, sy)
+		out[i] = uint32(small.Pix[o])<<16 | uint32(small.Pix[o+1])<<8 | uint32(small.Pix[o+2])
+	}
+	return out
+}
+
 // pickGlassColors 取四角各自的"面板玻璃本体"颜色（左上、右上、左下、右下），
 // 给阴影层铺弧那一圈的斜坡用。数据源是唤出前做好的磨砂小图：那上面任意一点
 // 就是面板玻璃在该位置的颜色（磨砂 + 压白之后的结果），不需要拍屏幕 —— 面板
@@ -951,14 +983,18 @@ func (a *application) refreshShadow() {
 	gl := a.pickGlassColors(x, y, w, h)
 	ok := a.shadow.Place(hwnd, win.ShadowSpec{
 		X: x, Y: y, W: w, H: h,
-		Radius:       r,
-		Margin:       a.shadowMargin(),
-		Corners:      patches,
-		Border:       a.cornerEdge,
-		BorderW:      int(math.Round(float64(s))),
+		Radius:  r,
+		Margin:  a.shadowMargin(),
+		Corners: patches,
+		Border:  a.cornerEdge,
+		// 边框线不画了（见 main.go 的 panelBorder）。右边、下边那格白由磨砂图多铺
+		// 两个像素盖掉（main.go 里的 extra），这里不再补色 —— 采样色和真实玻璃总差
+		// 一两档，1px 的色差本身就是一条细边。
+		BorderW:      0,
 		Desk:         uint32(a.deskColor.R)<<16 | uint32(a.deskColor.G)<<8 | uint32(a.deskColor.B),
 		Glass:        gl[0],
 		GlassCorners: [4]uint32{gl[0], gl[1], gl[2], gl[3]},
+		EdgeGlass:    a.pickEdgeGlass(x, y, w, h),
 	})
 	if d := time.Since(t0); d > 3*time.Millisecond {
 		log.Printf("阴影: 重建 %.2fms（位图 %.2f + 上传 %.2f）",

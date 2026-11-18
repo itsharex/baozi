@@ -135,7 +135,15 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 	// （不透明，能盖住 1 位台阶），区域和弧对齐就不会再留出那条白带。
 	const regionRadiusPad = 0
 	rgnRadius := radius + regionRadiusPad
-	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(w), uintptr(h), uintptr(rgnRadius*2), uintptr(rgnRadius*2))
+	// 右边多留的那一列在**客户区之外**（窗口矩形比客户区宽 1px），里面没有内容，
+	// DWM 合成时把它填成纯白 —— 以前靠自绘层描一圈边框盖着，边框去掉之后就是贴着
+	// 边沿的一道白线。区域收到 w-1，这一列直接被切掉，问题从根上没了。
+	// 只收右边：实测下边那格内容能盖满（(224,224,224)），收掉会少一行内容。
+	rw := w
+	if rw > 2 {
+		rw--
+	}
+	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(rw), uintptr(h), uintptr(rgnRadius*2), uintptr(rgnRadius*2))
 	if rgn == 0 {
 		return false
 	}

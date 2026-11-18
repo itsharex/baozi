@@ -184,6 +184,11 @@ type ShadowSpec struct {
 	// GlassCorners 是四角各自的玻璃色（左上、右上、左下、右下），0 表示用 Glass。
 	// 壁纸是照片时四角明暗差很远，一个全局色会在角上露出一条异色的发丝。
 	GlassCorners [4]uint32
+	// EdgeGlass 是四条直边**中点**内侧的玻璃色（上、右、下、左），0 表示不用。
+	// 最外那一圈像素要涂成玻璃色补齐（否则右边/下边那半格会被 DWM 补白），而玻璃
+	// 是渐变的：只用四角颜色插值，边中点那里会偏色，看起来又是一条细边。有了
+	// 中点色，每条边就是"角→中点→角"两段插值，和旁边的玻璃贴得紧。
+	EdgeGlass [4]uint32
 }
 
 func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
@@ -433,10 +438,66 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	// #FFFFFF），看上去就是"边框里面还有一条线"；上边、左边从 0 起算，没有这个
 	// 偏差，所以只坏在右下两边。这一层是按**整数物理像素**布局的（矩形就落在
 	// 面板的窗口矩形上），在这儿描一圈永远对得齐，顺手把那格亮底盖掉。
+	// 最外那一圈像素：现在**不画边框线**了（用户要求去掉），但这一格必须涂上
+	// 东西 —— 面板的 DIP 宽高换成物理像素不是整数（909 DIP × 1.25 = 1136.25），
+	// 右边和下边最后一格只盖到 0.25 格，内容层那点覆盖率被 DWM 补成白色，屏幕上
+	// 就是紧贴边沿的一列白（实测右侧 #FCFDFF）。涂成玻璃色等于"把玻璃补到边沿"，
+	// 看不出有线，也不会漏白。所以这里用的颜色是四角玻璃色的平均，不是边框色。
 	if sp.BorderW > 0 && w >= 4 && h >= 4 {
-		br2 := byte((sp.Border >> 16) & 0xFF)
-		bg2 := byte((sp.Border >> 8) & 0xFF)
-		bb2 := byte(sp.Border & 0xFF)
+		// 四角玻璃色按位置插值，而不是取一个平均值：磨砂在整块面板上是渐变的，
+		// 用平均色会在这条 1px 上显出一圈偏灰偏蓝的线（实测 (184,199,207) 夹在
+		// (166,208,234) 和 (193,216,232) 之间）—— 那就又变成一条边框了。
+		var gc [4][3]float64
+		var have [4]bool
+		for i, g := range sp.GlassCorners {
+			if g == 0 {
+				continue
+			}
+			gc[i] = [3]float64{float64(g >> 16 & 0xFF), float64(g >> 8 & 0xFF), float64(g & 0xFF)}
+			have[i] = true
+		}
+		// 四条边的中点玻璃色（上、右、下、左），有的话每边就变成两段插值。
+		var em [4][3]float64
+		var emHave [4]bool
+		for i, g := range sp.EdgeGlass {
+			if g == 0 {
+				continue
+			}
+			em[i] = [3]float64{float64(g >> 16 & 0xFF), float64(g >> 8 & 0xFF), float64(g & 0xFF)}
+			emHave[i] = true
+		}
+		if !have[0] && !have[1] && !have[2] && !have[3] && sp.Glass != 0 {
+			c := [3]float64{float64(sp.Glass >> 16 & 0xFF), float64(sp.Glass >> 8 & 0xFF), float64(sp.Glass & 0xFF)}
+			gc = [4][3]float64{c, c, c, c}
+			have = [4]bool{true, true, true, true}
+		}
+		fallback := [3]float64{
+			float64(sp.Border >> 16 & 0xFF),
+			float64(sp.Border >> 8 & 0xFF),
+			float64(sp.Border & 0xFF),
+		}
+		colorOf := func(i int) [3]float64 {
+			if have[i] {
+				return gc[i]
+			}
+			for j := 0; j < 4; j++ {
+				if have[j] {
+					return gc[j]
+				}
+			}
+			return fallback
+		}
+		lerp := func(a, b [3]float64, t float64) (byte, byte, byte) {
+			if t < 0 {
+				t = 0
+			}
+			if t > 1 {
+				t = 1
+			}
+			return byte(a[0] + (b[0]-a[0])*t + 0.5),
+				byte(a[1] + (b[1]-a[1])*t + 0.5),
+				byte(a[2] + (b[2]-a[2])*t + 0.5)
+		}
 		// 圆角那一段由上面的弧带负责，直边从弧的切点开始。
 		rInset := int(math.Ceil(r))
 		if rInset > w/2 {
@@ -445,16 +506,36 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 		if rInset > h/2 {
 			rInset = h / 2
 		}
-		setEdge := func(px, py int) {
+		setEdge := func(px, py int, r8, g8, b8 byte) {
 			if px < 0 || px >= twi || py < 0 || py >= thi {
 				return
 			}
 			o := (py*twi + px) * 4
 			// 位图是 BGRA（和上面弧带那段一致：索引 0 是蓝）
-			s.bits[o+0] = bb2
-			s.bits[o+1] = bg2
-			s.bits[o+2] = br2
+			s.bits[o+0] = b8
+			s.bits[o+1] = g8
+			s.bits[o+2] = r8
 			s.bits[o+3] = 255
+		}
+		spanX := float64(w - 1 - 2*rInset)
+		if spanX < 1 {
+			spanX = 1
+		}
+		spanY := float64(h - 1 - 2*rInset)
+		if spanY < 1 {
+			spanY = 1
+		}
+		gTL, gTR, gBL, gBR := colorOf(0), colorOf(1), colorOf(2), colorOf(3)
+		// 两段插值：0..0.5 从前一个角到中点，0.5..1 从中点到后一个角。
+		// 中点没有就退回两端直线插值。
+		seg := func(a, mid, b [3]float64, hasMid bool, t float64) (byte, byte, byte) {
+			if !hasMid {
+				return lerp(a, b, t)
+			}
+			if t <= 0.5 {
+				return lerp(a, mid, t*2)
+			}
+			return lerp(mid, b, (t-0.5)*2)
 		}
 		bw := sp.BorderW
 		if bw > 4 {
@@ -462,12 +543,18 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 		}
 		for k := 0; k < bw; k++ {
 			for px := m + rInset; px < m+w-rInset; px++ {
-				setEdge(px, m+k)     // 上边
-				setEdge(px, m+h-1-k) // 下边
+				t := float64(px-m-rInset) / spanX
+				r8, g8, b8 := seg(gTL, em[0], gTR, emHave[0], t)
+				setEdge(px, m+k, r8, g8, b8) // 上边
+				r8, g8, b8 = seg(gBL, em[2], gBR, emHave[2], t)
+				setEdge(px, m+h-1-k, r8, g8, b8) // 下边
 			}
 			for py := m + rInset; py < m+h-rInset; py++ {
-				setEdge(m+k, py)     // 左边
-				setEdge(m+w-1-k, py) // 右边
+				t := float64(py-m-rInset) / spanY
+				r8, g8, b8 := seg(gTL, em[3], gBL, emHave[3], t)
+				setEdge(m+k, py, r8, g8, b8) // 左边
+				r8, g8, b8 = seg(gTR, em[1], gBR, emHave[1], t)
+				setEdge(m+w-1-k, py, r8, g8, b8) // 右边
 			}
 		}
 	}
