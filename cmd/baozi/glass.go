@@ -58,14 +58,12 @@ const UseCornerBitmaps = false
 
 const glassRadius = 24
 
-// glassClipRadius 是内容（面板底色、边线、四角月牙）的圆角半径（DIP）。
+// glassClipRadius 是内容层（底栏、卡片、直边线）裁圆角用的半径（DIP）。
 //
-// 现在和 glassRadius **相等**：区域和弧同心同半径，弧的端点正好落在区域边界上，
-// 四条直边线的起点接上去不会有缝。早期让弧比区域小 2 DIP（区域外全由月牙的
-// 不透明部分垫着），那是因为当时月牙铺的是"每角一个采样色"，太厚的环会拉出
-// 一条弧形的色差带；现在弧外是逐像素照抄的真实桌面像素（captureCornerPatches），
-// 同色是天然的，不需要再让这一圈了 —— 让出去反而让直边线在角上断出一截。
-const glassClipRadius = glassRadius
+// 比 glassRadius 小 1：最外那一像素留给底图烘出来的边框环（backing.go）。
+// 内容一路铺到边上，就会把环盖掉 —— 用户报的"圆角的地方没有边框了"正是这个。
+// 只让 1 DIP，是因为让得越多，弧上露出来的底图带越宽，弧看着就越"粗"。
+const glassClipRadius = glassRadius - 1
 
 // snapshotScreen 抓一次全屏、做成磨砂图。
 // 必须在 Show 之前调用，否则抓到的是面板自己。
@@ -270,6 +268,7 @@ func (a *application) snapshotScreen() {
 	}
 	a.screenW, a.screenH = w, h
 	a.screenX, a.screenY = x, y
+	a.screenGen++
 	a.frost = a.frostFromScaled(small)
 	if a.frost == nil {
 		return
@@ -905,6 +904,14 @@ func (a *application) glassScale() float32 {
 // ClipInset 裁出来的圆角上，看上去仍然是直角。两边各管一半：内容靠 ClipInset，
 // 阴影靠这里。半径用 DIP × DPI，窗口区域要的是物理像素。
 func (a *application) applyRoundRegion() {
+	if bakedPanel {
+		// 形状完全由底图（backing.go）画出来，窗口不再设区域。
+		// 设了区域的副作用正是这一路问题的根源：SetWindowRgn 是 1 位掩码，弧上
+		// 必然是阶梯；区域之外的内容被系统丢掉，底图那圈覆盖率抗锯齿就没了意义。
+		// 代价是四角那 4 小块三角现在属于窗口（点上去会落在面板上），换来的是
+		// 弧上真正的抗锯齿，而且弧内外只有一处来源。
+		return
+	}
 	if a.frost == nil {
 		// Win11 的系统玻璃：圆角交给 DWM 的 WindowCornerPreference，不必插手。
 		return
@@ -975,8 +982,12 @@ func (a *application) refreshShadow() {
 	// 四角"弧外"那块要铺的是**当前位置**的真实桌面：用唤出那一刻抓的半分辨率
 	// 整屏图现场裁，而不是用旧位置 BitBlt 下来的 patch —— 后者在面板被拖动/缩放
 	// 之后就过期了，壁纸是照片时那块颜色会明显串味，看起来就是"角上画了一道圆弧"。
+	//
+	// bakedPanel 之后这块**不再交给阴影层**：弧和弧外全在底图里，阴影层只负责
+	// 面板外那一圈投影。它再补一遍角，就是两份数据叠在同一处 —— 之前"弧外多出
+	// 一小片色/一条线"全是这么来的。
 	patches := a.cornerPatchesAt(x, y, w, h, int(math.Round(float64(glassRadius)*float64(s)))+10)
-	if os.Getenv("BAOZI_NOCORNER") == "1" {
+	if bakedPanel || os.Getenv("BAOZI_NOCORNER") == "1" {
 		patches = [4]*image.RGBA{}
 	}
 	t0 := time.Now()
@@ -1084,9 +1095,14 @@ func (a *application) ensureShell(reason string) {
 		a.shellProbes++
 		log.Printf("外观复查 %s: 窗口区域=%v 阴影上屏=%v", reason, hasRegion, shadowShown)
 	}
-	if !hasRegion {
+	if !bakedPanel && !hasRegion {
 		log.Printf("玻璃: 圆角区域丢了（%s），补设一次", reason)
 		a.applyRoundRegion()
+	}
+	if bakedPanel && a.back == nil {
+		// 形状在底图里，底图没了就是四个直角 —— 这里重烘一张。
+		log.Printf("玻璃: 底图缺了（%s），重画一次", reason)
+		a.refreshBacking(true)
 	}
 	// 拖动/缩放那 0.x 秒本来就要收起阴影层（见 OnResize 的注释），别在这里叫醒它。
 	if a.dragging() {

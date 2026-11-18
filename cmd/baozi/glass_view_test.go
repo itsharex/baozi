@@ -12,6 +12,11 @@ import (
 // 这个测试直接造一张四色分块的"整屏图"，给一个已知的负偏移，看窗口里
 // 是不是露出了图上对应那一块 —— 露对了，取景就是对的。
 func TestGlassViewportShowsOffsetRegion(t *testing.T) {
+	if bakedPanel {
+		// 底图（整窗自绘）方案下，面板不再是"整屏磨砂图 + 取景偏移"，玻璃色
+		// 直接由 refreshBacking 逐像素烘进底图，这条测试覆盖的旧路径已经不走。
+		t.Skip("bakedPanel 下玻璃不走取景偏移，旧路径不参与布局")
+	}
 	a := testApp(t)
 	// 800×500 的图，左红右蓝、上深下浅，四个色块边界很好认。
 	const w, h = 800, 500

@@ -1,0 +1,501 @@
+package main
+
+// 面板的"底图"：整窗自绘。
+//
+// 为什么改这条路：
+//
+//	以前的圆角是三层拼出来的 —— 窗口区域（SetWindowRgn，1 位掩码）切形状、
+//	四角月牙（面板自己的位图）补弧外的桌面色、阴影层再补一遍。三层的弧各按各的
+//	方式算，交界处于是永远有一条看得见的线：弧和直边对不齐（"扇形的两个直边"）、
+//	弧外铺的色和真桌面差一两档（"鼓出去一点"）、区域那道 1 位硬边在弧上留台阶
+//	（"毛边"）。用户一句"你总说可以做，可是效果很不让人满意"就是冲着这个来的。
+//
+//	现在的做法是**一层**：把整个客户区当成一张画来画 ——
+//	  · 弧外 → 桌面（取唤出那一刻的半分辨率整屏快照，和窗口外面是同一张图）
+//	  · 弧上 → 桌面与玻璃按覆盖率相加（覆盖率来自圆角矩形的有符号距离，1px 过渡）
+//	  · 弧内 → 玻璃（取整屏磨砂图）
+//	  · 再嵌一条 1px 的边框环，同样带覆盖率
+//	画出来是一张不透明位图，直接铺满客户区。没有区域、没有月牙、没有补色，
+//	弧的每一像素只有一处来源，边界上不可能再出现两种算法打架。
+
+import (
+	"image"
+	"image/png"
+	"log"
+	"math"
+	"os"
+	"time"
+
+	"github.com/egoist/mygo/ui"
+
+	"baozi/internal/win"
+)
+
+// bakedPanel 打开后：面板的四角/边全部由 refreshBacking 烘进底图，
+// 窗口区域、四角月牙、直边线、阴影层补角一律不再参与形状。
+const bakedPanel = true
+
+// backingThrottle 是底图重算的最小间隔。底图要逐像素重采样（1100×660 这一级
+// 大约几毫秒），拖动时鼠标每秒报几百次，不节流会把 UI 线程占满 —— 这正是
+// 之前"快速拖动卡死"的来源。阴影层挪位、窗口几何照旧每帧走。
+const backingThrottle = 30 * time.Millisecond
+
+// testBacking：BAOZI_BACKTEST=1 时把底图渲染成"形状诊断图"（形状外红、
+// 边框环蓝、形状内白），用来在截图上量形状的真实边界。正常运行恒为 0。
+var testBacking = func() int {
+	if os.Getenv("BAOZI_BACKTEST") == "1" {
+		return 1
+	}
+	return 0
+}()
+
+// alphaBacking：形状外面不铺"桌面快照"，而是留成透明（alpha=0），
+// 让 DWM 自己把真正的背景透出来 —— 面板浮在任意窗口上时四角都不会
+// 露出一块"壁纸残影"。实测交换链支持每像素 alpha（面板压在别的窗口上时，
+// 弧外就是那个窗口本身），所以默认打开；BAOZI_BACKALPHA=0 退回旧的铺桌面法。
+var alphaBacking = func() bool {
+	return os.Getenv("BAOZI_BACKALPHA") != "0"
+}()
+
+// backKey 是底图的全部输入。位置/尺寸/半径/桌面快照任何一个变了才重算。
+type backKey struct {
+	cx, cy, cw, ch int
+	r              int
+	screenGen      int
+}
+
+// signed distance 用的圆角矩形参数：中心 + 半宽高（去半径后）+ 半径。
+type roundRect struct {
+	hx, hy, r float64
+}
+
+func newRoundRect(cw, ch, inset int, radius float64) roundRect {
+	w := float64(cw) - 2*float64(inset)
+	h := float64(ch) - 2*float64(inset)
+	r := radius - float64(inset)
+	if r < 0 {
+		r = 0
+	}
+	return roundRect{hx: w/2 - r, hy: h/2 - r, r: r}
+}
+
+// sd 返回点到圆角矩形边界的有符号距离（负=内部），坐标原点是矩形外框的中心。
+func (rr roundRect) sd(x, y float64) float64 {
+	qx := math.Abs(x) - rr.hx
+	qy := math.Abs(y) - rr.hy
+	in := math.Min(math.Max(qx, qy), 0)
+	ox := math.Max(qx, 0)
+	oy := math.Max(qy, 0)
+	return in + math.Hypot(ox, oy) - rr.r
+}
+
+// refreshBacking 重算底图。force 为 true 时不理会节流间隔。
+//
+//	调用时机：view 里（每帧布局都会经过），以及 finishResize / 唤出之后。
+func (a *application) refreshBacking(force bool) {
+	if !bakedPanel || a.frost == nil || a.panel == nil {
+		return
+	}
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	cx, cy, w, h := win.ClientRectPixels(hwnd)
+	if w <= 0 || h <= 0 {
+		return
+	}
+	s := a.glassScale()
+	r := int(math.Round(float64(glassRadius) * float64(s)))
+	k := backKey{cx: cx, cy: cy, cw: w, ch: h, r: r, screenGen: a.screenGen}
+	if a.back != nil && a.backKeySet && a.backKeyVal == k {
+		return
+	}
+	if !force {
+		now := time.Now()
+		if !a.lastBackAt.IsZero() && now.Sub(a.lastBackAt) < backingThrottle {
+			return
+		}
+	}
+	a.lastBackAt = time.Now()
+
+	t0 := time.Now()
+	pix := a.composeBacking(cx, cy, w, h, r)
+	if pix == nil {
+		return
+	}
+	if a.back != nil && a.backPixW == w && a.backPixH == h {
+		a.back.Update(pix)
+	} else {
+		a.back = ui.NewBitmap(pix)
+		a.backPixW, a.backPixH = w, h
+	}
+	a.backKeySet = true
+	a.backKeyVal = k
+	if d := time.Since(t0); d > 8*time.Millisecond {
+		log.Printf("玻璃: 底图 %.1fms（%dx%d）", float64(d.Microseconds())/1000, w, h)
+	}
+	// 诊断：把这一帧烘好的底图导成 PNG（面板是 noRedirect 合成的，屏幕截图
+	// 会被别的窗口干扰，量弧的覆盖率只能看这份原始数据）。
+	//   BAOZI_BACKDUMP=<路径>  每次重烘覆盖一次
+	if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
+		if f, err := os.Create(p); err == nil {
+			_ = png.Encode(f, pix)
+			_ = f.Close()
+		}
+	}
+}
+
+// composeBacking 返回客户区大小的不透明位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
+func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
+	if a.backPix == nil || a.backPix.Rect.Dx() != cw || a.backPix.Rect.Dy() != ch {
+		a.backPix = image.NewRGBA(image.Rect(0, 0, cw, ch))
+	}
+	out := a.backPix
+	// 所有像素都会被写到（形状外铺桌面），不用清零。
+
+	br, bg, bb := uint8(217), uint8(217), uint8(222)
+	if a.borderSet {
+		br, bg, bb = a.borderColor.R, a.borderColor.G, a.borderColor.B
+	}
+
+	// 边框宽度按物理像素：1 DIP × scale，至少 1 像素。
+	bw := int(math.Round(float64(a.glassScale())))
+	if bw < 1 {
+		bw = 1
+	}
+
+	outer := newRoundRect(cw, ch, 0, float64(r))
+	inner := newRoundRect(cw, ch, bw, float64(r))
+
+	halfW := float64(cw) / 2
+	halfH := float64(ch) / 2
+
+	// 玻璃 / 桌面采样用的原点（相对客户区左上角的屏幕坐标）
+	gox := cx - a.screenX
+	goy := cy - a.screenY
+	dox := cx - a.deskHalfX
+	doy := cy - a.deskHalfY
+	step := glassStep
+	if step < 1 {
+		step = 1
+	}
+	dstep := a.deskHalfStep
+	if dstep < 1 {
+		dstep = 1
+	}
+
+	// 玻璃采样：横向的源列号和权重只跟 x 有关，先算一遍存下来；纵向每行算一次。
+	// 逐像素就只剩 4 次查表和几次乘加（早先每像素都走一遍通用双线性，
+	// 1100×660 一次 15~18ms，拖动时节流都救不回来）。
+	gimg := a.frostSmall
+	var gx0i, gx1i []int
+	var gfxs []float64
+	// 内部（离弧很远、覆盖率必为 1 的那一大片）走**最近邻**：磨砂图本身已经在
+	// 1/8 分辨率上糊过（Blur 半径 3 ≈ 屏幕上 24 像素），放大时双线性和最近邻的
+	// 差别是 8 像素块里的一两档色差，看不出来；但主循环占了 95% 的像素，省下
+	// 每像素三次乘加就是省下一半的合成时间（拖动时这一趟每 50ms 就跑一次）。
+	var gxn []int
+	if gimg != nil && gimg.Rect.Dx() > 0 {
+		gxn = make([]int, cw)
+		w := gimg.Rect.Dx()
+		for x := 0; x < cw; x++ {
+			i := int(float64(gox+x) / float64(step))
+			if i < 0 {
+				i = 0
+			} else if i > w-1 {
+				i = w - 1
+			}
+			gxn[x] = i
+		}
+	}
+	if gimg != nil {
+		gx0i = make([]int, cw)
+		gx1i = make([]int, cw)
+		gfxs = make([]float64, cw)
+		gw, gh := gimg.Rect.Dx(), gimg.Rect.Dy()
+		for x := 0; x < cw; x++ {
+			f := float64(gox+x) / float64(step)
+			i0 := int(f)
+			fx := f - float64(i0)
+			i1 := i0 + 1
+			if i0 < 0 {
+				i0, i1, fx = 0, 0, 0
+			} else if i0 > gw-1 {
+				i0, i1, fx = gw-1, gw-1, 0
+			}
+			if i1 > gw-1 {
+				i1 = gw - 1
+			}
+			if i1 < 0 {
+				i1 = 0
+			}
+			if gh <= 0 {
+				i0, i1 = 0, 0
+			}
+			gx0i[x], gx1i[x], gfxs[x] = i0, i1, fx
+		}
+		if gh <= 0 {
+			gimg = nil
+		}
+	}
+
+	for y := 0; y < ch; y++ {
+		py := float64(y) + 0.5 - halfH
+		// 这一行的纵向采样（磨砂图的源行号 + 权重）
+		var gRow0, gRow1 []uint8
+		gfy := 0.0
+		if gimg != nil {
+			f := float64(goy+y) / float64(step)
+			j0 := int(f)
+			gfy = f - float64(j0)
+			j1 := j0 + 1
+			gh := gimg.Rect.Dy()
+			if j0 < 0 {
+				j0, j1, gfy = 0, 0, 0
+			} else if j0 > gh-1 {
+				j0, j1, gfy = gh-1, gh-1, 0
+			}
+			if j1 > gh-1 {
+				j1 = gh - 1
+			}
+			if j1 < 0 {
+				j1 = 0
+			}
+			gRow0 = gimg.Pix[(j0-gimg.Rect.Min.Y)*gimg.Stride:]
+			gRow1 = gimg.Pix[(j1-gimg.Rect.Min.Y)*gimg.Stride:]
+		}
+		gbx := gimg.Rect.Min.X
+		// 这一行的最近邻源行（内部快路径用）与双线性的两行（边缘带用）。
+		var gNearRow []uint8
+		if gimg != nil {
+			gj := 0
+			if gxn != nil {
+				gj = int(float64(goy+y) / float64(step))
+				gh := gimg.Rect.Dy()
+				if gj < 0 {
+					gj = 0
+				} else if gj > gh-1 {
+					gj = gh - 1
+				}
+			}
+			gNearRow = gimg.Pix[(gj-gimg.Rect.Min.Y)*gimg.Stride:]
+		}
+		// 上下两条 r 像素的横带之外、左右两条 r 像素的竖带之内 —— 这一整段都在
+		// 圆角矩形的"直线部分"包围盒里，离弧远，覆盖率必为 1：直接铺玻璃。
+		midRow := y >= r && y < ch-r
+		for x := 0; x < cw; x++ {
+			o := out.PixOffset(x, y)
+			px := float64(x) + 0.5 - halfW
+
+			if midRow && x >= r && x < cw-r {
+				// 内部整片：最近邻取玻璃色就是全部工作，写完接着下一个。
+				if gNearRow != nil {
+					o0 := (gxn[x] - gbx) * 4
+					out.Pix[o+0] = gNearRow[o0]
+					out.Pix[o+1] = gNearRow[o0+1]
+					out.Pix[o+2] = gNearRow[o0+2]
+					out.Pix[o+3] = 255
+				} else {
+					out.Pix[o+0], out.Pix[o+1], out.Pix[o+2], out.Pix[o+3] = 247, 248, 252, 255
+				}
+				continue
+			}
+
+			var gr, gg, gb float64
+			if gRow0 != nil {
+				o0 := (gx0i[x] - gbx) * 4
+				o1 := (gx1i[x] - gbx) * 4
+				fx := gfxs[x]
+				rr := float64(gRow0[o0])*(1-fx) + float64(gRow0[o1])*fx
+				r2 := float64(gRow1[o0])*(1-fx) + float64(gRow1[o1])*fx
+				gr = rr*(1-gfy) + r2*gfy
+				rr = float64(gRow0[o0+1])*(1-fx) + float64(gRow0[o1+1])*fx
+				r2 = float64(gRow1[o0+1])*(1-fx) + float64(gRow1[o1+1])*fx
+				gg = rr*(1-gfy) + r2*gfy
+				rr = float64(gRow0[o0+2])*(1-fx) + float64(gRow0[o1+2])*fx
+				r2 = float64(gRow1[o0+2])*(1-fx) + float64(gRow1[o1+2])*fx
+				gb = rr*(1-gfy) + r2*gfy
+			} else {
+				gr, gg, gb = 247, 248, 252
+			}
+
+			sdOut := outer.sd(px, py)
+			// 覆盖率：距离边界 0.5px 以内线性过渡（外正内负），也就是 1 像素宽的
+			// 抗锯齿带 —— 弧上每一行因此有 2~3 个半覆盖像素，不再是 1 位台阶。
+			cOut := 0.5 - sdOut
+			if cOut >= 1 {
+				cOut = 1
+			} else if cOut <= 0 {
+				cOut = 0
+			}
+			if cOut <= 0 {
+				// 完全在形状外面（四角三角）：铺桌面像素，和窗口外面的桌面同源。
+				if testBacking != 0 {
+					out.Pix[o+0] = 255
+					out.Pix[o+1] = 0
+					out.Pix[o+2] = 0
+					out.Pix[o+3] = 255
+					continue
+				}
+				if alphaBacking {
+					// 形状外面留透明：让真正的背景透出来，四角不再靠"壁纸残影"。
+					out.Pix[o+0] = 0
+					out.Pix[o+1] = 0
+					out.Pix[o+2] = 0
+					out.Pix[o+3] = 0
+					continue
+				}
+				dr, dg, db := a.deskAt(float64(dox+x), float64(doy+y), dstep)
+				out.Pix[o+0] = clamp8(dr)
+				out.Pix[o+1] = clamp8(dg)
+				out.Pix[o+2] = clamp8(db)
+				out.Pix[o+3] = 255
+				continue
+			}
+			sdIn := inner.sd(px, py)
+			cIn := 0.5 - sdIn
+			if cIn >= 1 {
+				cIn = 1
+			} else if cIn <= 0 {
+				cIn = 0
+			}
+
+			// 边框带 = 外覆盖率 - 内覆盖率：它就是那条 1px 边线，跟着弧走、
+			// 自带覆盖率，所以弧和直边是同一根线，没接缝。
+			ring := cOut - cIn
+			if ring < 0 {
+				ring = 0
+			}
+			wGlass := cIn
+			wDesk := 1 - cOut
+
+			if testBacking != 0 {
+				// 诊断配色（BAOZI_BACKTEST=1）：不管真实颜色，只标出三个区域，
+				// 截图上量"形状到底铺到哪儿"最省事。
+				rrr, rgg, rbb := 255, 255, 255
+				if ring > 0.5 {
+					rrr, rgg, rbb = 0, 0, 255
+				}
+				out.Pix[o+0] = uint8(rrr)
+				out.Pix[o+1] = uint8(rgg)
+				out.Pix[o+2] = uint8(rbb)
+				out.Pix[o+3] = 255
+				continue
+			}
+
+			var dr, dg, db float64
+			if wDesk > 0.002 && !alphaBacking {
+				dr, dg, db = a.deskAt(float64(dox+x), float64(doy+y), dstep)
+			} else {
+				dr, dg, db = gr, gg, gb
+			}
+
+			if alphaBacking {
+				// 交给 DWM 混合：颜色按 alpha 预乘（ring + glass 的权重加起来正好
+				// 就是覆盖率 cOut），形状外面 alpha=0，透出真正的背景。
+				out.Pix[o+0] = clamp8(ring*float64(br) + wGlass*gr)
+				out.Pix[o+1] = clamp8(ring*float64(bg) + wGlass*gg)
+				out.Pix[o+2] = clamp8(ring*float64(bb) + wGlass*gb)
+				out.Pix[o+3] = clamp8(cOut * 255)
+				continue
+			}
+
+			rr := wDesk*dr + ring*float64(br) + wGlass*gr
+			rgc := wDesk*dg + ring*float64(bg) + wGlass*gg
+			rb := wDesk*db + ring*float64(bb) + wGlass*gb
+			out.Pix[o+0] = clamp8(rr)
+			out.Pix[o+1] = clamp8(rgc)
+			out.Pix[o+2] = clamp8(rb)
+			out.Pix[o+3] = 255
+		}
+	}
+	return out
+}
+
+// deskAt 在唤出那一刻的半分辨率整屏快照上双线性采样（屏幕坐标，未缩放）。
+func (a *application) deskAt(sx, sy float64, step int) (float64, float64, float64) {
+	if a.deskHalf == nil {
+		c := a.deskColor
+		return float64(c.R), float64(c.G), float64(c.B)
+	}
+	return sampleBilinear(a.deskHalf, sx/float64(step), sy/float64(step))
+}
+
+// sampleBilinear 在 img 上按 (x,y) 双线性取样，出界时钳位到边缘。
+// 这个函数在底图循环里被调用几十万次，所以**不分配任何东西**（早先版本
+// 用一个 []*float64 循环写三个通道，每像素一次堆分配，1100×660 一帧就是
+// 72 万次 —— 实测 22ms，其中大半是 GC 和分配）。
+func sampleBilinear(img *image.RGBA, x, y float64) (float64, float64, float64) {
+	w := img.Rect.Dx()
+	h := img.Rect.Dy()
+	if w == 0 || h == 0 {
+		return 247, 248, 252
+	}
+	x0 := int(x)
+	y0 := int(y)
+	if x < 0 {
+		x0 = -1
+	}
+	if y < 0 {
+		y0 = -1
+	}
+	fx := x - float64(x0)
+	fy := y - float64(y0)
+	x1, y1 := x0+1, y0+1
+	if x0 < 0 {
+		x0, x1, fx = 0, 0, 0
+	} else if x0 > w-1 {
+		x0, x1, fx = w-1, w-1, 0
+	}
+	if y0 < 0 {
+		y0, y1, fy = 0, 0, 0
+	} else if y0 > h-1 {
+		y0, y1, fy = h-1, h-1, 0
+	}
+	if x1 > w-1 {
+		x1 = w - 1
+	}
+	if y1 > h-1 {
+		y1 = h - 1
+	}
+	row0 := img.Pix[(y0-img.Rect.Min.Y)*img.Stride:]
+	row1 := img.Pix[(y1-img.Rect.Min.Y)*img.Stride:]
+	o00 := (x0 - img.Rect.Min.X) * 4
+	o10 := (x1 - img.Rect.Min.X) * 4
+	a := float64(row0[o00])
+	bb := float64(row0[o10])
+	c := float64(row1[o00])
+	d := float64(row1[o10])
+	r := (a*(1-fx)+bb*fx)*(1-fy) + (c*(1-fx)+d*fx)*fy
+	a = float64(row0[o00+1])
+	bb = float64(row0[o10+1])
+	c = float64(row1[o00+1])
+	d = float64(row1[o10+1])
+	g := (a*(1-fx)+bb*fx)*(1-fy) + (c*(1-fx)+d*fx)*fy
+	a = float64(row0[o00+2])
+	bb = float64(row0[o10+2])
+	c = float64(row1[o00+2])
+	d = float64(row1[o10+2])
+	bl := (a*(1-fx)+bb*fx)*(1-fy) + (c*(1-fx)+d*fx)*fy
+	return r, g, bl
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+func clamp8(v float64) uint8 {
+	if v <= 0 {
+		return 0
+	}
+	if v >= 255 {
+		return 255
+	}
+	return uint8(v + 0.5)
+}

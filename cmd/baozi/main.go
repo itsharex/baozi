@@ -173,6 +173,19 @@ type application struct {
 	// 半分辨率（2560×1440 → 1280×720，3.7 MB）够用：那块本身就在阴影下面，糊一点看不出来。
 	deskHalf                           *image.RGBA
 	deskHalfX, deskHalfY, deskHalfStep int
+	// back 是"整窗自绘底图"：客户区大小的一张不透明位图，桌面 + 玻璃 + 边框
+	// 按覆盖率相加而成，面板四角的抗锯齿就是它给的（见 backing.go）。
+	// 没有它就没有圆角 —— 铺满整个客户区，不裁、不留透明。
+	back       *ui.Bitmap
+	backPix    *image.RGBA // 复用的合成缓冲，避免每帧 New 一兆多
+	backPixW   int
+	backPixH   int
+	backKeySet bool
+	backKeyVal backKey
+	// lastBackAt 是上一次合成底图的时刻（节流用，见 backingThrottle）。
+	lastBackAt time.Time
+	// screenGen 每次重新抓屏 +1：底图依赖快照内容，快照一换就必须重合成。
+	screenGen int
 	// cornerBitmaps 是四角那四张"月牙"位图，cornerPx 是它们的边长（物理像素）。
 	// 弧外铺 deskCorners 的桌面色，弧上按覆盖率渐隐到透明 —— 圆角那条内边界
 	// 的抗锯齿就是它们给的。变了桌面色或换了面板尺寸就重建（见 buildCornerBitmaps）。
@@ -628,6 +641,10 @@ func (a *application) view(c *ui.Context) {
 	// 不重裁、不重模糊、不换纹理，所以跟手。
 	// 内容放进 Overlay 才能压在它上面（Absolute 的元素总是画在兄弟之上）。
 	if a.frost != nil {
+		// 底图（整窗自绘：桌面 + 玻璃 + 边框环，四角靠覆盖率抗锯齿）在这里现算。
+		// 放在 view 里而不是挪窗/缩放的回调里，是因为它是"画之前必须就绪"的东西：
+		// 每帧布局都会走到这儿，输入没变时 refreshBacking 直接返回（一次比较）。
+		a.refreshBacking(false)
 		ox, oy := a.glassOffset()
 		// 圆角必须挂在**真正画东西的那一层**上：挂在 c.Root() 上时（root 是框架给的
 		// 窗口根、自身没有内容）实测裁不掉下面这两层，四角照旧是磨砂底色。
@@ -639,11 +656,36 @@ func (a *application) view(c *ui.Context) {
 		// 另一层上，万一那层没盖住窗口的右边或下边（实测底栏那一截就跑到它外面了），
 		// 从那块空白按下去时命中的是这条链——它有 DragWindow，面板照样能拖着走。
 		// 没有这条兜底，"从下边拖不动面板"就会跟着内容层的尺寸走，改一次尺寸复发一次。
-		ui.Column(c).Fill().DragWindow().Radius(glassRadius).Clip().Children(func() {
-			// 磨砂图铺满整个客户区，不裁圆角：圆角是四角的月牙（下面那几个
-			// ui.Image）和窗口区域一起做出来的，不是把这一层裁出来的。
-			ui.Image(c, a.frost).Absolute().Left(ox).Top(oy).
-				Size(a.frostW, a.frostH)
+		//
+		// **不再 Radius + Clip**：mygo 的 Radius 是 GPU 硬裁剪，没有抗锯齿，而且把
+		// 裁掉的像素填成纯白（实测上边缘连续 5 行 #FFFFFF）—— 用户反复说的"漏光"
+		// 就是这条白边。四角的形状现在整个烘在底图里（覆盖率抗锯齿），这一层只要
+		// 把底图铺满、不裁即可。
+		ui.Column(c).Fill().DragWindow().Children(func() {
+			if bakedPanel {
+				// 底图和客户区同尺寸，1:1 落在 (0,0)，不缩放、不偏移 —— 圆角位置
+				// 就是窗口位置，拖动/缩放时只要重新合成一张，弧永远贴着窗边。
+				if a.back != nil {
+					s := a.glassScale()
+					// 多铺 2 像素：DIP → 物理像素不是整数（908.8 DIP × 1.25 = 1136.25），
+					// mygo 按 DIP 布局时右边/下边可能只铺到 1135 格，剩下一列/一行
+					// 露出窗口底色（白）—— 就是"右边和下边边框里面还有一条线"，
+					// 而且四角被那条白补成直角。多出来这点会被窗口边界裁掉。
+					dip := float32(a.backPixW+2) / s
+					dipH := float32(a.backPixH+2) / s
+					ui.Image(c, a.back).Absolute().Left(0).Top(0).
+						Size(dip, dipH)
+					if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
+						pw, ph := a.panelSize()
+						log.Printf("玻璃: 底图铺开 %dx%d px → %.2fx%.2f DIP（面板 %dx%d DIP，scale %.2f）",
+							a.backPixW, a.backPixH, dip, dipH, pw, ph, s)
+					}
+				}
+			} else {
+				// 旧做法（保留作对照）：整屏磨砂图 + 窗口取景偏移 + 四角月牙。
+				ui.Image(c, a.frost).Absolute().Left(ox).Top(oy).
+					Size(a.frostW, a.frostH)
+			}
 			ui.Overlay(c, func() {
 				// 显式给面板的宽高，别指望 Left/Top/Right/Bottom 把四边撑开：
 				// Absolute 元素的高度实测是**按内容算**的（Right/Bottom 不起作用），
@@ -655,16 +697,17 @@ func (a *application) view(c *ui.Context) {
 				a.borderColor, a.borderSet = t.Border, true
 				// 整圈边分两段画：直边用四条细线（下面），圆角段由四角的月牙画。
 				//
-				// 这里既不能用 Radius、也不能用 BorderWidth：
-				//  · BorderWidth 的圆角段没有抗锯齿，只沿 24 DIP 这条弧画出整像素
-				//    台阶 —— 角上那道白色细刺就是它从月牙的缝里漏出来的；
-				//  · Radius 是靠 GPU 的 clip 裁圆角，而**它把被裁掉的像素填成纯白**
-				//    而不是透明（实测：上边缘从 x=0 起连续 5 行 #FFFFFF）。窗口区域
-				//    已经把角切掉了，这块白正好落在弧内的三角里，于是四角始终有一
-				//    小片白 —— 用户反复说的"漏光"就是它。
-				// 形状现在完全交给月牙（弧）和窗口区域（1 位掩码，藏在月牙底下）。
+				// 内容层现在**必须裁圆角**：底栏、卡片这些不透明底色是矩形的，
+				// 不裁就会一直铺到窗口四角，把底图烘出来的弧和弧外的桌面整个盖成
+				// 直角（截图里正是"只有上面两个角是圆的，下面俩是方的"）。
+				// mygo 的圆角 clip 走的是覆盖率裁剪（internal/raster/clipmask.go），
+				// 不是 1 位掩码，所以这一刀本身也有抗锯齿。
+				//
+				// 半径比面板小 1 DIP：让出最外那一像素给底图烘的边框环 —— 内容铺到
+				// 边上就会把环盖掉（以前"圆角那段没有边框"就是这么来的）。
 				ui.Column(c).Absolute().Left(0).Top(0).
 					Size(float32(pw), float32(ph)).
+					Radius(glassClipRadius).Clip().
 					DragWindow().Children(body)
 				// 四条直边。直边段和弧上的边线同色同宽，拼成一整圈框。
 				//
@@ -704,7 +747,7 @@ func (a *application) view(c *ui.Context) {
 				r0 := float32(glassRadius) - edgeOverlap
 				innerW := wDip - 2*r0
 				innerH := hDip - 2*r0
-				if panelBorder {
+				if panelBorder && !bakedPanel {
 					ui.Column(c).Absolute().Left(r0).Top(0).
 						Size(innerW, one).Background(t.Border)
 					ui.Column(c).Absolute().Left(r0).Top(one).
@@ -736,7 +779,7 @@ func (a *application) view(c *ui.Context) {
 			// 区域那道 1 位硬边 —— 右边和下边正在跟着手柄变，台阶看得最清，用户看到的
 			// 就是"右上、右下变成方角"。静止时仍然交给阴影层（它画的弧最干净，
 			// 两套一起画反而会叠出一道白边）。
-			if (UseCornerBitmaps || a.dragging()) && a.cornerPx > 0 {
+			if !bakedPanel && (UseCornerBitmaps || a.dragging()) && a.cornerPx > 0 {
 				s := a.glassScale()
 				pw, ph := a.panelSize()
 				cw, ch := int(math.Round(float64(pw)*float64(s))), int(math.Round(float64(ph)*float64(s)))
@@ -2115,7 +2158,7 @@ func (a *application) finishResize() {
 	// time.AfterFunc 的回调跑在普通 goroutine 上 —— 和渲染线程同时碰 D3D
 	// 设备是没保证的。RunOnMain 会在主线程上等它跑完（本来就在主线程时直接跑）。
 	start := time.Now()
-	var dRegion, dCorners, dShadow time.Duration
+	var dRegion, dCorners, dShadow, dBack time.Duration
 	mygo.RunOnMain(func() {
 		t := time.Now()
 		a.applyRoundRegion()
@@ -2127,16 +2170,22 @@ func (a *application) finishResize() {
 		dCorners = time.Since(t)
 
 		t = time.Now()
+		// 尺寸定了，底图按最终客户区重烘一张（弧和边框都跟着新尺寸走）。
+		a.refreshBacking(true)
+		dBack = time.Since(t)
+
+		t = time.Now()
 		a.refreshShadow()
 		dShadow = time.Since(t)
 	})
 	// 松手那一下如果有卡顿，这行把责任分清楚：是区域、四角、阴影，还是这三样
 	// 之外（那就是 mygo 自己按新尺寸重画的那一帧）。
 	if d := time.Since(start); d > 10*time.Millisecond {
-		log.Printf("缩放: 收尾 %.2fms（区域 %.2f + 四角 %.2f + 阴影 %.2f）",
+		log.Printf("缩放: 收尾 %.2fms（区域 %.2f + 四角 %.2f + 底图 %.2f + 阴影 %.2f）",
 			float64(d.Microseconds())/1000,
 			float64(dRegion.Microseconds())/1000,
 			float64(dCorners.Microseconds())/1000,
+			float64(dBack.Microseconds())/1000,
 			float64(dShadow.Microseconds())/1000)
 	}
 	// 一轮拖动的数据留一行日志：帧数、回调耗时、帧间隔峰值。
@@ -2339,6 +2388,9 @@ func (a *application) show() {
 	// force=true：每次唤出都重建一次，哪怕参数和上次一模一样（上一轮可能是从
 	// 别的窗口状态退下来的）。
 	a.refreshCorners(true)
+	// 底图必须在 Show 之前/之后最早的时刻烘好：面板第一帧铺的就是它，
+	// 底图还没生成的那一帧是矩形（用户报的"偶尔出现四个直角"）。
+	a.refreshBacking(true)
 	// 阴影层放在最后：它是从面板外侧取样的，得等四角的桌面色取完再显示，
 	// 否则那几像素的取样会被自己的阴影压暗。
 	a.refreshShadow()

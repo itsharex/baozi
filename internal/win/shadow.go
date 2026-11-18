@@ -55,7 +55,7 @@ const (
 	// 10~14px，这里取 16 让它再软一点。
 	ShadowMargin = 16
 	// constMaxAlpha 是阴影最深处的黑度。面板底色很浅，再深就显脏。
-	constMaxAlpha = 0.42
+	constMaxAlpha = 0.34
 )
 
 var (
@@ -246,7 +246,17 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 			return 0
 		}
 		f := 1 - t
-		return byte(maxAlpha*f*f*f*255 + 0.5)
+		a := maxAlpha * f * f * f
+		// 贴着面板边缘的一小圈：阴影在这里最浓（物理上也确实最浓），可面板最外
+		// 圈是半覆盖的抗锯齿像素，压不住它 —— 屏幕上就是一条紧贴边框的近黑细线
+		// （用户说的"边框内部还有一条线"，换个壁纸底色它还会跟着变）。所以最里面
+		// 4px 用 smoothstep 从 0 起坡，让阴影离开边框一点再浓起来；4px 相对 20px
+		// 的扩散宽度只是把最里面那一点压下去，整体观感不变，那条硬线没了。
+		if d < 6 {
+			t := d / 6
+			a *= t * t * (3 - 2*t)
+		}
+		return byte(a*255 + 0.5)
 		// 预乘黑：R=G=B=0 保持不变。
 	}
 	writePixel := func(px, py int) {
