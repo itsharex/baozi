@@ -180,7 +180,9 @@ type application struct {
 	// cornerSize 是上面四张图当前**实际的像素边长**。它和 cornerPx（沿用的大
 	// 尺寸）分开记：尺寸没变时只能 Update 像素、不能换新 Bitmap —— ui.Image
 	// 渲染一次就把纹理缓存住了，换对象屏上不会变。
-	cornerSize int
+	cornerSize   int
+	cornerKeySet bool
+	cornerKeyVal cornerKey
 	// maskKey / maskCache 缓存四角月牙的覆盖率掩码（每个角 size² 个 float64，
 	// 40×40 一共 51 KB）。掩码只跟圆角半径和位图边长有关，缩放时反复重建的是
 	// 桌面色，掩码根本不用重算 —— 每次重算要 40 万次 hypot 加八遍 3×3 柔化。
@@ -2067,11 +2069,31 @@ func (a *application) finishResize() {
 	// 收尾走主线程：buildCornerBitmaps 要造 ui.Bitmap（GPU 纹理），而
 	// time.AfterFunc 的回调跑在普通 goroutine 上 —— 和渲染线程同时碰 D3D
 	// 设备是没保证的。RunOnMain 会在主线程上等它跑完（本来就在主线程时直接跑）。
+	start := time.Now()
+	var dRegion, dCorners, dShadow time.Duration
 	mygo.RunOnMain(func() {
+		t := time.Now()
 		a.applyRoundRegion()
-		a.refreshCorners()
+		dRegion = time.Since(t)
+
+		t = time.Now()
+		// force=false：尺寸/位置里和四角位图无关的那部分变了也照旧复用旧图。
+		a.refreshCorners(false)
+		dCorners = time.Since(t)
+
+		t = time.Now()
 		a.refreshShadow()
+		dShadow = time.Since(t)
 	})
+	// 松手那一下如果有卡顿，这行把责任分清楚：是区域、四角、阴影，还是这三样
+	// 之外（那就是 mygo 自己按新尺寸重画的那一帧）。
+	if d := time.Since(start); d > 10*time.Millisecond {
+		log.Printf("缩放: 收尾 %.2fms（区域 %.2f + 四角 %.2f + 阴影 %.2f）",
+			float64(d.Microseconds())/1000,
+			float64(dRegion.Microseconds())/1000,
+			float64(dCorners.Microseconds())/1000,
+			float64(dShadow.Microseconds())/1000)
+	}
 	// 一轮拖动的数据留一行日志：帧数、回调耗时、帧间隔峰值。
 	// 帧数远小于鼠标移动次数（比如 400 次移动只来了 15 帧）就说明事件是被系统
 	// 或面板绘制并掉的，不是我们的回调慢；反过来回调 max 高就得先抠这里。
@@ -2243,9 +2265,14 @@ func (a *application) show() {
 	// 掩码的硬边落在四角月牙铺的纯桌面色里；弧本身的抗锯齿由月牙的 alpha 给。
 	// 区域同时决定 DWM 阴影的形状，这也是阴影能跟着圆角走的唯一办法。
 	a.applyRoundRegion()
-	// 四角的桌面色要在窗口移到本次位置之后再取（取的是窗外 2px 的实时像素），
-	// 月牙也得跟着重画 —— 这两件事都不能放到 Show 之前。
-	a.refreshCorners()
+	// 四角的桌面色要在窗口移到本次位置之后再取（取的是窗外 2px 的实时光片，
+	// 现在优先从刚刚抓的那张半分辨率快照里读，见 glass.go 的 colorAt）—— 这
+	// 件事不能放到 Show 之前，否则读到的还是上一处桌面。
+	// 面板四角露出的那块底色（deskColor）由它给出，每一次唤出都要更新。
+	a.pickDeskColor(nil)
+	// force=true：每次唤出都重建一次，哪怕参数和上次一模一样（上一轮可能是从
+	// 别的窗口状态退下来的）。
+	a.refreshCorners(true)
 	// 阴影层放在最后：它是从面板外侧取样的，得等四角的桌面色取完再显示，
 	// 否则那几像素的取样会被自己的阴影压暗。
 	a.refreshShadow()

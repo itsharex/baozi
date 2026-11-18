@@ -105,7 +105,11 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 	if rgn == 0 {
 		return false
 	}
-	r, _, _ := procSetWindowRgn.Call(hwnd, rgn, 1)
+	// bRedraw 传 0：这个区域只决定"DWM 阴影的形状 + 鼠标命中"，不参与内容绘制
+	// （内容在交换链里，区域裁不掉）。传 1 的话每次调用都会让整个窗口失效重画，
+	// 1100×724 一次 40ms 上下；缩放每帧一次、松手再来一次，那就是"缩放卡一下、
+	// 停手再卡一下"。面板自己该重绘的时候会重绘，这里不必替它安排。
+	r, _, _ := procSetWindowRgn.Call(hwnd, rgn, 0)
 	if r == 0 {
 		// 设置失败时区域的归属还在我们手上，得自己释放。
 		procDeleteObject.Call(rgn)

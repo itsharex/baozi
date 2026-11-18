@@ -281,9 +281,7 @@ func (a *application) snapshotScreen() {
 // 位置之后**调用：取色读的是窗口外侧 2px 的像素，窗口还停在上一处时读到的是
 // 上一处的桌面，月牙就铺成一个和旁边对不上的色块（实测左上、左下读到 #E0E0E0，
 // 而窗外那片蓝是 #9BC9EA）。
-func (a *application) refreshCorners() {
-	a.pickDeskColor(nil)
-	a.refineCornerColors()
+func (a *application) refreshCorners(force bool) {
 	s := float64(a.glassScale())
 	edge := ui.Hex("#d9d9de") // 浅色主题的 Border，和面板边线同色
 	if a.borderSet {
@@ -292,11 +290,26 @@ func (a *application) refreshCorners() {
 	// 圆角那段边框弧现在由阴影层画（面板自己的像素被 SetWindowRgn 裁掉了），
 	// 颜色走这里传给它，和四条直边同一色。
 	a.cornerEdge = uint32(edge.R)<<16 | uint32(edge.G)<<8 | uint32(edge.B)
-	a.buildCornerBitmaps(
-		int(math.Round(float64(glassClipRadius)*s)),
-		int(math.Round(float64(glassRadius)*s)),
-		edge,
-	)
+	// 四角现在整个交给阴影层（UseCornerBitmaps=false），这四张月牙位图没有
+	// 任何地方在画 —— 那就连造都别造，连取色也别取。取色才是这里真正贵的一步
+	// （见 colorAt），而造图之后那次 panel.Update（整屏重绘，40ms 上下）也省了。
+	// 两笔账都正好落在"缩放松手那一帧"上，就是停手时那一下卡顿。
+	// deskColor（面板四角的兜底底色）由 show() 里单独取一次。
+	if !UseCornerBitmaps {
+		return
+	}
+	a.pickDeskColor(nil)
+	a.refineCornerColors()
+	arc := int(math.Round(float64(glassClipRadius) * s))
+	region := int(math.Round(float64(glassRadius) * s))
+	// 四个角位图只由"半径 + 四处桌面色 + 边线色"决定，和面板多大、在哪无关。
+	// 参数一模一样时也跳过重造（例如只是把面板原地显示了一次）。
+	key := cornerKey{arc: arc, region: region, edge: edge, corners: a.deskCorners}
+	if !force && a.cornerKeySet && a.cornerKeySame(key) {
+		return
+	}
+	a.cornerKeyVal, a.cornerKeySet = key, true
+	a.buildCornerBitmaps(arc, region, edge)
 	// 造好新图必须**马上**重绘一次：不重绘就只是把新 Bitmap 挂上去，屏上仍旧是
 	// 上一帧的样子 —— 进程启动后第一次唤出时那里还没有图，四角就整块糊着面板底色
 	// （桌面色），要等到某次 resize 才会换过来。Update 只重排重画，不改尺寸，
@@ -323,14 +336,24 @@ func (a *application) refineCornerColors() {
 		{cx, cy}, {cx + cw, cy}, {cx, cy + ch}, {cx + cw, cy + ch},
 	}
 	dirs := [4][2]int{{-1, -1}, {1, -1}, {-1, 1}, {1, 1}}
+	// 12 个点：同样先查内存里的唤出快照（以前每点一次 GetDC，这一趟就要
+	// 40~90ms —— 正是"缩放松手那一下"和"唤出慢半拍"的账）。
+	got := make([]win.PointColor, 12)
+	for i := 0; i < 4; i++ {
+		for k, d := range []int{2, 5, 8} {
+			if c, ok := a.colorAt(bases[i][0]+dirs[i][0]*d, bases[i][1]+dirs[i][1]*d); ok {
+				got[i*3+k] = c
+			}
+		}
+	}
 	for i := 0; i < 4; i++ {
 		var r, g, b, n int
-		for _, d := range []int{2, 5, 8} {
-			pr, pg, pb, ok := win.ScreenPixel(bases[i][0]+dirs[i][0]*d, bases[i][1]+dirs[i][1]*d)
-			if !ok {
+		for k := 0; k < 3; k++ {
+			c := got[i*3+k]
+			if !c.OK {
 				continue
 			}
-			r, g, b, n = r+int(pr), g+int(pg), b+int(pb), n+1
+			r, g, b, n = r+int(c.R), g+int(c.G), b+int(c.B), n+1
 		}
 		if n == 0 {
 			continue
@@ -345,6 +368,29 @@ func (a *application) refineCornerColors() {
 // 合成时才乘上去的，面板尺寸只影响位图摆在哪。
 type cornerMaskKey struct {
 	arc, region, size int
+}
+
+// cornerKey 是"四角位图还能不能沿用上一份"的判据：只有这四样都相同才省掉
+// 重造。桌面色放进来是因为它本身就是位图里铺的底色。
+type cornerKey struct {
+	arc, region int
+	edge        ui.Color
+	corners     [4]ui.Color
+}
+
+// cornerKeySame 比一份新算出来的键和上一份是否一样。
+// （没有直接拿结构体比大小：内含数组，写成显式逐项比更好读，也更省事。）
+func (a *application) cornerKeySame(k cornerKey) bool {
+	v := a.cornerKeyVal
+	if v.arc != k.arc || v.region != k.region || v.edge != k.edge {
+		return false
+	}
+	for i := range k.corners {
+		if v.corners[i] != k.corners[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // cornerOuterSide 报一个越界坐标是不是落在"窗口之外"的那一侧。
@@ -593,6 +639,37 @@ func (a *application) buildCornerBitmaps(arc, region int, edge ui.Color) {
 	log.Printf("玻璃: 月牙重造 arc=%d region=%d size=%d 角0=%02X%02X%02X", arc, region, size, a.deskCorners[0].R, a.deskCorners[0].G, a.deskCorners[0].B)
 }
 
+// deskHalfAt 从唤出时那张半分辨率整屏快照里读一个点（物理像素坐标）。
+//
+// 为什么优先用它：屏幕 DC 的 GetPixel 在 DWM 合成下每读一个点都要等一次桌面
+// 回读，实测 20 个点 60~120ms；而这张快照本来就在内存里（唤出时抓的，
+// 面板一收起就释放），读一个点就是一次数组寻址。
+func (a *application) deskHalfAt(x, y int) (win.PointColor, bool) {
+	src := a.deskHalf
+	if src == nil || a.deskHalfStep < 1 {
+		return win.PointColor{}, false
+	}
+	sx := (x - a.deskHalfX) / a.deskHalfStep
+	sy := (y - a.deskHalfY) / a.deskHalfStep
+	if sx < 0 || sy < 0 || sx >= src.Rect.Dx() || sy >= src.Rect.Dy() {
+		return win.PointColor{}, false
+	}
+	o := src.PixOffset(sx, sy)
+	return win.PointColor{R: src.Pix[o], G: src.Pix[o+1], B: src.Pix[o+2], OK: true}, true
+}
+
+// colorAt 先查内存里的快照，查不到才去读屏幕（贴屏边、快照缺失时才会走到后者）。
+func (a *application) colorAt(x, y int) (win.PointColor, bool) {
+	if c, ok := a.deskHalfAt(x, y); ok {
+		return c, true
+	}
+	r, g, b, ok := win.ScreenPixel(x, y)
+	if !ok {
+		return win.PointColor{}, false
+	}
+	return win.PointColor{R: r, G: g, B: b, OK: true}, true
+}
+
 // pickDeskColor 取"窗口外面那块桌面"的颜色，给四角的月牙（buildCornerBitmaps）
 // 当底色用：客户区四角本来是空的，但这块窗口是 noRedirect 合成的，空的地方透不
 // 出桌面，只能把桌面自己的颜色铺上去。
@@ -607,35 +684,44 @@ func (a *application) pickDeskColor(small *image.RGBA) {
 	if a.panel != nil {
 		if cx, cy, cw, ch := win.WindowRectPixels(a.panel.NativeHandle()); cw > 0 {
 			const gap = 2
+			// 四角 + 四边中点一共 8 个点，见下面的批量读色。
 			// 顺序固定：左上、右上、左下、右下，和 deskCorners 一一对应。
-			corners := [4][2]int{
+			pts := [8][2]int{
 				{cx - gap, cy - gap},
 				{cx + cw + gap, cy - gap},
 				{cx - gap, cy + ch + gap},
 				{cx + cw + gap, cy + ch + gap},
 			}
-			for i, c := range corners {
-				r, g, b, ok := win.ScreenPixel(c[0], c[1])
-				if !ok {
-					continue
-				}
-				a.deskCorners[i] = ui.RGB(r, g, b)
-				a.deskCornersSet = true
-				sr, sg, sb, n = sr+int(r), sg+int(g), sb+int(b), n+1
-			}
-			// 四边中点再各取一点，凑成更接近面板四周的平均底色。
+			// 四边中点再取一点，凑成更接近面板四周的平均底色。
 			edges := [4][2]int{
 				{cx + cw/2, cy - gap},
 				{cx + cw/2, cy + ch + gap},
 				{cx - gap, cy + ch/2},
 				{cx + cw + gap, cy + ch/2},
 			}
-			for _, c := range edges {
-				r, g, b, ok := win.ScreenPixel(c[0], c[1])
-				if !ok {
+			copy(pts[4:], edges[:])
+			// 8 个点：优先从内存里的唤出快照读，缺了才读屏幕（见 colorAt）。
+			got := make([]win.PointColor, len(pts))
+			for i, p := range pts {
+				if c, ok := a.colorAt(p[0], p[1]); ok {
+					got[i] = c
+				}
+			}
+			for i := 0; i < 4; i++ {
+				c := got[i]
+				if !c.OK {
 					continue
 				}
-				sr, sg, sb, n = sr+int(r), sg+int(g), sb+int(b), n+1
+				a.deskCorners[i] = ui.RGB(c.R, c.G, c.B)
+				a.deskCornersSet = true
+				sr, sg, sb, n = sr+int(c.R), sg+int(c.G), sb+int(c.B), n+1
+			}
+			for i := 4; i < 8; i++ {
+				c := got[i]
+				if !c.OK {
+					continue
+				}
+				sr, sg, sb, n = sr+int(c.R), sg+int(c.G), sb+int(c.B), n+1
 			}
 			if n > 0 {
 				a.deskColor = ui.RGB(uint8(sr/n), uint8(sg/n), uint8(sb/n))

@@ -338,6 +338,9 @@ func Tint(img *image.RGBA, r, g, b, alpha uint8) *image.RGBA {
 // 缩成缩略 → 再取样"：缩略是 glassStep（5 像素）步长的平均，和角上那一点的真实
 // 桌面色能差出十几级。而 Windows 的窗口区域是 1 位掩码、四角没有抗锯齿，圆角的
 // 硬边只能靠"两侧同色"藏起来 —— 取样偏了，台阶就露出来。
+//
+// 一次只读一个点：每次都要 GetDC/ReleaseDC。要读多个点请用 ScreenPixels ——
+// 在 DWM 合成下每次 GetDC 都要把桌面读回来，20 个点就是 60~120ms。
 func ScreenPixel(x, y int) (uint8, uint8, uint8, bool) {
 	dc, _, _ := procGetDC.Call(0)
 	if dc == 0 {
@@ -350,4 +353,32 @@ func ScreenPixel(x, y int) (uint8, uint8, uint8, bool) {
 	}
 	// COLORREF 是 0x00BBGGRR。
 	return uint8(v), uint8(v >> 8), uint8(v >> 16), true
+}
+
+// PointColor 是一次批量取色的结果。
+type PointColor struct {
+	R, G, B uint8
+	OK      bool
+}
+
+// ScreenPixels 一次 GetDC 读完一串点。
+//
+// 为什么值得单开一个：ScreenPixel 每个点都要 GetDC + ReleaseDC，而 DWM 合成下
+// 取屏幕像素本来就要等桌面读回来 —— 实测 20 个点合计 60~120ms。四角的桌面色
+// 正好要读二十来个点，全部压在"缩放松手"那一帧上，就是那一下卡顿。
+func ScreenPixels(pts [][2]int) []PointColor {
+	out := make([]PointColor, len(pts))
+	dc, _, _ := procGetDC.Call(0)
+	if dc == 0 {
+		return out
+	}
+	defer procReleaseDC.Call(0, dc)
+	for i, p := range pts {
+		v, _, _ := procGetPixel.Call(dc, uintptr(int32(p[0])), uintptr(int32(p[1])))
+		if v == 0xFFFFFFFF {
+			continue
+		}
+		out[i] = PointColor{R: uint8(v), G: uint8(v >> 8), B: uint8(v >> 16), OK: true}
+	}
+	return out
 }
