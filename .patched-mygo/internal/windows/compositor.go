@@ -398,6 +398,12 @@ func (c *compositor) draw(dev *composition, px []uint32, w, h int32) error {
 // which is the same jagged edge a window region gives.
 func (c *compositor) roundPixels(px []uint32, w, h int32) {
 	r := c.radius
+	// baozi 的诊断补丁：窗口建好时没人把 CornerRadius 传进来（实测 radius=0，
+	// 所以内容四角一直是直角）。这里先按 24 DIP × 1.25 = 30 兜底，用来验证
+	// "内容层 alpha 裁圆角"这条路通不通；验证完应该由调用方把半径传对。
+	if r <= 0 {
+		r = 30
+	}
 	if r <= 0 || w < 2*r || h < 2*r {
 		if !c.roundLogged {
 			os.WriteFile(filepath.Join(os.TempDir(), "mygo-round.txt"), []byte(fmt.Sprintf("skip r=%d w=%d h=%d\n", r, w, h)), 0o644)

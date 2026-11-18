@@ -697,6 +697,39 @@ func (a *application) colorAt(x, y int) (win.PointColor, bool) {
 // 角上的月牙要铺的是**这个角附近**的色 —— 用一个平均色垫四个角，壁纸色调一不均
 // 就显出一块和旁边不一样的色，圆角的硬边（窗口区域是 1 位掩码、没有抗锯齿）
 // 立刻露出来。
+// pickGlassColors 取四角各自的"面板玻璃本体"颜色（左上、右上、左下、右下），
+// 给阴影层铺弧那一圈的斜坡用。数据源是唤出前做好的磨砂小图：那上面任意一点
+// 就是面板玻璃在该位置的颜色（磨砂 + 压白之后的结果），不需要拍屏幕 —— 面板
+// 自己正挡着那里。
+//
+// 取点沿对角线往弧内缩 10 物理像素：再往外就进了弧带本身，再往内磨砂图的分辨
+// 率又太糊。四个角分开取是因为壁纸是照片时四角明暗差得远。
+func (a *application) pickGlassColors(x, y, w, h int) [4]uint32 {
+	var out [4]uint32
+	small := a.frostSmall
+	if small == nil || small.Rect.Dx() == 0 || a.screenW <= 0 || a.screenH <= 0 {
+		return out
+	}
+	sw, sh := small.Rect.Dx(), small.Rect.Dy()
+	inset := 10
+	pts := [4][2]int{
+		{x + inset, y + inset},
+		{x + w - 1 - inset, y + inset},
+		{x + inset, y + h - 1 - inset},
+		{x + w - 1 - inset, y + h - 1 - inset},
+	}
+	for i, p := range pts {
+		sx := (p[0] - a.screenX) * sw / a.screenW
+		sy := (p[1] - a.screenY) * sh / a.screenH
+		if sx < 0 || sy < 0 || sx >= sw || sy >= sh {
+			continue
+		}
+		o := small.PixOffset(sx, sy)
+		out[i] = uint32(small.Pix[o])<<16 | uint32(small.Pix[o+1])<<8 | uint32(small.Pix[o+2])
+	}
+	return out
+}
+
 func (a *application) pickDeskColor(small *image.RGBA) {
 	var sr, sg, sb, n int
 	if a.panel != nil {
@@ -793,6 +826,8 @@ func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	// 压一层近似白（247,248,252，alpha 150 ≈ 盖住六成）：牛奶白磨砂，
 	// 背后透得出颜色和明暗。
 	small = win.Tint(small, 247, 248, 252, 150)
+	// 阴影层取"玻璃色"用：磨砂图上任意一点就是面板玻璃在那里的颜色。
+	a.frostSmall = small
 	// 图在界面上的尺寸 = 整个虚拟屏的 DIP 尺寸，窗口在里面取景。
 	s := a.glassScale()
 	a.frostW, a.frostH = float32(a.screenW)/s, float32(a.screenH)/s
@@ -913,14 +948,17 @@ func (a *application) refreshShadow() {
 		patches = [4]*image.RGBA{}
 	}
 	t0 := time.Now()
+	gl := a.pickGlassColors(x, y, w, h)
 	ok := a.shadow.Place(hwnd, win.ShadowSpec{
 		X: x, Y: y, W: w, H: h,
-		Radius:  r,
-		Margin:  a.shadowMargin(),
-		Corners: patches,
-		Border:  a.cornerEdge,
-		BorderW: int(math.Round(float64(s))),
-		Desk:    uint32(a.deskColor.R)<<16 | uint32(a.deskColor.G)<<8 | uint32(a.deskColor.B),
+		Radius:       r,
+		Margin:       a.shadowMargin(),
+		Corners:      patches,
+		Border:       a.cornerEdge,
+		BorderW:      int(math.Round(float64(s))),
+		Desk:         uint32(a.deskColor.R)<<16 | uint32(a.deskColor.G)<<8 | uint32(a.deskColor.B),
+		Glass:        gl[0],
+		GlassCorners: [4]uint32{gl[0], gl[1], gl[2], gl[3]},
 	})
 	if d := time.Since(t0); d > 3*time.Millisecond {
 		log.Printf("阴影: 重建 %.2fms（位图 %.2f + 上传 %.2f）",

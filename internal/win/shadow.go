@@ -177,6 +177,13 @@ type ShadowSpec struct {
 	// Desk 是"抓不到四角桌面图块时"用的兜底底色（0xRRGGBB）。给 0 表示不兜底，
 	// 弧外留空（只有阴影压着，边缘会发毛、还会漏 DWM 的白）。
 	Desk uint32
+	// Glass 是面板玻璃本体的颜色（0xRRGGBB，从面板边缘内侧的像素取样）。
+	// 弧这一圈用它和桌面色做面积混合 —— 面板自己的圆角是 GPU 硬裁剪，边界是
+	// 1 位台阶，只有用两侧真实颜色铺一条 2px 的斜坡才看不见台阶。
+	Glass uint32
+	// GlassCorners 是四角各自的玻璃色（左上、右上、左下、右下），0 表示用 Glass。
+	// 壁纸是照片时四角明暗差很远，一个全局色会在角上露出一条异色的发丝。
+	GlassCorners [4]uint32
 }
 
 func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
@@ -329,29 +336,21 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 			for ly := 0; ly < k; ly++ {
 				for lx := 0; lx < k; lx++ {
 					idc := cov.idc[ly*k+lx]
-					// 判断"这个像素在弧内还是弧外"必须用**像素中心的几何位置**，
-					// 不能用 cc：cc 是个 2px 宽的软边系数（0.5 - 距离/2），所以弧内侧
-					// 还有 1px 落进 cc>0 —— 那一段被当成弧外刷成了桌面色，弧上的
-					// 亮边线因此断成一截截短划（放大看就是"毛边"）。
+					// 这一层的圆角只做一件事：把面板那条**硬裁剪**的边界盖成一条
+					// 平滑斜坡。
 					//
-					// 现在的分法：
-					//   弧内深处（距离 > borderW）→ 玻璃，不插手
-					//   弧内 1px（0 < 距离 ≤ borderW）→ 边框弧，不透明
-					//   弧外（距离 < 0）→ 桌面色，边界那一格按**面积覆盖率**掺边框色
-					bwF := float64(sp.BorderW)
-					if bwF < 1 {
-						bwF = 1
-					}
-					// 弧带往弧内多铺到 2.5px：面板自己的圆角裁剪和画出来的弧不完全
-					// 同心，两者之间会留下 1~2px 的缝，缝里两层窗口都是透明的，透出来
-					// 的就是壁纸本身（深色照片上表现为弧内侧一道暗色月牙）。
-					// 把弧带加厚正好盖住这条缝，也让弧看起来更像一条连续的线。
-					if bwF < 2.5 {
-						bwF = 2.5
-					}
-					if idc > bwF {
-						continue // 弧内深处：面板自己的玻璃
-					}
+					// 面板内容层的圆角是 GPU 裁的（ui 的 Radius+Clip），裁剪是 1 位
+					// 台阶：弧上每一行只前进一格，行与行之间就是肉眼数得出的直角锯齿。
+					// 以前在这上面再描一条不透明的弧线，等于把台阶描第二遍，所以
+					// "怎么改都有毛边"。
+					//
+					// 现在不描线：在弧这一圈铺一条**不透明**的斜坡，两端用真实颜色
+					// （玻璃色 ↔ 桌面色）。这一层压在面板之上，所以斜坡的内半段会把
+					// 面板自己那条 1 位台阶一起盖住，屏幕上剩下的只是一条干净的曲线。
+					//   弧内深处 → 清成透明，让面板的玻璃露出来
+					//   弧带上（±ramp）→ 玻璃色到桌面色 的线性斜坡，alpha 255
+					//   弧外 → 桌面色（带阴影压暗）
+					const ramp = 2.0
 					px, py := m+lx, m+ly
 					switch c {
 					case 1:
@@ -368,12 +367,13 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 						continue
 					}
 					off := (py*int(tw) + px) * 4
-					if idc > 0 {
-						// 边框弧：整圈不透明，遮住面板在区域边界上漏的那格白。
-						s.bits[off+0] = byte(bb)
-						s.bits[off+1] = byte(bg)
-						s.bits[off+2] = byte(br)
-						s.bits[off+3] = 255
+					if idc > ramp+0.5 {
+						// 弧内深处：这一层必须是透明的，否则四角会有一道暗色月牙
+						// （阴影的渐变本来就写在这一格里，面板的玻璃被它压暗）。
+						s.bits[off+0] = 0
+						s.bits[off+1] = 0
+						s.bits[off+2] = 0
+						s.bits[off+3] = 0
 						continue
 					}
 					ix, iy := lx, ly
@@ -391,15 +391,29 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 					// 这块桌面色同样被阴影压暗，才和紧挨着的外圈接得上。
 					sa := cov.shade[ly*k+lx]
 					keep := 1 - sa
-					// 边界那一格按**面积**混：inside 是这个像素有多少面积落在弧内
-					// （8×8 超采样得到），弧外那一份是压暗的桌面色，弧内那一份是
-					// 紧挨着的边框线。这样弧的边界是真正的 1px 抗锯齿斜坡，而不是
-					// 一条 1 位掩码的台阶。alpha 必须 255：这块在轮廓外，桌面原样
-					// 可见，半透明会把边界那格的白漏出来。
-					bs := cov.inside[ly*k+lx]
-					s.bits[off+0] = byte(cb*keep*(1-bs) + bb*bs)
-					s.bits[off+1] = byte(cg*keep*(1-bs) + bg*bs)
-					s.bits[off+2] = byte(cr*keep*(1-bs) + br*bs)
+					gcol := sp.GlassCorners[c]
+					if gcol == 0 {
+						gcol = sp.Glass
+					}
+					gr := float64((gcol >> 16) & 0xFF)
+					gg := float64((gcol >> 8) & 0xFF)
+					gb2 := float64(gcol & 0xFF)
+					if gcol == 0 {
+						// 没给玻璃色就退回边框色：斜率两端至少有一个和直边线的颜色
+						// 一致，不会在弧和直边的接缝处突然掉色。
+						gr, gg, gb2 = br, bg, bb
+					}
+					// t：0 = 弧内（玻璃），1 = 弧外（桌面）。(ramp+0.5) 到 -ramp 之间线性。
+					t := (ramp + 0.5 - idc) / (ramp*2 + 0.5)
+					if t < 0 {
+						t = 0
+					}
+					if t > 1 {
+						t = 1
+					}
+					s.bits[off+0] = byte(cb*keep*t + gb2*(1-t))
+					s.bits[off+1] = byte(cg*keep*t + gg*(1-t))
+					s.bits[off+2] = byte(cr*keep*t + gr*(1-t))
 					s.bits[off+3] = 255
 				}
 			}

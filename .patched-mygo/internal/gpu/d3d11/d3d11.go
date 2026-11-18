@@ -662,6 +662,14 @@ func (r *Renderer) setBackground(c scene.Color) bool {
 // the window's swap chain shows it.
 func (r *Renderer) background() [4]float32 {
 	rgba := r.bg.Premul(1)
+	// baozi 的补丁：这里原本无条件把 alpha 拉成 1，于是"内容没画到的地方"
+	// （被圆角裁掉的四角、还没画完的那一帧）永远是**不透明白底** —— 用户说的
+	// "角上漏光/白月牙"就是从这儿来的。内容背景本身就是半透明/全透明时，
+	// 让它照原样透出去，四角才能由下面那层窗口（桌面快照）接管。
+	if r.bg.A < 255 {
+		rgba[3] = float32(r.bg.A) / 255
+		return rgba
+	}
 	rgba[3] = 1
 	return rgba
 }

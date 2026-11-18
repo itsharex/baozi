@@ -139,6 +139,10 @@ type application struct {
 	// frostPixW/H 是磨砂图的像素尺寸，用来判断能不能复用同一张纹理。
 	frostPixW int
 	frostPixH int
+	// frostSmall 是最近一次做出来的磨砂小图（整屏缩略、模糊、压白之后）。
+	// 留着它只是为了在阴影层里取"玻璃本体颜色"：弧那一圈要用玻璃色和桌面色
+	// 做面积混合，两侧颜色都必须和邻居同源。
+	frostSmall *image.RGBA
 	// screenW/H/X/Y 是整屏快照的尺寸与屏幕原点（物理像素），算取景偏移时要用。
 	screenW int
 	screenH int
@@ -628,7 +632,7 @@ func (a *application) view(c *ui.Context) {
 		// 另一层上，万一那层没盖住窗口的右边或下边（实测底栏那一截就跑到它外面了），
 		// 从那块空白按下去时命中的是这条链——它有 DragWindow，面板照样能拖着走。
 		// 没有这条兜底，"从下边拖不动面板"就会跟着内容层的尺寸走，改一次尺寸复发一次。
-		ui.Column(c).Fill().Background(a.deskColor).DragWindow().Children(func() {
+		ui.Column(c).Fill().DragWindow().Radius(glassRadius).Clip().Children(func() {
 			// 磨砂图铺满整个客户区，不裁圆角：圆角是四角的月牙（下面那几个
 			// ui.Image）和窗口区域一起做出来的，不是把这一层裁出来的。
 			ui.Image(c, a.frost).Absolute().Left(ox).Top(oy).
