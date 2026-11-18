@@ -351,16 +351,24 @@ func (a *application) refineCornerColors() {
 		}
 	}
 	for i := 0; i < 4; i++ {
+		// 这一个角三个取样里有没有非白的：都没有说明桌面本来就是白的，照收。
+		whiteish := func(c win.PointColor) bool {
+			return c.OK && c.R > 245 && c.G > 245 && c.B > 245
+		}
+		allWhite := true
+		for k := 0; k < 3; k++ {
+			if !whiteish(got[i*3+k]) {
+				allWhite = false
+				break
+			}
+		}
 		var r, g, b, n int
 		for k := 0; k < 3; k++ {
 			c := got[i*3+k]
 			if !c.OK {
 				continue
 			}
-			// 抓图失败时 BitBlt 会返回整块白（日志里见过 "桌面底色 #FDFDFD"），
-			// 拿它当月牙的底色，四个角就各糊一块白 —— 用户看到的就是"角上漏光"、
-			// 角里一道白弧。这里和 captureCornerPatches 用同一条判据：近纯白不认。
-			if c.R > 245 && c.G > 245 && c.B > 245 {
+			if !allWhite && whiteish(c) {
 				continue
 			}
 			r, g, b, n = r+int(c.R), g+int(c.G), b+int(c.B), n+1
@@ -717,9 +725,29 @@ func (a *application) pickDeskColor(small *image.RGBA) {
 					got[i] = c
 				}
 			}
+			// 近纯白的取样只在"另有非白取样"时才丢掉。
+			//
+			// 丢掉的理由：抓图失败 / 背面正好是白窗口时，那一点读到的是 #FFFFFF，
+			// 认下来这个角弧外就铺一块纯白 —— 用户说的"角上漏光"。
+			// 但要是八个点全是白的，那桌面本来就是白的，再丢就等于把角涂黑，
+			// 所以那种情况照收（见下面的 allWhite）。
+			allWhite := true
+			for i := range got {
+				c := got[i]
+				if c.OK && !(c.R > 245 && c.G > 245 && c.B > 245) {
+					allWhite = false
+					break
+				}
+			}
+			blank := func(c win.PointColor) bool {
+				return !allWhite && c.R > 245 && c.G > 245 && c.B > 245
+			}
 			for i := 0; i < 4; i++ {
 				c := got[i]
 				if !c.OK {
+					continue
+				}
+				if blank(c) {
 					continue
 				}
 				a.deskCorners[i] = ui.RGB(c.R, c.G, c.B)
@@ -729,6 +757,9 @@ func (a *application) pickDeskColor(small *image.RGBA) {
 			for i := 4; i < 8; i++ {
 				c := got[i]
 				if !c.OK {
+					continue
+				}
+				if blank(c) {
 					continue
 				}
 				sr, sg, sb, n = sr+int(c.R), sg+int(c.G), sb+int(c.B), n+1
