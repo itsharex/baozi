@@ -357,6 +357,12 @@ func (a *application) refineCornerColors() {
 			if !c.OK {
 				continue
 			}
+			// 抓图失败时 BitBlt 会返回整块白（日志里见过 "桌面底色 #FDFDFD"），
+			// 拿它当月牙的底色，四个角就各糊一块白 —— 用户看到的就是"角上漏光"、
+			// 角里一道白弧。这里和 captureCornerPatches 用同一条判据：近纯白不认。
+			if c.R > 245 && c.G > 245 && c.B > 245 {
+				continue
+			}
 			r, g, b, n = r+int(c.R), g+int(c.G), b+int(c.B), n+1
 		}
 		if n == 0 {

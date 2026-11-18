@@ -675,23 +675,41 @@ func (a *application) view(c *ui.Context) {
 				// 上边距底边 29px，标的就是这个交界点。给直边线内侧补一条同宽的
 				// 30% 边线，两边视觉宽度一致，接口就平了。
 				edgeSoft := t.Border.Alpha(0.3)
+				// 所有边线都按**物理像素**定位，而不是按 DIP 面板宽高：
+				// 面板是 909 DIP × 1.25 = 1136.25 物理像素，窗口实际只有 1136 个像素宽
+				// —— 用 909 DIP 当右边界，那条 1 DIP 的边线就压在半像素上：1135 只盖到
+				// 0.75、1136 那一格落在窗口外，右边和下边于是只剩半条线，旁边还露出
+				// 一格亮底（截图实测右侧 #F5F5F5、下侧 #FFFFFF），看上去就是"边框里面
+				// 还有一条线"。上边、左边从 0 起算，不存在这个偏差。
+				// 这里把"一像素"换算成 DIP（1/scale）来画，四条边都正好铺满一格。
+				scale := float32(a.glassScale())
+				if scale <= 0 {
+					scale = 1
+				}
+				one := 1 / scale // 正好一个物理像素的 DIP 宽
+				soft := one * 0.4
+				// 面板右/下边在 DIP 坐标里的真实位置：物理像素宽高除以缩放，可能不是整数
+				wDip := float32(math.Round(float64(pw)*float64(scale))) / scale
+				hDip := float32(math.Round(float64(ph)*float64(scale))) / scale
 				r0 := float32(glassRadius) - edgeOverlap
+				innerW := wDip - 2*r0
+				innerH := hDip - 2*r0
 				ui.Column(c).Absolute().Left(r0).Top(0).
-					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
-				ui.Column(c).Absolute().Left(r0).Top(edgeDip).
-					Size(float32(pw)-2*r0, edgeDip).Background(edgeSoft)
-				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-edgeDip).
-					Size(float32(pw)-2*r0, edgeDip).Background(t.Border)
-				ui.Column(c).Absolute().Left(r0).Top(float32(ph)-2*edgeDip).
-					Size(float32(pw)-2*r0, edgeDip).Background(edgeSoft)
+					Size(innerW, one).Background(t.Border)
+				ui.Column(c).Absolute().Left(r0).Top(one).
+					Size(innerW, soft).Background(edgeSoft)
+				ui.Column(c).Absolute().Left(r0).Top(hDip-one).
+					Size(innerW, one).Background(t.Border)
+				ui.Column(c).Absolute().Left(r0).Top(hDip-one-soft).
+					Size(innerW, soft).Background(edgeSoft)
 				ui.Column(c).Absolute().Left(0).Top(r0).
-					Size(edgeDip, float32(ph)-2*r0).Background(t.Border)
-				ui.Column(c).Absolute().Left(edgeDip).Top(r0).
-					Size(edgeDip, float32(ph)-2*r0).Background(edgeSoft)
-				ui.Column(c).Absolute().Left(float32(pw)-edgeDip).Top(r0).
-					Size(edgeDip, float32(ph)-2*r0).Background(t.Border)
-				ui.Column(c).Absolute().Left(float32(pw)-2*edgeDip).Top(r0).
-					Size(edgeDip, float32(ph)-2*r0).Background(edgeSoft)
+					Size(one, innerH).Background(t.Border)
+				ui.Column(c).Absolute().Left(one).Top(r0).
+					Size(soft, innerH).Background(edgeSoft)
+				ui.Column(c).Absolute().Left(wDip-one).Top(r0).
+					Size(one, innerH).Background(t.Border)
+				ui.Column(c).Absolute().Left(wDip-one-soft).Top(r0).
+					Size(soft, innerH).Background(edgeSoft)
 			})
 			// 四角的月牙最后画，压住磨砂图、底色和边线：弧外是该角真实的桌面色，
 			// 弧上按覆盖率渐隐，弧内透明露出玻璃 —— 见 glass.go 的

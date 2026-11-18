@@ -198,7 +198,13 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	// 现在不偏移：alpha 在 d=m 处正好归零，图层边缘天然干净。
 	offY := float64(m)
 	r := float64(radius)
-	hw, hh := float64(w)/2, float64(h)/2
+	// 这里用 (w-1)/2 而不是 w/2 当中心：面板占的是 [m, m+w-1] 这 w 个像素，
+	// 用 w/2 时左右两侧到中心的距离差半格 —— 左边第一格离边缘 1 格、右边第一格
+	// 离边缘 0 格，于是右边的阴影从"零"起步，紧贴面板右边和下边的那一列/行完全
+	// 没被压暗，露出一条 1px 的亮线（截图实测右侧 #F5F5F5、下侧 #FFFFFF；
+	// 左边、上边那一格却压暗到 #A3A3A3）。用户看到的就是"下边和右边在边框内部
+	// 还有一条线"。改成 (w-1)/2 之后四条边对称，第一格都有影。
+	hw, hh := float64(w-1)/2, float64(h-1)/2
 	qw, qh := hw-r, hh-r
 	if qw < 0 {
 		qw = 0
@@ -208,7 +214,7 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	}
 	const maxAlpha = constMaxAlpha
 	mf := float64(m)
-	cx0, cy0 := float64(w)/2, float64(h)/2
+	cx0, cy0 := hw, hh // 和上面的中心保持一致，见那条注释（差半格会在右下露出一条亮线）
 	// 只画"边带"：面板盖住的那一大片内部 alpha 恒为 0，没必要每帧都算一遍。
 	// 这一改动把缩放时的一帧从"整张 1140×760 ≈ 87 万像素"降到"四条带"，
 	// 是"缩放跟不跟手"的关键（整张算的时候一次回调 15~25ms，肉眼就是卡）。
@@ -380,6 +386,53 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 					s.bits[off+2] = byte(cr*keep*t + br*(1-t))
 					s.bits[off+3] = 255
 				}
+			}
+		}
+	}
+
+	// 四条直边的那一圈边线也由这一层描。
+	//
+	// 为什么不让面板自己画：面板的 DIP 宽高换成物理像素不是整数（909 DIP × 1.25
+	// = 1136.25），右边、下边那条边线就压在半像素上 —— 窗口只有 1136 格，最后一格
+	// 只盖到一部分，于是右边和下边剩下一格亮底（截图实测右侧 #F5F5F5、下侧
+	// #FFFFFF），看上去就是"边框里面还有一条线"；上边、左边从 0 起算，没有这个
+	// 偏差，所以只坏在右下两边。这一层是按**整数物理像素**布局的（矩形就落在
+	// 面板的窗口矩形上），在这儿描一圈永远对得齐，顺手把那格亮底盖掉。
+	if sp.BorderW > 0 && w >= 4 && h >= 4 {
+		br2 := byte((sp.Border >> 16) & 0xFF)
+		bg2 := byte((sp.Border >> 8) & 0xFF)
+		bb2 := byte(sp.Border & 0xFF)
+		// 圆角那一段由上面的弧带负责，直边从弧的切点开始。
+		rInset := int(math.Ceil(r))
+		if rInset > w/2 {
+			rInset = w / 2
+		}
+		if rInset > h/2 {
+			rInset = h / 2
+		}
+		setEdge := func(px, py int) {
+			if px < 0 || px >= twi || py < 0 || py >= thi {
+				return
+			}
+			o := (py*twi + px) * 4
+			// 位图是 BGRA（和上面弧带那段一致：索引 0 是蓝）
+			s.bits[o+0] = bb2
+			s.bits[o+1] = bg2
+			s.bits[o+2] = br2
+			s.bits[o+3] = 255
+		}
+		bw := sp.BorderW
+		if bw > 4 {
+			bw = 4
+		}
+		for k := 0; k < bw; k++ {
+			for px := m + rInset; px < m+w-rInset; px++ {
+				setEdge(px, m+k)     // 上边
+				setEdge(px, m+h-1-k) // 下边
+			}
+			for py := m + rInset; py < m+h-rInset; py++ {
+				setEdge(m+k, py)     // 左边
+				setEdge(m+w-1-k, py) // 右边
 			}
 		}
 	}

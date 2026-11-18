@@ -121,7 +121,11 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 	if w <= 0 || h <= 0 {
 		return false
 	}
-	// 区域取到 +1：右下角那条线要包进来，否则少一像素亮边。
+	// 区域就取窗口矩形本身 (0,0,w,h)：以前写的是 w+1/h+1（"右下角那条线要包进来"），
+	// 结果右边和下边外侧多露出 1 个像素 —— 那一列没有内容可画，DWM 合成时填白，
+	// 屏幕上就是紧贴边框外侧一道 1px 的亮线（截图实测右侧 #F5F5F5、下侧 #FFFFFF，
+	// 而上边左边从 0 起、不存在这一格）。这道亮线正是"下边和右边在边框内部多一条线"。
+	// 边框线本身画在窗口的最后一格（w-1），本来就在区域里面，不需要多包一格。
 	//
 	// 圆角半径再放大 2px：GDI 区域的弧是**按扫描线量的整数格**，没有抗锯齿。
 	// 区域半径和画出来的弧一模一样时，那道硬台阶正好切在弧的抗锯齿带上（那里
@@ -131,7 +135,7 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 	// 像素都不丢。
 	const regionRadiusPad = 2
 	rgnRadius := radius + regionRadiusPad
-	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(w+1), uintptr(h+1), uintptr(rgnRadius*2), uintptr(rgnRadius*2))
+	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(w), uintptr(h), uintptr(rgnRadius*2), uintptr(rgnRadius*2))
 	if rgn == 0 {
 		return false
 	}
