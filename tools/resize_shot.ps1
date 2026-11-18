@@ -17,3 +17,4 @@ pwsh -NoProfile -File "D:\work\baozi\tools\shot.ps1"
 Copy-Item "D:\work\baozi\dist\shot_panel.png" "D:\work\baozi\dist\shot_resizing.png" -Force
 Get-Job | Wait-Job | Remove-Job -Force
 Write-Output "shot=D:\work\baozi\dist\shot_resizing.png"
+

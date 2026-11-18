@@ -51,7 +51,7 @@ public class BaoziShot {
 }
 '@
 
-$pidBaozi = [uint32](Get-Process baozi).Id
+$pidBaozi = [uint32]((Get-Process -Name baozi,baozi.debug -ErrorAction SilentlyContinue | Select-Object -First 1).Id)
 $rect = [BaoziShot]::Ensure($pidBaozi, $true)
 $parts = $rect -split ','
 if ($parts[2] -eq '0') { Write-Output "panel=not-visible"; exit 1 }
@@ -68,3 +68,5 @@ $out = "D:\work\baozi\dist\shot_panel.png"
 $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 Write-Output "panel=$rect shot=$out ${w}x${h}"
+
+

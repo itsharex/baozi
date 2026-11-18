@@ -4,6 +4,7 @@ import (
 	"image"
 	"log"
 	"math"
+	"os"
 	"time"
 
 	"github.com/egoist/mygo/ui"
@@ -28,6 +29,11 @@ import (
 // 就缩到 1/8（2560×1440 → 320×180），只分配两百多 KB —— 既省内存又省模糊时间，
 // 显示时放大回去照样是均匀的一片糊。
 const glassStep = 8
+
+// deskHalfStep 是"给四角弧外当底色"用的半分辨率快照的降采样倍数。
+// 用 2 而不是 8：8 只有 320×180，裁一个 52px 的角块只剩 6 个源像素，放大出来是色块；
+// 2 是 1280×720（3.7 MB），面板藏起来时就释放，不值得为它省那点内存。
+const deskHalfStep = 2
 
 // glassRadius 是窗口区域的圆角半径（DIP），也是内容那条弧的半径。
 //
@@ -122,6 +128,89 @@ func (a *application) captureCornerPatches() {
 	log.Printf("玻璃: 四角 patch %dx%d 已抓 %d/4（窗口 %d,%d %dx%d）", size, size, kept, cx, cy, cw, ch)
 }
 
+// cornerPatchesAt 按**当前位置**从半分辨率整屏快照里裁出四角那一小块桌面。
+//
+// 阴影层拿它铺"弧外那块"（面板被 SetWindowRgn 裁掉、自己画不出去的地方）。
+// 用快照而不是现场 BitBlt：面板可见时现场抓到的就是面板自己，抓不了；
+// 而唤出前抓的那一份是固定的全屏图，无论面板后来被拖到哪、缩成多大，
+// 都能从同一张图里按新坐标重新裁 —— 弧外颜色永远和真实桌面一致。
+// 快照没有（抓失败）时退回 captureCornerPatches 存的那一份。
+func (a *application) cornerPatchesAt(cx, cy, cw, ch, size int) [4]*image.RGBA {
+	shot := a.deskHalf
+	if shot == nil || size <= 0 || cw < size || ch < size {
+		return a.cornerPatches
+	}
+	step := a.deskHalfStep
+	if step < 1 {
+		step = 1
+	}
+	origins := [4][2]int{
+		{cx, cy},
+		{cx + cw - size, cy},
+		{cx, cy + ch - size},
+		{cx + cw - size, cy + ch - size},
+	}
+	var out [4]*image.RGBA
+	for i := 0; i < 4; i++ {
+		// 快照坐标：屏幕原点已经在抓图时归一化掉了，所以只减虚拟屏原点。
+		sx := float64(origins[i][0]-a.deskHalfX) / float64(step)
+		sy := float64(origins[i][1]-a.deskHalfY) / float64(step)
+		sw := float64(size) / float64(step)
+		sh := float64(size) / float64(step)
+		if sx < 0 || sy < 0 || sx+sw > float64(shot.Rect.Dx()) || sy+sh > float64(shot.Rect.Dy()) {
+			out[i] = a.cornerPatches[i]
+			continue
+		}
+		out[i] = samplePatch(shot, sx, sy, sw, sh, size)
+	}
+	return out
+}
+
+// samplePatch 从 src 的 (sx,sy,sw,sh) 这块里双线性采样出 size×size 的图。
+// 放大倍数是 step（2），双线性够用；要的是"糊得均匀"，不是细节。
+func samplePatch(src *image.RGBA, sx, sy, sw, sh float64, size int) *image.RGBA {
+	dst := image.NewRGBA(image.Rect(0, 0, size, size))
+	for y := 0; y < size; y++ {
+		fy := sy + (float64(y)+0.5)*sh/float64(size) - 0.5
+		y0 := int(math.Floor(fy))
+		wy := fy - float64(y0)
+		if y0 < 0 {
+			y0, wy = 0, 0
+		}
+		if y0 >= src.Rect.Dy()-1 {
+			y0, wy = src.Rect.Dy()-1, 0
+		}
+		for x := 0; x < size; x++ {
+			fx := sx + (float64(x)+0.5)*sw/float64(size) - 0.5
+			x0 := int(math.Floor(fx))
+			wx := fx - float64(x0)
+			if x0 < 0 {
+				x0, wx = 0, 0
+			}
+			if x0 >= src.Rect.Dx()-1 {
+				x0, wx = src.Rect.Dx()-1, 0
+			}
+			pick := func(px, py int) (float64, float64, float64) {
+				o := src.PixOffset(px, py)
+				return float64(src.Pix[o]), float64(src.Pix[o+1]), float64(src.Pix[o+2])
+			}
+			r00, g00, b00 := pick(x0, y0)
+			r10, g10, b10 := pick(x0+1, y0)
+			r01, g01, b01 := pick(x0, y0+1)
+			r11, g11, b11 := pick(x0+1, y0+1)
+			mix := func(v00, v10, v01, v11 float64) float64 {
+				return (v00*(1-wx)+v10*wx)*(1-wy) + (v01*(1-wx)+v11*wx)*wy
+			}
+			o := dst.PixOffset(x, y)
+			dst.Pix[o] = byte(mix(r00, r10, r01, r11) + 0.5)
+			dst.Pix[o+1] = byte(mix(g00, g10, g01, g11) + 0.5)
+			dst.Pix[o+2] = byte(mix(b00, b10, b01, b11) + 0.5)
+			dst.Pix[o+3] = 255
+		}
+	}
+	return dst
+}
+
 // patchLooksBlank 判断抓下来的角块是不是"一片白"。
 //
 // 采样点里绝大多数都接近 #FFFFFF 时当作无效：真桌面上确实可能有白色窗口，
@@ -151,8 +240,18 @@ func (a *application) snapshotScreen() {
 	if a.panel == nil {
 		return
 	}
-	// 四角那小块桌面顺手抓下来，给月牙弧外当底色（此刻窗口还没显示）。
+	// 四角那小块桌面顺手抓下来（此刻窗口还没显示）。
 	a.captureCornerPatches()
+	// 半分辨率整屏快照：四角"弧外"那块以后就靠它现场裁，面板拖动/缩放都不会过期。
+	if vx, vy, vw, vh := win.VirtualScreenRect(); vw > 0 && vh > 0 {
+		if half, err := win.CaptureScreenScaled(vx, vy, vw, vh, deskHalfStep); err == nil {
+			a.deskHalf = half
+			a.deskHalfX, a.deskHalfY, a.deskHalfStep = vx, vy, deskHalfStep
+		} else {
+			log.Printf("玻璃: 半分辨率快照失败 %v（四角弧外改用现场 patch）", err)
+			a.deskHalf = nil
+		}
+	}
 	if win.SystemGlass() {
 		// Win11 22H2 起这层材质由 DWM 自己画（mygo 的 vibrancy 走系统 backdrop），
 		// 用不上我们这张图。
@@ -666,12 +765,26 @@ func (a *application) refreshShadow() {
 	}
 	s := a.glassScale()
 	r := int(math.Round(float64(glassRadius) * float64(s)))
+	// 调试开关（只在手动跑 dist\baozi.debug.exe 时用）：
+	//   BAOZI_NOSHADOW=1  阴影层整块不上屏（看"没有自绘层时四角到底有没有白"）
+	//   BAOZI_NOCORNER=1  只保留外圈阴影，不补四角弧外的桌面色/边框弧
+	if os.Getenv("BAOZI_NOSHADOW") == "1" {
+		a.hideShadow()
+		return
+	}
+	// 四角"弧外"那块要铺的是**当前位置**的真实桌面：用唤出那一刻抓的半分辨率
+	// 整屏图现场裁，而不是用旧位置 BitBlt 下来的 patch —— 后者在面板被拖动/缩放
+	// 之后就过期了，壁纸是照片时那块颜色会明显串味，看起来就是"角上画了一道圆弧"。
+	patches := a.cornerPatchesAt(x, y, w, h, int(math.Round(float64(glassRadius)*float64(s)))+10)
+	if os.Getenv("BAOZI_NOCORNER") == "1" {
+		patches = [4]*image.RGBA{}
+	}
 	t0 := time.Now()
 	ok := a.shadow.Place(hwnd, win.ShadowSpec{
 		X: x, Y: y, W: w, H: h,
 		Radius:  r,
 		Margin:  a.shadowMargin(),
-		Corners: a.cornerPatches,
+		Corners: patches,
 		Border:  a.cornerEdge,
 		BorderW: int(math.Round(float64(s))),
 	})
@@ -684,8 +797,6 @@ func (a *application) refreshShadow() {
 	if !ok {
 		log.Print("阴影: 图层布局失败")
 	}
-	sx, sy, sw, sh := a.shadow.Bounds()
-	log.Printf("阴影: 面板 %dx%d @ %d,%d → 图层 %dx%d @ %d,%d", w, h, x, y, sw, sh, sx, sy)
 	a.shadow.Show()
 }
 
@@ -706,7 +817,9 @@ func (a *application) followShadow() {
 	if hwnd == 0 {
 		return
 	}
-	x, y, _, _ := win.ClientRectPixels(hwnd)
+	// 用窗口矩形（不是客户区）：圆角区域、阴影位图的参照矩形都是窗口矩形，
+	// 混着用会在拖动时错开那圈边框带的宽度，阴影相对面板跳一下。
+	x, y, _, _ := win.WindowRectPixels(hwnd)
 	// 拖动中尺寸不变，宽度按上次建好的位图来（由 Place 记着）。
 	a.shadow.Move(x, y, a.shadowMargin())
 }

@@ -47,7 +47,7 @@ public class BaoziResize {
 }
 '@
 
-$pidBaozi = [uint32](Get-Process baozi).Id
+$pidBaozi = [uint32]((Get-Process -Name baozi,baozi.debug -ErrorAction SilentlyContinue | Select-Object -First 1).Id)
 $before = [BaoziResize]::Rect($pidBaozi)
 Write-Output "before=$before"
 # 先放大 16 帧、再缩回 16 帧
@@ -58,3 +58,5 @@ Start-Sleep -Milliseconds 300
 $after = [BaoziResize]::Rect($pidBaozi)
 Write-Output "after=$after"
 Write-Output (Get-Content -LiteralPath "$env:LOCALAPPDATA\Baozi\baozi.log" -Encoding utf8 | Select-String "缩放:" | Select-Object -Last 20)
+
+

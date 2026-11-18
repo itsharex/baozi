@@ -384,10 +384,18 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	sz := size{CX: tw, CY: th}
 	blend := blendFunction{SourceConstantAlpha: 255, AlphaFormat: 1}
 	tULW := time.Now()
-	ulr, _, ulerr := procUpdateLayeredWindow.Call(s.hwnd, screenDC(),
+	// GetDC 必须配 ReleaseDC：这个函数在缩放时**每帧**都会跑，漏一次就是漏一个 DC。
+	// 曾经这里直接 screenDC() 不还，拖动几十帧之后进程的 DC 池被吃光，整个桌面卡住
+	// （用户实测"缩放时卡死"）。严格说漏的 DC 会被系统在进程退出时回收，但
+	// 一帧一次的速度下几百帧就够呛了。
+	dc := screenDC()
+	ulr, _, ulerr := procUpdateLayeredWindow.Call(s.hwnd, dc,
 		uintptr(unsafe.Pointer(&dst)), uintptr(unsafe.Pointer(&sz)),
 		s.memDC, uintptr(unsafe.Pointer(&src)), 0,
 		uintptr(unsafe.Pointer(&blend)), ulwAlpha)
+	if dc != 0 {
+		procReleaseDC.Call(0, dc)
+	}
 	ulwCost := time.Since(tULW)
 	s.dbg = ulr == 0
 	s.dbgInfo = "err=" + ulerr.Error()
@@ -656,10 +664,14 @@ func (s *Shadow) Move(x, y, m int) {
 		return
 	}
 	dst := point{X: int32(x - m), Y: int32(y - m)}
-	procUpdateLayeredWindow.Call(s.hwnd, screenDC(),
+	dc := screenDC()
+	procUpdateLayeredWindow.Call(s.hwnd, dc,
 		uintptr(unsafe.Pointer(&dst)), uintptr(unsafe.Pointer(&size{CX: s.w, CY: s.h})),
 		s.memDC, uintptr(unsafe.Pointer(&point{})), 0,
 		uintptr(unsafe.Pointer(&blendFunction{SourceConstantAlpha: 255, AlphaFormat: 1})), ulwAlpha)
+	if dc != 0 {
+		procReleaseDC.Call(0, dc)
+	}
 	s.x, s.y = dst.X, dst.Y
 }
 

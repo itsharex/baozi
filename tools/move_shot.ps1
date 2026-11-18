@@ -49,7 +49,7 @@ public class BaoziMove2 {
   }
 }
 '@
-$pidB = [uint32](Get-Process baozi).Id
+$pidB = [uint32]((Get-Process -Name baozi,baozi.debug -ErrorAction SilentlyContinue | Select-Object -First 1).Id)
 Write-Output ("before=" + [BaoziMove2]::Now($pidB))
 # 子进程半拍后截屏（截到"正在滑"的那一帧）
 $shot = Start-Process pwsh -ArgumentList '-NoProfile','-Command',"Start-Sleep -Milliseconds $DelayMs; pwsh -NoProfile -File 'D:\work\baozi\tools\shot.ps1'; Copy-Item 'D:\work\baozi\dist\shot_panel.png' 'D:\work\baozi\dist\shot_moving.png' -Force" -PassThru -WindowStyle Hidden
@@ -58,3 +58,4 @@ Start-Sleep -Milliseconds 150
 $shot | Wait-Process -Timeout 20
 Write-Output ("after=" + [BaoziMove2]::Now($pidB))
 Write-Output "shot=D:\work\baozi\dist\shot_moving.png"
+

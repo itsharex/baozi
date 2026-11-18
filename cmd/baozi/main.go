@@ -161,6 +161,12 @@ type application struct {
 	// 壁纸在那里有渐变（实测弧外铺 #79C5F7、紧挨着的真桌面是 #15A4F2），
 	// 月牙就成了壁纸上一道亮带。取不到（尺寸对不上、抓图失败）就退回 deskCorners。
 	cornerPatches [4]*image.RGBA
+	// deskHalf 是唤出那一刻的**半分辨率整屏快照**，专门给四角"弧外"那块当底色用。
+	// 为什么不用 BitBlt 现场抓的 patch：面板一被拖动/缩放，那块 patch 就过期了
+	// （抓的是上一处位置），壁纸是照片时颜色明显串味，屏幕上就是"角上画了一道弧"。
+	// 半分辨率（2560×1440 → 1280×720，3.7 MB）够用：那块本身就在阴影下面，糊一点看不出来。
+	deskHalf                           *image.RGBA
+	deskHalfX, deskHalfY, deskHalfStep int
 	// cornerBitmaps 是四角那四张"月牙"位图，cornerPx 是它们的边长（物理像素）。
 	// 弧外铺 deskCorners 的桌面色，弧上按覆盖率渐隐到透明 —— 圆角那条内边界
 	// 的抗锯齿就是它们给的。变了桌面色或换了面板尺寸就重建（见 buildCornerBitmaps）。
@@ -2024,6 +2030,9 @@ func (a *application) placePanel(x, y int) {
 func (a *application) hidePanel() {
 	a.hideShadow()
 	a.panel.Hide()
+	// 半分辨率整屏快照只在"面板开着"这段时间有用（四角弧外要按当前位置裁），
+	// 面板收起就放掉，3.7 MB 不占着常驻。
+	a.deskHalf = nil
 }
 
 // finishResize 是缩放停手后的一次收尾：重设圆角区域、重画四角月牙，最后把阴影
@@ -2239,11 +2248,16 @@ func (a *application) ready() {
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
 	a.panel.OnResize(func() {
 		t0 := time.Now()
-		// 阴影层**每帧都跟着重建**，不再收起来。
-		// 收起之后四角"弧外那块"就没人补了：那是 DWM 填的白，面板自己被区域裁掉
-		// 画不出去 —— 缩放过程中四角会冒白（和"拖动时四角变直角"是同一类观感问题）。
-		// 代价是一次全位图重画，实测 1100×700 约 2~3ms，和区域重设一起仍在 6ms 内。
-		a.refreshShadow()
+		// 缩放期间把阴影层收起来（只留面板自己 + 每帧重设的圆角区域）。
+		//
+		// 也试过"每帧重建"，两个问题：
+		//   1) 每帧多一次位图重画 + UpdateLayeredWindow + SetWindowPos(TOPMOST)，
+		//      缩放回调用实测从 5~6ms 涨到 8~10ms —— 用户对跟手最敏感，不值；
+		//   2) 面板自己的图层在那一帧还没按新尺寸重排，四角补的桌面色/边框弧会
+		//      错位露在玻璃外面，屏幕上就是"缩放时能看到四角画了道弧"。
+		// 收起只需一次 ShowWindow，停手 160ms 由 finishResize 按最终尺寸重建。
+		// （阴影"常驻"说的是空闲状态：唤出后一直有影，不是拖动的那 0.x 秒。）
+		a.hideShadow()
 		// 窗口区域**每帧都要跟着重设**：形状不跟着窗口走的话，拖动过程中四角就是直的
 		// （而且旧区域还会把窗口新长出来的部分裁掉）。这一步只是一次
 		// CreateRoundRectRgn + SetWindowRgn，实测不到 1ms。
