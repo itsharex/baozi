@@ -702,7 +702,11 @@ func (a *application) view(c *ui.Context) {
 			// 采样渗到透明边缘，角上漏出一两个白点（左上、左下从 0 起步，所以没事，
 			// 这就是四个角只有斜对的两个露白的原因）。这里按窗口客户区的真实像素
 			// 宽高算偏移，乘回缩放之后正好是整数。
-			if UseCornerBitmaps && a.cornerPx > 0 {
+			// 拖动/缩放期间也画：那时阴影层是收起的（见 OnResize），四角就只剩窗口
+			// 区域那道 1 位硬边 —— 右边和下边正在跟着手柄变，台阶看得最清，用户看到的
+			// 就是"右上、右下变成方角"。静止时仍然交给阴影层（它画的弧最干净，
+			// 两套一起画反而会叠出一道白边）。
+			if (UseCornerBitmaps || a.dragging()) && a.cornerPx > 0 {
 				s := a.glassScale()
 				pw, ph := a.panelSize()
 				cw, ch := int(math.Round(float64(pw)*float64(s))), int(math.Round(float64(ph)*float64(s)))

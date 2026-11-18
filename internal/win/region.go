@@ -122,7 +122,16 @@ func RoundRegion(hwnd uintptr, radius int) bool {
 		return false
 	}
 	// 区域取到 +1：右下角那条线要包进来，否则少一像素亮边。
-	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(w+1), uintptr(h+1), uintptr(radius*2), uintptr(radius*2))
+	//
+	// 圆角半径再放大 2px：GDI 区域的弧是**按扫描线量的整数格**，没有抗锯齿。
+	// 区域半径和画出来的弧一模一样时，那道硬台阶正好切在弧的抗锯齿带上（那里
+	// alpha 还接近满值），于是不管里面画得多细，屏幕上的角都是一圈栅栏 ——
+	// 这就是"角上毛边"的来源。把区域放大 2px，硬边就落到弧**外面**那片区域，
+	// 那里本来铺的就是桌面色（面板最底一层铺满窗口），看不见；弧该有的软边一个
+	// 像素都不丢。
+	const regionRadiusPad = 2
+	rgnRadius := radius + regionRadiusPad
+	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(w+1), uintptr(h+1), uintptr(rgnRadius*2), uintptr(rgnRadius*2))
 	if rgn == 0 {
 		return false
 	}

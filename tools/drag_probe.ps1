@@ -46,7 +46,9 @@ public class DragProbe2 {
       uint p; GetWindowThreadProcessId(h, out p);
       if (p != pid) return true;
       var t = new StringBuilder(256); GetWindowText(h, t, 256);
-      if (t.ToString() == "Baozi" && IsWindowVisible(h)) { P = h; return false; }
+      // 只按标题找：面板是 noRedirect 的合成窗口，系统在它身上会把 IsWindowVisible
+      // 报成 false（窗口明明在屏上），带那个条件就永远找不到。
+      if (t.ToString() == "Baozi") { P = h; return false; }
       return true;
     }, IntPtr.Zero);
     return P;
