@@ -358,10 +358,11 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 					}
 					off := (py*int(tw) + px) * 4
 					if cc <= 0 {
-						// 边框弧：seam 段涂实，band 段按覆盖率做抗锯齿。
-						a := bb2
-						if sm > 0 {
-							a = 1
+						// 边框弧：用 ring 的软边 alpha（内边界 1px 线性过渡），
+						// 不再用"sm>0 就涂实"的 1 位判据。
+						a := cov.ring[ly*k+lx]
+						if a <= 0 {
+							a = bb2
 						}
 						s.bits[off+0] = byte(bb * a)
 						s.bits[off+1] = byte(bg * a)
@@ -559,6 +560,7 @@ type cornerCoverageT struct {
 	shade []float64 // 同一位置该压多黑（和外圈阴影同曲线）
 	band  []float64 // 弧内侧 borderW 像素的边框覆盖率
 	seam  []float64 // 紧贴弧边界的 1px（弧内侧），要涂实遮住面板漏的白
+	ring  []float64 // 弧那段边框线的最终 alpha（内侧 1px 线性软边）
 }
 
 var (
@@ -582,6 +584,7 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 		shade: make([]float64, size*size),
 		band:  make([]float64, size*size),
 		seam:  make([]float64, size*size),
+		ring:  make([]float64, size*size),
 	}
 	r := float64(radius)
 	mf := float64(margin)
@@ -620,7 +623,14 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 			cov.cov[i] = math.Max(0, math.Min(1, 0.5-insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)/aaW))
 			cov.band[i] = float64(inBand) / float64(ss*ss)
 			cov.seam[i] = float64(inSeam) / float64(ss*ss)
-			d := -insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)
+			// ring 是弧那段边框线的最终 alpha：弧边界一侧交给 cc 和填充去混，
+			// **内侧**那条边（到弧的距离 = borderW）以前是"sm>0 就涂 1"的硬判据，
+			// 等于 1 位掩码 —— 沿弧走一圈，内侧边缘的台阶就是 1 像素跳变，也就是
+			// 用户说的"毛边"。这里按到内边界的距离做 1px 线性过渡：相邻像素的
+			// 透明度连续变化，内侧也软下来。
+			idc := insideDistance(float64(lx)+0.5, float64(ly)+0.5, r)
+			cov.ring[i] = math.Max(0, math.Min(1, 0.5+(bw-idc)))
+			d := -idc
 			if d > 0 && d < mf {
 				f := 1 - d/mf
 				cov.shade[i] = constMaxAlpha * f * f * f
