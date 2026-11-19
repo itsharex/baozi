@@ -11,6 +11,11 @@ package main
 // 自己接管以后顺序可以反过来：**先把内容画好、再挪窗口、再 Present**，让
 // "窗口新位置"和"新内容"落在同一次合成里 —— 相对位移为 0，怎么快都不错位。
 //
+// 为什么要用 SetWindowSubclass 而不是 SetWindowLongPtr 换 WndProc：
+// mygo 在每次 Show / 改窗口样式时都可能再 SetWindowLongPtr 一次，直接把换上去的
+// proc 顶掉（第一版就是这样，装上以后一段时间就静默失效，表现是"完全拖不动"）。
+// 子类化是插在消息链**最前面**的一层，mygo 换 GWLP_WNDPROC 也摘不掉它。
+//
 // 消息处理上的取舍：
 //   · 左键按下照旧转发给 mygo（图标、搜索框、底部按钮的按下态和聚焦都保持原样）；
 //   · 位移超过 6px 才开始接管，之前照旧转发（单击、拖选不受影响）；
@@ -30,14 +35,19 @@ import (
 )
 
 var (
-	dragUser32      = windows.NewLazySystemDLL("user32.dll")
-	procSetWndProc  = dragUser32.NewProc("SetWindowLongPtrW")
-	procCallWndProc = dragUser32.NewProc("CallWindowProcW")
-	procSetCapture  = dragUser32.NewProc("SetCapture")
-	procRelCapture  = dragUser32.NewProc("ReleaseCapture")
-	procGetCursor   = dragUser32.NewProc("GetCursorPos")
-	procSetWinPos   = dragUser32.NewProc("SetWindowPos")
-	procGetKeyState = dragUser32.NewProc("GetKeyState")
+	dragUser32 = windows.NewLazySystemDLL("user32.dll")
+	dragCtl32  = windows.NewLazySystemDLL("comctl32.dll")
+
+	procSetSubclass   = dragCtl32.NewProc("SetWindowSubclass")
+	procDelSubclass   = dragCtl32.NewProc("RemoveWindowSubclass")
+	procDefSubclass   = dragCtl32.NewProc("DefSubclassProc")
+	procEnumChild     = dragUser32.NewProc("EnumChildWindows")
+	procGetClassNameW = dragUser32.NewProc("GetClassNameW")
+
+	procSetCapture = dragUser32.NewProc("SetCapture")
+	procRelCapture = dragUser32.NewProc("ReleaseCapture")
+	procGetCursor  = dragUser32.NewProc("GetCursorPos")
+	procSetWinPos  = dragUser32.NewProc("SetWindowPos")
 )
 
 const (
@@ -46,17 +56,17 @@ const (
 	wmMouseMove   = 0x0200
 	wmCancelMode  = 0x001F
 
-	// GWLP_WNDPROC 在 64 位上就是 -4。
-	gwlpWndProc = ^uintptr(3)
-
+	swpNoSize     = 0x0001
+	swpNoMove     = 0x0002
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
-	swpNoSize     = 0x0001
-
-	vkLButton = 0x01
+	swpShowWindow = 0x0040
 
 	// 开始接管的位移阈值（物理像素）。小于它是普通点击/拖选，照旧交给 mygo。
 	dragThreshold = 6
+
+	// 子类化用的固定 id，一个窗口只挂一份。
+	dragSubclassID = 0x626F7A // "boz"
 )
 
 type point struct{ X, Y int32 }
@@ -64,9 +74,9 @@ type point struct{ X, Y int32 }
 // selfDrag 是面板自绘拖动的状态机。
 type selfDrag struct {
 	app   *application
-	hwnd  uintptr
-	proc  uintptr // 原来的 WndProc（mygo 的），转发消息给它
-	tramp uintptr // 我们注册的 Go 回调
+	host  uintptr // 顶层窗口：SetWindowPos / 取客户区原点 / 重绘的目标
+	hwnd  uintptr // 挂子类化的窗口：mygo 的 MyGoSurface 子窗口 = 鼠标消息真正落点
+	tramp uintptr
 
 	pending bool // 按下但还没到阈值
 	active  bool // 已接管
@@ -82,39 +92,87 @@ type selfDrag struct {
 	// （那圈看不见的缩放边框），客户区原点不等于窗口原点；底图取景用的是**客户区**
 	// 原点，直接用 SetWindowPos 的 x,y 会让整张玻璃偏出几个像素。
 	clientDX, clientDY int32
+
+	// lastDraw 是拖动渲染的节流点：SetWindowPos 会反过来再派 WM_MOUSEMOVE，
+	// 不限速时每次移动都能滚出一串几百帧（实测 405fps），白烧 CPU。
+	lastDraw time.Time
+
+	// 分项耗时累计（微秒）：挪窗口 / 阴影 / 算底图 / 排帧。拖动里到底哪一步在
+	// 吃掉帧时间，只能靠这个数出来。
+	costPos, costShadow, costBacking, costInvalidate int64
+	costSamples                                      int64
+
+	// faded 表示拖动中已经切到糊化玻璃（setDragFade），松手时恢复清晰。
+	faded bool
+
+	dbgLog int
 }
 
-// installSelfDrag 在面板窗口上装一份自己的 WndProc。必须在窗口建好之后调用。
-func (a *application) installSelfDrag(hwnd uintptr) {
-	if hwnd == 0 || a.selfDrag != nil {
+// findMyGoSurface 在顶层窗口下面找 mygo 的 MyGoSurface 子窗口 —— 鼠标消息落点。
+// surface.go 里它是 createWindow(wsExNoRedirect, surfaceClass, ..., w.hwnd) 建的
+// 子窗口：真正接鼠标的是它，不是顶层 MyGoWindow。
+func findMyGoSurface(host uintptr) uintptr {
+	var found uintptr
+	cb := windows.NewCallback(func(child, _ uintptr) uintptr {
+		var buf [64]uint16
+		procGetClassNameW.Call(child, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+		if windows.UTF16ToString(buf[:]) == "MyGoSurface" {
+			found = child
+			return 0
+		}
+		return 1
+	})
+	procEnumChild.Call(host, cb, 0)
+	return found
+}
+
+// installSelfDrag 在面板窗口上挂一层子类化。必须在窗口建好之后调用，可重复调用。
+//
+// 注意挂的**不是**顶层窗口：mygo 的鼠标输入走 MyGoSurface 这个子窗口，消息根本
+// 不会经过顶层窗口的消息过程（第一版挂错地方，结果一条鼠标消息都收不到，
+// 表现就是"完全拖不动"）。
+func (a *application) installSelfDrag(host uintptr) {
+	if host == 0 {
 		return
 	}
-	d := &selfDrag{app: a, hwnd: hwnd}
-	d.tramp = windows.NewCallback(d.wndProc)
-	prev, _, _ := procSetWndProc.Call(hwnd, gwlpWndProc, d.tramp)
-	if prev == 0 {
-		log.Printf("拖动: 装不上自己的 WndProc，退回系统拖动")
+	if a.selfDrag != nil && a.selfDrag.host == host {
 		return
 	}
-	d.proc = prev
+	target := findMyGoSurface(host)
+	if target == 0 {
+		target = host
+	}
+	if a.selfDrag != nil && a.selfDrag.hwnd != 0 {
+		a.selfDrag.detach()
+	}
+	d := &selfDrag{app: a, host: host, hwnd: target}
+	d.tramp = windows.NewCallback(d.subclassProc)
+	if r, _, err := procSetSubclass.Call(target, d.tramp, dragSubclassID, 0); r == 0 {
+		log.Printf("拖动: 子类化没挂上（%v），退回系统拖动", err)
+		return
+	}
 	a.selfDrag = d
-	log.Printf("拖动: 已接管（位移超过 %d 像素才真正开始拖）", dragThreshold)
+	log.Printf("拖动: 已接管（host=%d surface=%d，位移超过 %d 像素才真正开始拖）",
+		host, target, dragThreshold)
 }
 
-// detach 在窗口销毁前把原来的 WndProc 放回去。
+// raise 把面板提到置顶组的最前面。它不是"永远最前"，只是保证唤出后点得到：
+// 别的置顶窗口（比如豆包工作窗）盖在上面时，鼠标消息会落到它那儿，面板就
+// "拖不动"了 —— 这正是这一版第一次部署后用户遇到的现象。
+func (a *application) raisePanel() {
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	procSetWinPos.Call(hwnd, ^uintptr(0), 0, 0, 0, 0,
+		swpNoMove|swpNoSize|swpNoActivate)
+}
+
 func (d *selfDrag) detach() {
-	if d.hwnd != 0 && d.proc != 0 {
-		procSetWndProc.Call(d.hwnd, gwlpWndProc, d.proc)
+	if d.hwnd != 0 {
+		procDelSubclass.Call(d.hwnd, d.tramp, dragSubclassID)
+		d.hwnd = 0
 	}
-	d.hwnd = 0
-}
-
-func (d *selfDrag) call(hwnd, msg, wp, lp uintptr) uintptr {
-	if d.proc == 0 {
-		return 0
-	}
-	ret, _, _ := procCallWndProc.Call(d.proc, hwnd, msg, wp, lp)
-	return ret
 }
 
 func cursorPos() (int32, int32) {
@@ -129,11 +187,26 @@ func windowXY(hwnd uintptr) (int32, int32) {
 }
 
 func setWindowXY(hwnd uintptr, x, y int32) {
+	// SWP_NOZORDER：不带它每次移动都会把这个 topmost 窗口重新提到置顶组最前，
+	// 而重排 z 序要牵动整个桌面重新合成 —— 拖动里每帧一次，就是"拖一下卡一下"。
 	procSetWinPos.Call(hwnd, 0, uintptr(x), uintptr(y), 0, 0,
 		swpNoSize|swpNoZOrder|swpNoActivate)
 }
 
-func (d *selfDrag) wndProc(hwnd, msg, wp, lp uintptr) uintptr {
+// measureClientOffset 记下客户区相对窗口左上角的偏移（见 clientDX 的说明）。
+func (d *selfDrag) measureClientOffset() {
+	wx, wy, _, _ := win.WindowRectPixels(d.host)
+	cx, cy, _, _ := win.ClientRectPixels(d.host)
+	d.clientDX, d.clientDY = int32(cx-wx), int32(cy-wy)
+}
+
+func (d *selfDrag) subclassProc(hwnd, msg, wp, lp, id, ref uintptr) uintptr {
+	if (msg == wmLButtonDown || msg == wmLButtonUp || msg == wmMouseMove) && d.dbgLog < 30 {
+		d.dbgLog++
+		cx, cy := cursorPos()
+		log.Printf("拖动: 消息 0x%04x active=%v pending=%v 光标 %d,%d",
+			msg, d.active, d.pending, cx, cy)
+	}
 	switch msg {
 	case wmLButtonDown:
 		d.pending = true
@@ -141,14 +214,14 @@ func (d *selfDrag) wndProc(hwnd, msg, wp, lp uintptr) uintptr {
 		d.frames = 0
 		d.t0 = time.Now()
 		d.startCursorX, d.startCursorY = cursorPos()
-		d.startWinX, d.startWinY = windowXY(hwnd)
+		d.startWinX, d.startWinY = windowXY(d.host)
 		d.lastX, d.lastY = d.startWinX, d.startWinY
 		// 照旧转发：图标/搜索框/按钮的按下态、聚焦都要走 mygo 那一套。
 		return d.call(hwnd, msg, wp, lp)
 
 	case wmMouseMove:
 		if d.active {
-			d.dragTo(hwnd)
+			d.dragTo()
 			return 0
 		}
 		if d.pending {
@@ -159,8 +232,8 @@ func (d *selfDrag) wndProc(hwnd, msg, wp, lp uintptr) uintptr {
 					return 0
 				}
 				d.active = true
-				d.measureClientOffset(hwnd)
-				d.dragTo(hwnd)
+				d.measureClientOffset()
+				d.dragTo()
 				return 0
 			}
 		}
@@ -170,6 +243,17 @@ func (d *selfDrag) wndProc(hwnd, msg, wp, lp uintptr) uintptr {
 		was := d.active
 		d.pending = false
 		d.active = false
+		if was {
+			// 补最后一拍位置，恢复清晰玻璃，然后按新位置重算一次取景并请求一帧。
+			d.dragTo()
+			d.app.setDragFade(false)
+			d.faded = false
+			d.app.refreshBacking(true)
+			if d.app.panel != nil {
+				d.app.panel.Invalidate()
+			}
+			d.app.followShadow()
+		}
 		procRelCapture.Call()
 		if was {
 			if n := d.frames; n > 1 {
@@ -195,22 +279,20 @@ func (d *selfDrag) wndProc(hwnd, msg, wp, lp uintptr) uintptr {
 	return d.call(hwnd, msg, wp, lp)
 }
 
-// measureClientOffset 记下客户区相对窗口左上角的偏移（见 clientDX 的说明）。
-func (d *selfDrag) measureClientOffset(hwnd uintptr) {
-	wx, wy, _, _ := win.WindowRectPixels(hwnd)
-	cx, cy, _, _ := win.ClientRectPixels(hwnd)
-	d.clientDX, d.clientDY = int32(cx-wx), int32(cy-wy)
+func (d *selfDrag) call(hwnd, msg, wp, lp uintptr) uintptr {
+	ret, _, _ := procDefSubclass.Call(hwnd, msg, wp, lp)
+	return ret
 }
 
-// dragTo 按当前光标把窗口挪到位。顺序是刻意的：
+// dragTo 的顺序是刻意的，也是这整件事的答案：
 //
-//  1. 先按**目标**位置把底图算好并上传（此时窗口还在旧位置，但纹理里已经是新取景）；
-//  2. 再 SetWindowPos 挪窗口；
-//  3. 立刻 RedrawNow 提交一帧。
-//
-// DWM 下一次合成看到的是"窗口在新位置 + 内容也是新位置"的同一组数据，所以没有
-// 相对错位 —— 这正是系统拖动做不到的地方（它先挪窗口，我们只能追。
-func (d *selfDrag) dragTo(hwnd uintptr) {
+//  1. 先 SetWindowPos —— 这一刻起窗口就贴在光标上了（零点几毫秒）。以前把
+//     算底图放在前面，窗口要等算完才动，鼠标一快就是"追不上光标"。
+//  2. 阴影跟着挪（Nudge，只 SetWindowPos，不重传位图）。
+//  3. 最后才补内容：平移底图（memmove + 从快照补新露出的带，1~2ms）+ 排一帧。
+//     这两步按 16ms 节流，而且**不** RedrawNow（那会同步等一次 vsync，把消息
+//     处理卡成每帧 16ms）。所以窗口每条消息都跟手，背景最多落后一帧。
+func (d *selfDrag) dragTo() {
 	cx, cy := cursorPos()
 	nx := d.startWinX + (cx - d.startCursorX)
 	ny := d.startWinY + (cy - d.startCursorY)
@@ -219,11 +301,48 @@ func (d *selfDrag) dragTo(hwnd uintptr) {
 	}
 	d.lastX, d.lastY = nx, ny
 
+	// 0) 拖动第一帧：把玻璃糊化一次（重做磨砂图 + 整张重烘，十毫秒级，只做一次）。
+	//    松手时 up 里再恢复清晰。见 glass.go 的 setDragFade。
+	if !d.faded {
+		d.faded = true
+		d.app.setDragFade(true)
+	}
+
+	// 1) 先把内容算好（平移底图，1~2ms）。窗口还在旧位置，但纹理里已经是
+	//    新位置的取景。
+	tBake := time.Now()
 	d.app.refreshBackingFor(int(nx)+int(d.clientDX), int(ny)+int(d.clientDY), false)
-	setWindowXY(hwnd, nx, ny)
-	win.RedrawNow(hwnd)
-	d.app.followShadow()
+	d.costBacking += int64(time.Since(tBake))
+
+	// 2) 挪窗口。这一步起窗口就贴着光标了。
+	tPos := time.Now()
+	setWindowXY(d.host, nx, ny)
+	d.costPos += int64(time.Since(tPos))
+
+	// 3) 阴影跟着走（只挪位置，不重传位图 —— UpdateLayeredWindow 每帧整张提交
+	//    一千多像素宽的位图，十几毫秒）。
+	tShadow := time.Now()
+	d.app.followShadowNudge()
+	d.costShadow += int64(time.Since(tShadow))
+
+	// 4) 立刻把这一帧画出来并提交。**这是关键**：mygo 平时走 paced 帧，画完要
+	//    等下一次 DWM 刷新（DwmFlush）才提交，于是"窗口已经在新位置、内容还是
+	//    旧的"要持续一整帧；FrameNow 不等刷新，位置和内容一起进同一个合成帧。
+	tFrame := time.Now()
+	if d.app.panel != nil {
+		d.app.panel.FrameNow()
+	}
+	d.costInvalidate += int64(time.Since(tFrame))
+	d.costSamples++
+
 	d.app.uiTick.Store(time.Now().UnixNano())
 	d.app.dragUntil.Store(time.Now().Add(600 * time.Millisecond).UnixNano())
 	d.frames++
+	if d.frames%30 == 0 {
+		n := 30.0
+		log.Printf("拖动: setpos %.2fms 阴影 %.2fms 底图 %.2fms 排帧 %.2fms",
+			float64(d.costPos)/n/1000, float64(d.costShadow)/n/1000,
+			float64(d.costBacking)/n/1000, float64(d.costInvalidate)/n/1000)
+		d.costPos, d.costShadow, d.costBacking, d.costInvalidate = 0, 0, 0, 0
+	}
 }

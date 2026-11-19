@@ -899,8 +899,49 @@ func (a *application) frostImage() *image.RGBA {
 		return nil
 	}
 	work := dupRGBA(a.frostBase)
-	work = win.Blur(work, glassBlurRadius, 3)
-	return win.Tint(work, 247, 248, 252, glassTintAlpha)
+	blur := glassBlurRadius
+	alpha := glassTintAlpha
+	if a.dragFade {
+		// 拖动中把玻璃糊化并压浓：面板挪动 (SetWindowPos) 和内容提交 (DComp
+		// commit) 分属相邻两帧，那一帧的相对位移在快速拖动时是十几像素，
+		// 眼睛对"框走了、框里的画没跟上"极敏感。糊成色块之后就没有细节可比，
+		// 错位在视觉上消失，而窗口本身仍然是零延迟跟手的。松手立刻恢复清晰。
+		blur = glassBlurRadius*2 + 8
+		if alpha < 190 {
+			alpha = 190
+		}
+	}
+	work = win.Blur(work, blur, 3)
+	return win.Tint(work, 247, 248, 252, alpha)
+}
+
+// rebuildFrost 用现有的底片重做一张磨砂图（改透明度、或拖动前后切换糊化）。
+func (a *application) rebuildFrost() {
+	if a.frostBase == nil {
+		return
+	}
+	small := a.frostImage()
+	if small == nil {
+		return
+	}
+	a.frostSmall = small
+	if a.frost != nil && a.frostPixW == small.Rect.Dx() && a.frostPixH == small.Rect.Dy() {
+		a.frost.Update(small)
+		return
+	}
+	a.frostPixW, a.frostPixH = small.Rect.Dx(), small.Rect.Dy()
+	a.frost = ui.NewBitmap(small)
+}
+
+// setDragFade 切换"拖动中的糊化玻璃"。切换时重做磨砂图并整张重烘底图，
+// 只在拖动开始/结束各做一次（十毫秒级），拖动过程中每帧仍是平移底图。
+func (a *application) setDragFade(on bool) {
+	if a.dragFade == on {
+		return
+	}
+	a.dragFade = on
+	a.rebuildFrost()
+	a.refreshBacking(true)
 }
 
 // dupRGBA 拷一份图像。win.Blur / win.Tint 都是原地改，所以底片必须留一份原件，
@@ -1106,6 +1147,20 @@ func (a *application) followShadow() {
 	x, y, _, _ := win.WindowRectPixels(hwnd)
 	// 拖动中尺寸不变，宽度按上次建好的位图来（由 Place 记着）。
 	a.shadow.Move(x, y, a.shadowMargin())
+}
+
+// followShadowNudge 拖动期间用的轻量版：只挪阴影窗口，不重传位图。
+// 见 win.Shadow.Nudge —— UpdateLayeredWindow 每帧整张提交是拖动的延迟来源。
+func (a *application) followShadowNudge() {
+	if a.shadow == nil || !a.shadow.Shown() {
+		return
+	}
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	x, y, _, _ := win.WindowRectPixels(hwnd)
+	a.shadow.Nudge(x, y, a.shadowMargin())
 }
 
 func (a *application) shadowMargin() int {

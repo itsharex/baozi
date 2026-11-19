@@ -46,6 +46,8 @@ const (
 	swShowNoActivate = 4
 	swHide           = 0
 	swpNoActivate    = 0x0010
+	swpNoSize        = 0x0001
+	swpNoZOrder      = 0x0004
 	hwndTopmost      = ^uintptr(0)
 
 	ulwAlpha = 2
@@ -907,6 +909,24 @@ func (s *Shadow) Bounds() (x, y, w, h int) {
 		return 0, 0, 0, 0
 	}
 	return WindowRectPixels(s.hwnd)
+}
+
+// Nudge 只挪位置、不重传位图。拖动时每帧都要动，而 Move 每帧都走
+// UpdateLayeredWindow 把一千多像素宽的阴影位图整张提交一遍（实测十几毫秒）——
+// 那正是"拖动延迟"。位图内容在拖动中并不变，一个 SetWindowPos 就够。
+func (s *Shadow) Nudge(x, y, m int) {
+	if s == nil || s.hwnd == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.shown {
+		return
+	}
+	dst := point{X: int32(x - m), Y: int32(y - m)}
+	procSetWindowPos.Call(s.hwnd, 0, uintptr(dst.X), uintptr(dst.Y), 0, 0,
+		swpNoSize|swpNoZOrder|swpNoActivate)
+	s.x, s.y = dst.X, dst.Y
 }
 
 // Move 只挪位置（面板被拖动时用，不重算位图）。

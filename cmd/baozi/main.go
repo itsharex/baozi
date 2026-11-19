@@ -247,6 +247,10 @@ type application struct {
 	uiTick     atomic.Int64
 	dragUntil  atomic.Int64
 	hangDumped atomic.Bool
+	// dragFade 是"拖动中把玻璃糊化"的开关（见 glass.go 的 setDragFade）。
+	// 面板挪动和内容提交分属相邻两帧，那一帧的相对位移在快拖时十几像素；
+	// 糊成色块之后没有细节可比，错位就不见了，松手立刻恢复清晰。
+	dragFade bool
 	// redrawNext 是"拖动时自己推一帧上屏"的节流点（见 OnMove 里的 win.RedrawNow）。
 	// 拖动走系统模态循环，帧请求在那儿排队，光算完底图屏幕不会变。
 	redrawNext atomic.Int64
@@ -2423,11 +2427,14 @@ func (a *application) show() {
 	// 底图必须在 Show 之前/之后最早的时刻烘好：面板第一帧铺的就是它，
 	// 底图还没生成的那一帧是矩形（用户报的"偶尔出现四个直角"）。
 	a.refreshBacking(true)
-	// 面板的自绘拖动（dragwin.go）：窗口建好、位置定下之后在它的 hwnd 上换一份
-	// 自己的 WndProc。幂等，多次唤出只装一次。
+	// 面板的自绘拖动（dragwin.go）：窗口建好、位置定下之后在它的 hwnd 上挂一层
+	// 子类化。必须放在 Show 之后 —— mygo 显示窗口时会重设 WndProc，太早挂会被顶掉。
 	if hwnd := a.panel.NativeHandle(); hwnd != 0 {
 		a.installSelfDrag(hwnd)
 	}
+	// 唤出即置顶。别的置顶窗口（豆包工作窗就是）盖在上面时，鼠标消息落不到面板，
+	// 表现就是"完全拖不动"。
+	a.raisePanel()
 	// 阴影层放在最后：它是从面板外侧取样的，得等四角的桌面色取完再显示，
 	// 否则那几像素的取样会被自己的阴影压暗。
 	a.refreshShadow()

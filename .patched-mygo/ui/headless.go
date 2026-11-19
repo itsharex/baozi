@@ -185,6 +185,9 @@ func (h *headless) invalidate() {
 	h.requested.Store(true)
 }
 
+// frameNow has nothing to show at once: headless frames go nowhere.
+func (h *headless) frameNow() { h.invalidate() }
+
 // writeClipboard copies s, unless FailClipboard set an error;
 // writeClipboardThen gives done that error before the next frame too, as
 // a window gives it after the system wrote the clipboard.
