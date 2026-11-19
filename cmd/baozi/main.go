@@ -667,12 +667,18 @@ func (a *application) view(c *ui.Context) {
 				// 就是窗口位置，拖动/缩放时只要重新合成一张，弧永远贴着窗边。
 				if a.back != nil {
 					s := a.glassScale()
-					// 多铺 2 像素：DIP → 物理像素不是整数（908.8 DIP × 1.25 = 1136.25），
-					// mygo 按 DIP 布局时右边/下边可能只铺到 1135 格，剩下一列/一行
-					// 露出窗口底色（白）—— 就是"右边和下边边框里面还有一条线"，
-					// 而且四角被那条白补成直角。多出来这点会被窗口边界裁掉。
-					dip := float32(a.backPixW+2) / s
-					dipH := float32(a.backPixH+2) / s
+					// **按像素 1:1 铺**，一个像素都不缩：底图是 963×771 张物理像素，
+					// 就用 963/scale DIP 去画 —— mygo 再乘回 scale 正好是 963 格，
+					// 图像一像素对屏幕一像素，覆盖率抗锯齿原样落在屏幕上。
+					//
+					// 这里曾经写成 (backPixW+2)/s（多铺 2 像素去盖右边/下边那条白线），
+					// 代价是整张图被拉成 965 格 → 0.2% 的重采样。直边看不出来，
+					// 弧上就是一层糊：每一行都被插值一次，16 档覆盖率被抹成一片，
+					// 用户说的"毛边/虚"有一半是这个。右边那条白改为：底图按客户区
+					// 的**整数物理像素**尺寸合成（composeBacking 用的是 ClientRectPixels），
+					// 画回去时又正好是同一批整数像素，右边/下边一格都不缺。
+					dip := float32(a.backPixW) / s
+					dipH := float32(a.backPixH) / s
 					ui.Image(c, a.back).Absolute().Left(0).Top(0).
 						Size(dip, dipH)
 					if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {

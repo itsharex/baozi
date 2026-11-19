@@ -1006,6 +1006,8 @@ func (a *application) refreshShadow() {
 		Glass:        gl[0],
 		GlassCorners: [4]uint32{gl[0], gl[1], gl[2], gl[3]},
 		EdgeGlass:    a.pickEdgeGlass(x, y, w, h),
+		// 角和弧全在底图里了，这一层只保留投影（见 ShadowSpec.SkipPatch）。
+		SkipPatch: bakedPanel,
 	})
 	if d := time.Since(t0); d > 3*time.Millisecond {
 		log.Printf("阴影: 重建 %.2fms（位图 %.2f + 上传 %.2f）",

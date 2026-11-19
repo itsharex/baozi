@@ -189,6 +189,15 @@ type ShadowSpec struct {
 	// 是渐变的：只用四角颜色插值，边中点那里会偏色，看起来又是一条细边。有了
 	// 中点色，每条边就是"角→中点→角"两段插值，和旁边的玻璃贴得紧。
 	EdgeGlass [4]uint32
+	// SkipPatch 让这一层**只画投影**：四角补桌面色、弧上那条不透明斜坡、
+	// 直边最外一格的补色全部不做。
+	//
+	// 面板改成"整窗自绘底图"（bakedPanel）之后，角和弧已经在面板自己那张图里，
+	// 这一层再补就是两份数据叠在同一处。实测（shdump.png）那段补角代码在没有
+	// 桌面图块时退回兜底底色 sp.Desk —— 而 sp.Desk 是唤出时取样的桌面底色，
+	// 壁纸是照片时它跟当前那一角根本不是同一个颜色，还带着 alpha=255 铺进缺口，
+	// 屏幕上就是"角上一块深色楔形 + 弧外多一道边"。用户指着它问了好几轮。
+	SkipPatch bool
 }
 
 func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
@@ -329,7 +338,7 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	//
 	// 覆盖率掩码只跟半径和扩散宽度有关，和面板尺寸无关 —— 用角部局部坐标算一份，
 	// 四个角镜像复用，缩放时一帧都不用重算。
-	if radius > 0 && len(corners) > 0 {
+	if radius > 0 && len(corners) > 0 && !sp.SkipPatch {
 		cov := cornerCoverage(radius, m, sp.BorderW)
 		k := cov.size
 		br := float64((sp.Border >> 16) & 0xFF)
