@@ -293,7 +293,7 @@ func (s *settingsWindow) section(c *ui.Context, idx int, build func()) {
 
 func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(10).Children(func() {
-		sectionTitle(c, t, "唤出", "快捷键唤不出多半是被别的程序抢了，双击 Ctrl 走的是低级键盘钩子，更可靠")
+		sectionTitle(c, t, "唤出", "")
 		ui.Checkbox(c, &s.doubleCtrl, "双击 Ctrl 唤出面板")
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "两次 Ctrl 的最大间隔（毫秒）").FontSize(12).TextColor(t.TextMuted)
@@ -307,7 +307,6 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 		ui.Checkbox(c, &s.fullscreen, "全屏应用（游戏、全屏视频）前台时不响应")
 		ui.Checkbox(c, &s.openAtLogin, "开机自动启动（登录后静默待在托盘，不弹面板）")
 		ui.Checkbox(c, &s.hideOnStart, "启动时不弹面板（手动启动也一样，只在托盘里等着，双击 Ctrl 随时唤出）")
-		ui.Text(c, "自启靠系统的 Run 键，任务管理器「启动」页里能单独禁用；禁用后这里的勾选会跟着变回未勾选。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
@@ -315,7 +314,7 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 // 关掉的来源连读都不读（跟随器每次轮询都会问一遍，改完保存立刻生效，不用重启）。
 func (s *settingsWindow) followSection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(10).Children(func() {
-		sectionTitle(c, t, "文件对话框跟随", "另存为 / 打开框开着时，去文件管理器换个目录，再切回那个框，路径自动变过去")
+		sectionTitle(c, t, "文件对话框跟随", "")
 		ui.Checkbox(c, &s.followOn, "启用跟随（关掉后 Baozi 完全不读别的程序的窗口）")
 
 		ui.Row(c).Gap(18).AlignItems(ui.Center).Children(func() {
@@ -330,16 +329,12 @@ func (s *settingsWindow) followSection(c *ui.Context, t *ui.Theme) {
 			ui.Checkbox(c, &s.srcXplorer2, "xplorer2")
 			ui.Checkbox(c, &s.srcTessoa, "tessoa")
 		})
-		ui.Text(c, "只勾真正装了的即可，没装的多一次「窗口类名」判断而已。"+
-			"tessoa 是自绘窗口、读不到地址栏，走它自带的 `tessoa.exe --print-cwd`"+
-			"（每次查询要起一个它自己的进程，实测热态 16ms）。"+
-			"OneCommander 与 Files 要靠 UI Automation 取路径，暂不支持。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
 func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(10).Children(func() {
-		sectionTitle(c, t, "排序", "三项权重越大越优先：频次 > 类型 > 准确性（默认 0.5 / 0.3 / 0.2）")
+		sectionTitle(c, t, "排序", "")
 		sliderRow(c, t, "频次（用得多的靠前）", &s.wFreq)
 		sliderRow(c, t, "类型（可执行文件、快捷方式靠前）", &s.wType)
 		sliderRow(c, t, "准确性（名字匹配得越准越靠前）", &s.wAcc)
@@ -372,8 +367,6 @@ func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 			}
 		}
 		ui.Checkbox(c, &s.thumbnails, "图片、视频、PDF 显示内容缩略图")
-		ui.Text(c, "缩略图在后台取，取到才替换掉线框图标，不会拖慢唤出。"+
-			"关掉后一律用单色线框图标（系统没有缩略图提供者的文件本来也只有线框）。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
@@ -381,14 +374,13 @@ func (s *settingsWindow) rankSection(c *ui.Context, t *ui.Theme) {
 
 func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(10).Children(func() {
-		sectionTitle(c, t, "索引", "每行一个。改动根目录后会自动重建索引（大磁盘需要几分钟）")
+		sectionTitle(c, t, "索引", "")
 		ui.Row(c).Gap(12).Children(func() {
 			labelledTextArea(c, t, "索引的磁盘/目录", &s.roots)
 			labelledTextArea(c, t, "排除的目录名或路径片段", &s.excludes)
 		})
 		ui.Row(c).Gap(16).AlignItems(ui.Center).Children(func() {
 			ui.Checkbox(c, &s.includeHidden, "包含隐藏文件")
-			ui.Text(c, "（默认不索引隐藏文件，可减少噪声；隐藏目录总会进去，不然备份盘里搜不到）").FontSize(11).TextColor(t.TextMuted)
 		})
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "自动重建间隔（分钟，0 = 只在启动时建一次）").FontSize(12).TextColor(t.TextMuted)
@@ -428,7 +420,6 @@ func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
 					s.message = "请在 UAC 弹窗里确认；之后回到目录扫描"
 				}
 			}
-			ui.Text(c, "装一次即可，开机自启；不需要时点右边卸载，服务与数据都会清掉").FontSize(11).TextColor(t.TextMuted)
 		})
 	})
 }
@@ -492,19 +483,19 @@ func (s *settingsWindow) commandsPage(c *ui.Context, t *ui.Theme) {
 			cmd := &s.cmds[s.cmdSel]
 			ui.Scroll(c).Grow(1).Children(func() {
 				ui.Column(c).Padding(22, 18).Gap(14).Children(func() {
-					formField(c, t, "激活词", "在搜索框里敲它就出这条命令；可写多个，逗号分隔（空格后面的内容会作为参数）")
+					formField(c, t, "激活词", "")
 					ui.TextInput(c, &s.cmdAlias).Placeholder("关机, shut, shutdown")
 
-					formField(c, t, "显示名", "结果列表里显示的名字")
+					formField(c, t, "显示名", "")
 					ui.TextInput(c, &cmd.Name).Placeholder("定时关机")
 
-					formField(c, t, "程序", "可执行文件；只写文件名就按 PATH 找。也可以直接填 .ps1 / .bat，会自动带上解释器")
+					formField(c, t, "程序", "")
 					ui.TextInput(c, &cmd.Exec).Placeholder(`D:\1tools\scripts\shutdown-after.ps1`)
 
-					formField(c, t, "参数", "一行一个。支持占位符：%1…%9（第几个词）、%*（全部词）、{dir}（当前跟随到的目录）")
+					formField(c, t, "参数", "")
 					ui.TextArea(c, &s.cmdArgs).Height(110).FontSize(12)
 
-					formField(c, t, "工作目录", "留空则继承 Baozi 自己的目录；也支持 {dir}")
+					formField(c, t, "工作目录", "")
 					ui.TextInput(c, &cmd.Dir).Placeholder(`D:\1tools  或  {dir}`)
 
 					ui.Checkbox(c, &cmd.KeepOpen, "执行后不收起面板（开终端这类窗口时勾上）")
@@ -543,7 +534,9 @@ func (s *settingsWindow) duplicateKeywords() []string {
 func formField(c *ui.Context, t *ui.Theme, label, desc string) {
 	ui.Column(c).Gap(4).Children(func() {
 		ui.Text(c, label).FontSize(12).Bold()
-		ui.Text(c, desc).FontSize(11).TextColor(t.TextMuted)
+		if desc != "" {
+			ui.Text(c, desc).FontSize(11).TextColor(t.TextMuted)
+		}
 	})
 }
 
@@ -622,7 +615,10 @@ func splitKeywords(text string) []string {
 func sectionTitle(c *ui.Context, t *ui.Theme, title, desc string) {
 	ui.Column(c).Gap(2).Children(func() {
 		ui.Text(c, title).FontSize(14).Bold()
-		ui.Text(c, desc).FontSize(11).TextColor(t.TextMuted)
+		// desc 为空就整行不画：界面上只留标题，说明文字一律不摆出来。
+		if desc != "" {
+			ui.Text(c, desc).FontSize(11).TextColor(t.TextMuted)
+		}
 	})
 }
 
@@ -712,25 +708,19 @@ func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
 // 形状由系统管；面板是整窗自绘的（见 glass.go / backing.go），因此这三项都能自己调。
 func (s *settingsWindow) appearanceSection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(14).Children(func() {
-		sectionTitle(c, t, "界面外观",
-			"三项都只有开关：要不要。具体程度沿用上次保存的，改完保存立刻生效")
-		toggleRow(c, t, &s.radiusOn, "圆角",
-			"关掉 = 直角面板；开着就是现在这个圆度")
-		toggleRow(c, t, &s.opacityOn, "透明度",
-			"关掉 = 完全不透明、看不见桌面；开着是现在这层玻璃（模糊随透明度一起变）")
-		toggleRow(c, t, &s.shadowOn, "投影",
-			"关掉 = 面板外完全不投影；开着是现在这层影子")
+		sectionTitle(c, t, "界面外观", "")
+		toggleRow(c, t, &s.radiusOn, "圆角")
+		toggleRow(c, t, &s.opacityOn, "透明度")
+		toggleRow(c, t, &s.shadowOn, "投影")
 	})
 }
 
-// toggleRow 是"一个勾选 + 一句说明"的一行。外观这三项不再让用户填数：
-// 面板上真能看出来的只有"有/没有"，一个 px 或一个百分比对眼睛没有意义，
-// 反而给了个"调到最合适"的假任务。程度值仍在配置里（沿用上次保存的），
-// 只是不在界面上摆出来。
-func toggleRow(c *ui.Context, t *ui.Theme, on *bool, label, hint string) {
+// toggleRow 是"一个勾选"的一行。外观三项不再让用户填数、也不再挂说明：
+// 面板上真能看出来的只有"有/没有"，一个 px 或一个百分比对眼睛没有意义。
+// 程度值仍在配置里（沿用上次保存的），只是不在界面上摆出来。
+func toggleRow(c *ui.Context, t *ui.Theme, on *bool, label string) {
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Checkbox(c, on, label)
-		ui.Text(c, hint).FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
