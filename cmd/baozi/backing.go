@@ -91,6 +91,11 @@ type backKey struct {
 	r         int
 	screenGen int
 	dark      bool // 桌面明暗参与 key：换了一套配色，旧底图不能复用
+	// fade 是"拖动中糊透"这个状态。它必须参与 key：糊度一变，底图里每个像素的
+	// 来源就跟着变，旧图一个都不能留。早先没放进来，结果是拖动开始/结束时如果
+	// 窗口正好还在动，就会走平移快路径 —— 中间保留着旧糊度的像素、只有贴在
+	// 边上那四条带按新糊度重算，屏幕上于是出现"一半清晰一半糊"的拼接。
+	fade bool
 }
 
 // backingPad 是底图四周比客户区多烘出来的物理像素数（见 refreshBacking 里的
@@ -237,7 +242,7 @@ func (a *application) refreshBackingFor(cx, cy int, force bool) {
 	}
 	s := a.glassScale()
 	r := int(math.Round(float64(glassRadius) * float64(s)))
-	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark}
+	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark, fade: a.dragFade}
 
 	// 形状没变、只是窗口挪了地方：**不整张重烘**，把内容整体平移到位就行。
 	//
