@@ -57,6 +57,26 @@ var alphaBacking = func() bool {
 	return os.Getenv("BAOZI_BACKALPHA") != "0"
 }()
 
+// ringMode 决定四角和四条边那条 1px 线怎么画 —— 用户"能看出来"的那道白弧
+// 就是它。三种：
+//
+//	0  不画（现在的默认）：形状边界只剩覆盖率抗锯齿，玻璃直接过渡到背景。
+//	   用户对着 iced 的角说"最好做到和 iced 一样"，而 iced 就是没有这条线。
+//	1  浅色环（老样子）：#D9D9DE 那种暖灰。直边上像"边框"，弧上就是一道白弧，
+//	   用户连着几轮指的就是它。
+//	2  深色环：比玻璃暗的灰（#68737D），看上去是"描了一圈边"。
+//
+// BAOZI_RING=1 / 2 切回老画法。三张对比图在 dist\cmp_ring2.png。
+var ringMode = func() int {
+	switch os.Getenv("BAOZI_RING") {
+	case "1":
+		return 1
+	case "2", "dark":
+		return 2
+	}
+	return 0
+}()
+
 // backKey 是底图的全部输入。位置/尺寸/半径/桌面快照任何一个变了才重算。
 type backKey struct {
 	cx, cy, cw, ch int
@@ -156,6 +176,10 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 	br, bg, bb := uint8(217), uint8(217), uint8(222)
 	if a.borderSet {
 		br, bg, bb = a.borderColor.R, a.borderColor.G, a.borderColor.B
+	}
+	if ringMode == 2 {
+		// 深色环：比玻璃暗一档，看上去像"描了边"，不像"发着光的白弧"。
+		br, bg, bb = 104, 115, 125
 	}
 
 	// 边框宽度按物理像素：1 DIP × scale，至少 1 像素。
@@ -398,6 +422,10 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 			ring := ringC
 			if ring > cOut {
 				ring = cOut
+			}
+			if ringMode == 0 {
+				// 不描线：这一像素整块按覆盖率当玻璃算，边界就只剩抗锯齿本身。
+				ring = 0
 			}
 			wGlass := cOut - ring
 			wDesk := 1 - cOut
