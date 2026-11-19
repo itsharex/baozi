@@ -201,14 +201,23 @@ func (s *settingsWindow) load() {
 
 func (s *settingsWindow) show() {
 	s.load()
-	// 先放行投影层：Show() 之后视图那一帧就会补投影（见 view 的兜底）。
+	// 顺序很讲究：底图必须在 Show() **之前**烘好，投影层必须在 Show() **之后**才显示。
+	// 反了的话，窗口上屏的头一两帧是"没有底图的窗"—— 客户区是空的、四角是直角矩形
+	// （弧形画在底图里），用户看到的就是"先闪一个空框，然后才整好"。藏着的窗口
+	// ClientRect 一样有效，所以能提前烘。
 	if s.glass != nil {
 		s.glass.show()
+		s.glass.refresh(true)
 	}
+	// 再让视图在**藏着的窗口**上先跑一帧：底图铺下去、内容层布局好。
+	// 少了这一下，Show() 之后的头几百毫秒窗口是"通体透明"的 —— 第一帧还没画出来，
+	// 用户看到的就是"先闪一个空框，然后才整好"（设置页控件多，首帧布局本身就要
+	// 几十毫秒）。Update 是 mygo 的强制重绘入口，主线程里调，等价于手动跑一帧。
+	s.win.Update(func() {})
 	s.win.Show()
 	s.win.Focus()
-	// 先 Show 再烘底图：句柄和客户区尺寸只有显示之后才准（藏着的窗口 DWM 不给尺寸）。
 	if s.glass != nil {
+		// 显示之后尺寸/位置若还有出入，这里补一次；然后才让投影上屏。
 		s.glass.refresh(true)
 		s.glass.refreshShadow()
 	}

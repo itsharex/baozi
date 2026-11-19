@@ -142,9 +142,13 @@ func (s *shareWindow) show() {
 	// 每次打开都重新枚举网卡（用户可能刚插网线/连了 WiFi）。
 	s.labels, s.values = bindOptions()
 	// 不再一打开就开服务：分享是一次性的，要用户自己点「生成链接」。
+	// 底图先烘、窗口再显示、投影最后上 —— 和设置窗同一个理由，见那边注释。
 	if s.glass != nil {
 		s.glass.show()
+		s.glass.refresh(true)
 	}
+	// 藏着的窗口上先跑一帧：底图和内容都就位了再 Show，不会先露一个透明空框。
+	s.win.Update(func() {})
 	s.win.Show()
 	s.win.Focus()
 	if s.glass != nil {
