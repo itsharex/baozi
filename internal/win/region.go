@@ -65,10 +65,7 @@ func DisableWindowFrame(hwnd uintptr) bool {
 	}
 	off := uint32(dwmNCRPDisabled)
 	r, _, _ := procDwmSetWindowAttr.Call(hwnd, dwmwaNCRenderingPolicy, uintptr(unsafe.Pointer(&off)), unsafe.Sizeof(off))
-	// 边框往客户区扩的 1px 也要收回去，否则那 1px 的"非客户区"还在。
-	var m margins
-	rf, _, _ := procDwmExtendFrame.Call(hwnd, uintptr(unsafe.Pointer(&m)))
-	return r == 0 || rf == 0
+	return r == 0
 }
 
 // EnableWindowFrameShadow 让 DWM 给这个窗口画阴影：先开非客户区绘制，再把
