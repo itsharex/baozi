@@ -711,22 +711,26 @@ func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
 // 只影响主面板，不影响设置窗和文件互传窗：那两个是 mygo 的系统玻璃窗口，
 // 形状由系统管；面板是整窗自绘的（见 glass.go / backing.go），因此这三项都能自己调。
 func (s *settingsWindow) appearanceSection(c *ui.Context, t *ui.Theme) {
-	scale := s.app.scale
-	if scale <= 0 {
-		scale = 1
-	}
 	ui.Column(c).Gap(14).Children(func() {
 		sectionTitle(c, t, "界面外观",
-			"三项都是保存后立刻生效；数值按屏幕缩放换算成实际像素/百分比")
-		toggleSliderRow(c, t, &s.radiusOn, &s.radiusVal, "圆角", 0, config.MaxPanelRadius,
-			"关掉 = 直角。数值是这个角在屏幕上的半径（像素）",
-			func(v float64) string { return fmt.Sprintf("%.0f px", math.Round(v*float64(scale))) })
-		toggleSliderRow(c, t, &s.opacityOn, &s.opacityVal, "透明度", 0, 100,
-			"0% = 完全不透明（看不见桌面）；越大越透，模糊也跟着变轻；100% 仍留一层白",
-			func(v float64) string { return fmt.Sprintf("透 %.0f%%", v) })
-		toggleSliderRow(c, t, &s.shadowOn, &s.shadowVal, "投影", 0, 100,
-			"面板外那圈影子；关掉 = 完全不投影，数值越大影子越深",
-			func(v float64) string { return fmt.Sprintf("深浅 %.0f%%", v) })
+			"三项都只有开关：要不要。具体程度沿用上次保存的，改完保存立刻生效")
+		toggleRow(c, t, &s.radiusOn, "圆角",
+			"关掉 = 直角面板；开着就是现在这个圆度")
+		toggleRow(c, t, &s.opacityOn, "透明度",
+			"关掉 = 完全不透明、看不见桌面；开着是现在这层玻璃（模糊随透明度一起变）")
+		toggleRow(c, t, &s.shadowOn, "投影",
+			"关掉 = 面板外完全不投影；开着是现在这层影子")
+	})
+}
+
+// toggleRow 是"一个勾选 + 一句说明"的一行。外观这三项不再让用户填数：
+// 面板上真能看出来的只有"有/没有"，一个 px 或一个百分比对眼睛没有意义，
+// 反而给了个"调到最合适"的假任务。程度值仍在配置里（沿用上次保存的），
+// 只是不在界面上摆出来。
+func toggleRow(c *ui.Context, t *ui.Theme, on *bool, label, hint string) {
+	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Checkbox(c, on, label)
+		ui.Text(c, hint).FontSize(11).TextColor(t.TextMuted)
 	})
 }
 
