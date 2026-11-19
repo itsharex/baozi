@@ -974,6 +974,8 @@ func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	}
 	// 阴影层取"玻璃色"用：磨砂图上任意一点就是面板玻璃在那里的颜色。
 	a.frostSmall = small
+	// 磨砂图换了：底图整张作废（键里有 frostGen，见 backing.go 的 backKey）。
+	a.frostGen++
 	// 图在界面上的尺寸 = 整个虚拟屏的 DIP 尺寸，窗口在里面取景。
 	s := a.glassScale()
 	a.frostW, a.frostH = float32(a.screenW)/s, float32(a.screenH)/s
@@ -1039,6 +1041,9 @@ func (a *application) rebuildFrost() {
 		return
 	}
 	a.frostSmall = small
+	// 磨砂图重做过了：底图的键必须跟着变，否则三块玻璃都会觉得"形状没变"
+	// 而不重烘 —— 用户点保存后屏幕上什么都不动（见 backing.go 的 backKey）。
+	a.frostGen++
 	if a.frost != nil && a.frostPixW == small.Rect.Dx() && a.frostPixH == small.Rect.Dy() {
 		a.frost.Update(small)
 		return

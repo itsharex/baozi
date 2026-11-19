@@ -216,6 +216,22 @@ func (g *subGlass) hide() {
 	}
 }
 
+// refreshAppearance 外观（透明度/模糊/圆角/投影强度）改完之后，把这扇窗的玻璃
+// 也重来一遍：磨砂图已经按新设置重做过（application.frostGen +1），底图整张重烘，
+// 推一帧上屏，投影按新强度/新半径重画。
+//
+// 没在屏上的窗口不用管：下次 show() 走的是同一套 refresh，本来就会按新设置烘。
+func (g *subGlass) refreshAppearance() {
+	if !g.pane.visible || !g.pane.hostShown {
+		return
+	}
+	g.refresh(true)
+	if g.win != nil {
+		g.win.FrameNow()
+	}
+	g.refreshShadow()
+}
+
 // refreshShadow 让投影层按当前窗口位置尺寸重画一次并显示。
 func (g *subGlass) refreshShadow() {
 	if g.pane.shadow == nil || g.win == nil {

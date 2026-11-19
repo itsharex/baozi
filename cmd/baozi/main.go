@@ -147,6 +147,13 @@ type application struct {
 	// 模糊要当场重做磨砂图，就得有这张干净的原件（Blur/Tint 都是原地改图）。
 	// 面板收起时随 frostSmall 一起放掉，省 230KB。
 	frostBase *image.RGBA
+	// frostGen 是磨砂图的代次：每重做一次（改透明度/模糊、拖动糊化、重新抓屏）就 +1。
+	//
+	// 它必须参与底图的形状键（见 pane.go 的 keyAt）：底图里每个玻璃像素都是拿磨砂图
+	// 采样来的，磨砂图一换，旧底图整张作废。早先键里没有它，于是"设置页把透明度
+	// 从半透明改成不透明、点保存"之后，屏幕上一点变化都没有 —— 磨砂图确实重做了，
+	// 但三块玻璃都认为形状没变、谁都不重烘。
+	frostGen int
 	// screenW/H/X/Y 是整屏快照的尺寸与屏幕原点（物理像素），算取景偏移时要用。
 	screenW int
 	screenH int
@@ -2558,18 +2565,29 @@ func applyAppearance(cfg *config.Config) {
 // 老实现把它原地糊掉+压白了，所以只能等下次唤出重新抓屏，用户会觉得"点了保存
 // 却没反应"。面板藏着时（没有底片）就什么都不用做，下次唤出自然按新设置来。
 func (a *application) applyAppearanceNow() {
-	if a.panel == nil || !a.panelUp.Load() {
-		return
-	}
 	// 走主线程：refreshBacking / Bitmap.Update 都要碰 GPU，和渲染线程同时搞 D3D 没保证。
 	mygo.RunOnMain(func() {
+		// 1) 先把磨砂图按新的透明度/模糊重做一张。这一步必须排在重烘之前：底图
+		//    里每个玻璃像素都是拿它采样来的，先重烘再换磨砂图，重烘出来的还是旧图。
+		//    磨砂图能就地重做，是因为唤出时留了一张没动过的桌面底片（a.frostBase）。
+		a.rebuildFrost()
+		// 2) 面板区域（bakedPanel 下是空操作）与面板自己的底图、投影。
+		//    面板藏着时**不要**碰它：refreshShadow 会按窗口矩形重摆投影层，
+		//    而隐藏窗口的矩形是旧位置，摆出来就是桌上一个没人认领的空框。
 		a.applyRoundRegion()
-		a.refreshBacking(true)
-		if img := a.frostImage(); img != nil && a.frost != nil {
-			a.frost.Update(img)
+		if a.panel != nil && a.panelUp.Load() {
+			a.refreshBacking(true)
+			a.panel.Update(func() {})
+			a.refreshShadow()
 		}
-		a.panel.Update(func() {})
-		a.refreshShadow()
+		// 3) 设置窗、文件互传窗。它们往往正是用户改完设置时盯着的那扇窗：只刷面板
+		//    的话，屏幕上"什么都没变"，看着就是"点保存没反应"。
+		if a.settings != nil && a.settings.glass != nil {
+			a.settings.glass.refreshAppearance()
+		}
+		if a.share != nil && a.share.glass != nil {
+			a.share.glass.refreshAppearance()
+		}
 	})
 }
 

@@ -101,6 +101,7 @@ func (p *paneState) keyAt(w, h, r int) backKey {
 	return backKey{
 		cw: w, ch: h, r: r,
 		screenGen: p.ap.screenGen,
+		frost:     p.ap.frostGen,
 		dark:      p.ap.deskDark,
 		fade:      p.ap.dragFade,
 	}
