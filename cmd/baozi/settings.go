@@ -305,8 +305,8 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 			ui.TextInput(c, &s.combo).Width(240).Placeholder("Alt+Shift+Space，留空则不注册")
 		})
 		ui.Checkbox(c, &s.fullscreen, "全屏应用（游戏、全屏视频）前台时不响应")
-		ui.Checkbox(c, &s.openAtLogin, "开机自动启动（登录后静默待在托盘，不弹面板）")
-		ui.Checkbox(c, &s.hideOnStart, "启动时不弹面板")
+		ui.Checkbox(c, &s.openAtLogin, "开机自动启动")
+		ui.Checkbox(c, &s.hideOnStart, "静默启动")
 	})
 }
 
@@ -383,8 +383,9 @@ func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
 			ui.Checkbox(c, &s.includeHidden, "包含隐藏文件")
 		})
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "自动重建间隔（分钟，0 = 只在启动时建一次）").FontSize(12).TextColor(t.TextMuted)
-			ui.NumberInput(c, &s.rescanMinutes, 0, 1440, 30).Width(120)
+			// 索引是实时的（USN 增量 / 目录扫描 + 增量合并），不需要"每隔多久自动
+			// 重建一次"这种东西 —— 那只是在给"索引不可信该怎么兜底"找一个数字，
+			// 而那个数字谁也说不出该填多少。要重建就按这个按钮，一次算一次。
 			if ui.Button(c, "立即重建索引").Clicked() {
 				go s.app.rescan()
 				if s.app.serviceAlive() {
