@@ -254,7 +254,12 @@ func (d *selfDrag) subclassProc(hwnd, msg, wp, lp, id, ref uintptr) uintptr {
 			}
 			d.app.followShadow()
 		}
-		procRelCapture.Call()
+		// 只在**真的拖过**的时候松捕获。早先这里无条件 ReleaseCapture，
+		// 结果面板里所有"按下-抬起"配对的控件（设置/互传按钮、结果行点击）
+		// 全哑了 —— mygo 的点击靠 SetCapture 跟踪，中途被我们收回去就断了。
+		if was {
+			procRelCapture.Call()
+		}
 		if was {
 			if n := d.frames; n > 1 {
 				if el := time.Since(d.t0); el > 0 {
