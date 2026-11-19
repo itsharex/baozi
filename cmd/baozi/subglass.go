@@ -45,6 +45,10 @@ type subGlass struct {
 	// "只有边框和投影的空框"。由 show()/hide() 维护。
 	visible bool
 
+	// needCleanSnap 表示下一次 refresh 要先抓一张"不含自家窗口"的桌面快照。
+	// 抓的时候把启动面板设成 WDA_EXCLUDEFROMCAPTURE，底片里才不会印着它。
+	needCleanSnap bool
+
 	// follower 是挂在顶层窗口上的 WM_MOVE 子类化（见 subfollow.go）。
 	follower *shadowFollower
 
@@ -106,6 +110,14 @@ func (g *subGlass) refresh(force bool) {
 	cx, cy, w, h := win.ClientRectPixels(hwnd)
 	if w <= 0 || h <= 0 {
 		return
+	}
+	// 第一次上屏（或重新打开）先抓一张不含自家窗口的桌面快照，底片才干净。
+	if g.needCleanSnap {
+		g.needCleanSnap = false
+		win.SetDisplayAffinity(hwnd, true)
+		a.snapshotScreenClean()
+		win.SetDisplayAffinity(hwnd, false)
+		force = true
 	}
 	s := a.glassScale()
 	r := int(math.Round(float64(glassRadius) * float64(s)))
@@ -191,6 +203,10 @@ func (g *subGlass) dipSize() (float32, float32) {
 // show 标记"这个窗口要上屏了"：投影层这时才允许显示。
 func (g *subGlass) show() {
 	g.visible = true
+	// 下一次 refresh 顺便抓一张**干净**的桌面快照（抓的时候把启动面板设成
+	// "捕获不可见"）。否则底片里会印着启动面板自己 —— 用户看到的就是
+	// "背后明明是我的桌面，玻璃里却是启动面板"。
+	g.needCleanSnap = true
 	// 主面板在建窗时就调了 win.DisableViewFrame，把 DWM 画的那一圈非客户区关掉。
 	// 抽 subGlass 时漏了这一步 —— 于是设置窗/互传窗的边上还留着 DWM 的一圈
 	// （深底上是白亮的 1px 直边），用户看到的就是"四角还是直角"。补上。
@@ -204,6 +220,12 @@ func (g *subGlass) show() {
 // hide 标记"窗口收起来了"：投影层必须一起收，否则它会自己留在屏幕上。
 func (g *subGlass) hide() {
 	g.visible = false
+	// 拖动状态必须一并清掉：SetCapture 还攥着、active 还是 true 的话，用户
+	// 下次打开这个窗，所有按下都被当成"继续拖"，点击全被吞 —— 表现就是
+	// "面板打开了，关闭按钮点不动"。
+	if g.drag != nil {
+		g.drag.cancel()
+	}
 	g.hideShadow()
 	// 再补两拍：第一次关窗口时，宿主还没真正隐藏，投影层可能刚好压在
 	// win.Hide() 后面又被打了一次 Show —— 用户看到的就是"关掉之后桌面上

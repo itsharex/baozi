@@ -36,10 +36,12 @@ const (
 	// 不然在副标题那一行按下就不接管，退回系统拖动 —— 拖动时背景不动。
 	subTopBarDip = 78
 
-	// 顶栏右侧「✕ 关闭」占的宽度，DIP。只需盖住按钮本身，别把整条顶栏右端
-	// 都让出去 —— 用户就是"鼠标放在关闭那一行"往左一点拖，结果那里不接管，
-	// 看着像"拖不动 / 背景没变"。
-	subCloseAreaDip = 60
+	// 顶栏右侧「✕ 关闭」占的宽度，DIP。
+	//
+	// 这个数必须**大于按钮真实宽度**：按钮在 1.25 缩放下从 x≈1050 到 1140
+	// （约 112 DIP）。之前给 60 DIP，把手区一直伸到 1075 —— 按钮左半边落在
+	// 把手区里，按下就被我们吃掉、单击永远传不到 mygo，用户点关闭毫无反应。
+	subCloseAreaDip = 130
 
 	// 拖动中重烘底图的节流间隔。整张 1150x1025 约 8ms，60Hz 的鼠标移动也就是
 	// 16ms 一帧 —— 12ms 能让背景基本跟着手走，又不至于把 UI 线程占满。
@@ -156,6 +158,19 @@ func (d *subDrag) begin() {
 }
 
 // inTopBar 判断这次按下是不是落在"顶栏空白区"（能当拖动把手的地方）。
+// cancel 强制结束一次拖动。窗口被隐藏/关闭时必须调用。
+//
+// 不收拾的话，SetCapture 还攥在我们手里、active 还留着 true：用户再次打开
+// 面板时，每一次按下都被当成"还在拖"，点击全被吞掉 —— 表现就是"面板打开了
+// 却点不动关闭"，窗口还会莫名其妙跟着鼠标走。
+func (d *subDrag) cancel() {
+	d.active = false
+	d.pending = false
+	if d.hwnd != 0 {
+		procRelCapture.Call()
+	}
+}
+
 func (d *subDrag) inTopBar(x, y int32) bool {
 	_, _, cw, chh := win.ClientRectPixels(d.hwnd)
 	if cw <= 0 || chh <= 0 {

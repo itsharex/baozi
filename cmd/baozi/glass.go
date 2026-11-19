@@ -1037,6 +1037,23 @@ func (a *application) refreshGlass() {
 	a.snapshotScreen()
 }
 
+// snapshotScreenClean 抓一张"只含桌面"的快照：抓的瞬间把启动面板设成
+// WDA_EXCLUDEFROMCAPTURE（照常显示给人看，但截屏里看不到），抓完立刻恢复。
+//
+// 没有这一步，子窗的玻璃底片里会印着启动面板 —— 用户的原话是"背后其实是
+// 我的桌面，但是他实际抓取到了启动面板"。
+func (a *application) snapshotScreenClean() {
+	if a.panel != nil {
+		if h := a.panel.NativeHandle(); h != 0 {
+			win.SetDisplayAffinity(h, true)
+			a.snapshotScreen()
+			win.SetDisplayAffinity(h, false)
+			return
+		}
+	}
+	a.snapshotScreen()
+}
+
 // glassScale 是这块屏的 DPI 缩放，没问到就按 1 算。
 func (a *application) glassScale() float32 {
 	if a.scale > 0 {
