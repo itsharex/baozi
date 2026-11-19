@@ -79,19 +79,27 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 	switch msg {
 	case wmEnterSizeMove:
 		f.drag = true
-		// 拖动开始时把投影按当前位置摆好（不要收：收了边缘直贴桌面，弧外的 1px
-		// 桌面色和窗口的矩形形状一起露出来，就是"四个直角"）。
+		// 万一这条路径真的被走到（系统拖动），也要和自绘拖动表现一致：
+		// 切糊化、重烘一次、并且把这一帧推上屏。
+		if f.glass != nil && f.glass.app != nil {
+			f.glass.app.setDragFade(true)
+		}
+		f.glass.refresh(true)
 		f.glass.refreshShadow()
+		if f.win != nil {
+			f.win.FrameNow()
+		}
 	case wmMove:
 		if f.drag {
-			// 拖动中**什么都不碰**：不动底图、不压重绘，只让投影跟着窗口走。
-			//
-			// 底图是窗口坐标系的位图，铺满客户区 —— 弧本来就画在窗口边缘上，窗口
-			// 移动时被 DWM 一起搬走，边缘永远是弧。上一版在这一步每 30ms 重烘一次
-			// 底图并压重绘，正好在系统拖动的模态循环里跟渲染循环抢：烘出来的图还没
-			// 上屏，窗口已经又挪了，屏幕上成了一块"没玻璃的矩形" —— 既没模糊，
-			// 又满眼直角。停手之后再精确重烘，代价只有一次。
+			// 系统拖动中：投影跟着走、底图按节流重烘、每帧推上屏。
+			if time.Since(f.lastBake) >= 12*time.Millisecond {
+				f.lastBake = time.Now()
+				f.glass.refresh(true)
+			}
 			f.glass.followShadow()
+			if f.win != nil {
+				f.win.FrameNow()
+			}
 			r, _, _ := procDefSubclass.Call(hwnd, msg, wparam, lparam, id, data)
 			return r
 		}
@@ -104,11 +112,14 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 		}
 	case wmExitSizeMove:
 		f.drag = false
-		// 停手：糊化退掉、底图按最终位置重烘一次，投影按新位置重画并显示。
+		// 停手：糊化退掉、底图按最终位置重烘一次、推一帧上屏，投影按新位置重画。
 		if f.glass != nil && f.glass.app != nil {
 			f.glass.app.setDragFade(false)
 		}
 		f.glass.refresh(true)
+		if f.win != nil {
+			f.win.FrameNow()
+		}
 		f.glass.refreshShadow()
 	case wmNonClientLeftButtonDown:
 		// 顶栏被当成了标题栏（hitTest == HTCAPTION）：系统准备自己搬窗口了。
