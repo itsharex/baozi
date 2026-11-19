@@ -2532,21 +2532,20 @@ func applyAppearance(cfg *config.Config) {
 	}
 	glassTintAlpha = uint8(alpha)
 	// 模糊跟着透明度走：越透糊得越轻（想看见桌面就该少糊一点）。
-	// 59% 是 7；往上到 100% 降到 3（磨砂图本身已经降采样，3 约等于屏幕 12 像素的
-	// 中糊，桌面轮廓还认得出来、但已经不是"一块透明塑料"）；往下到 0% 给到 10。
-	// 三档整体比早先（5 / 1 / 8）重两档：早先拉满透明度几乎不糊。
-	blur := 7
+	// 59% 是 9；往上到 100% 降到 5（磨砂图本身已经降采样，5 约合屏幕 20 像素，
+	// 桌面只剩明暗和色块，认得是"一片窗外的景色"但认不出图标）；往下到 0% 给到 12。
+	blur := 9
 	switch {
 	case pct <= config.DefaultGlassTransparency:
-		blur = 7 + int(math.Round(float64(config.DefaultGlassTransparency-pct)*3.0/59.0))
+		blur = 9 + int(math.Round(float64(config.DefaultGlassTransparency-pct)*3.0/59.0))
 	case pct > config.DefaultGlassTransparency:
-		blur = 7 - int(math.Round(float64(pct-config.DefaultGlassTransparency)*4.0/41.0))
+		blur = 9 - int(math.Round(float64(pct-config.DefaultGlassTransparency)*4.0/41.0))
 	}
-	if blur < 3 {
-		blur = 3
+	if blur < 5 {
+		blur = 5
 	}
-	if blur > 10 {
-		blur = 10
+	if blur > 12 {
+		blur = 12
 	}
 	glassBlurRadius = blur
 	// 投影强度百分比 → 黑度：100% 对应 0.6（再深就显脏，见 internal/win/shadow.go）。

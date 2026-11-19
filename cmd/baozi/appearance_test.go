@@ -27,8 +27,8 @@ func TestApplyAppearance(t *testing.T) {
 	if glassTintAlpha != 158 {
 		t.Fatalf("缺省压白 alpha 应 158，实际 %d", glassTintAlpha)
 	}
-	if glassBlurRadius != 7 {
-		t.Fatalf("缺省模糊半径应 7，实际 %d", glassBlurRadius)
+	if glassBlurRadius != 9 {
+		t.Fatalf("缺省模糊半径应 9，实际 %d", glassBlurRadius)
 	}
 
 	// 透明度 0 = 完全不透明：白层盖满、模糊最重。
@@ -38,8 +38,8 @@ func TestApplyAppearance(t *testing.T) {
 	if glassTintAlpha != 255 {
 		t.Fatalf("透明度 0 应完全不透明（alpha 255），实际 %d", glassTintAlpha)
 	}
-	if glassBlurRadius != 10 {
-		t.Fatalf("透明度 0 模糊应最重（10），实际 %d", glassBlurRadius)
+	if glassBlurRadius != 12 {
+		t.Fatalf("透明度 0 模糊应最重（12），实际 %d", glassBlurRadius)
 	}
 
 	// 透明度 100 = 最透：alpha 压到 62（还有四分之一层白，禁止完全透明），
@@ -50,8 +50,8 @@ func TestApplyAppearance(t *testing.T) {
 	if glassTintAlpha != 62 {
 		t.Fatalf("透明度 100 应 alpha 62，实际 %d", glassTintAlpha)
 	}
-	if glassBlurRadius != 3 {
-		t.Fatalf("透明度 100 模糊应最轻（3），实际 %d", glassBlurRadius)
+	if glassBlurRadius != 5 {
+		t.Fatalf("透明度 100 模糊应最轻（5），实际 %d", glassBlurRadius)
 	}
 
 	// 把开关关掉 = 不要玻璃能看穿 → 等同透明度 0（实心）。
