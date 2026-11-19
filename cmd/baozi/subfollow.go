@@ -41,10 +41,6 @@ type shadowFollower struct {
 	glass *subGlass
 	tramp uintptr
 	drag  bool
-
-	// 拖动中重烘底图的节流。整张重烘一次 8~10ms（1150x1025），拖动时每帧都做
-	// 会把帧率吃掉一半，30ms 一次已经够"背景跟着走"了。
-	lastBake time.Time
 }
 
 // installShadowFollower 给子窗的**顶层窗口**挂 WM_MOVE 子类化。
@@ -106,11 +102,10 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 	case wmEnterSizeMove:
 		f.drag = true
 		// 万一这条路径真的被走到（系统拖动），也要和自绘拖动表现一致：
-		// 切糊化、重烘一次、并且把这一帧推上屏。
+		// 切糊化、重烘一次（子窗版：只烘这一块，不烘面板）、并且把这一帧推上屏。
 		if f.glass != nil && f.glass.app != nil {
-			f.glass.app.setDragFade(true)
+			f.glass.app.setDragFadeSub(f.glass, true)
 		}
-		f.glass.refresh(true)
 		f.glass.refreshShadow()
 		if f.win != nil {
 			f.win.FrameNow()
@@ -137,11 +132,11 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 		}
 	case wmExitSizeMove:
 		f.drag = false
-		// 停手：糊化退掉、底图按最终位置重烘一次、推一帧上屏，投影按新位置重画。
+		// 停手：糊化退掉、底图按最终位置重烘一次（都在 setDragFadeSub 里），
+		// 推一帧上屏，投影按新位置重画。
 		if f.glass != nil && f.glass.app != nil {
-			f.glass.app.setDragFade(false)
+			f.glass.app.setDragFadeSub(f.glass, false)
 		}
-		f.glass.refresh(true)
 		if f.win != nil {
 			f.win.FrameNow()
 		}

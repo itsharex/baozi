@@ -374,6 +374,16 @@ func shiftPix(img *image.RGBA, dx, dy int) {
 // 单独补。整张是 74 万像素，这里约 4~5 万，一次平移 2ms 上下。
 func (a *application) repaintBackingBands(cx, cy, cw, ch, r, band, dx, dy int) {
 	_ = band
+	a.backPix = a.repaintBandsInto(a.backPix, cx, cy, cw, ch, r, backingPad, dx, dy)
+}
+
+// repaintBandsInto 同上，但把结果写回**指定**那张底图（子窗的 g.pix）。
+//
+// 面板和子窗走的是同一条平移快路径，所以"平移之后要补哪几块"必须共用一份代码：
+// 子窗抽出来的时候只做了 shiftPix + Update，没补这四条带 —— 拖动时贴边那一圈
+// （抗锯齿过渡、边框环、弧外 alpha=0）还是旧坐标的像素，压在深色桌面上就是一条
+// 会跟着窗口跑的亮线。如今两边共用这一个函数。
+func (a *application) repaintBandsInto(dst *image.RGBA, cx, cy, cw, ch, r, inset, dx, dy int) *image.RGBA {
 	abs := func(v int) int {
 		if v < 0 {
 			return -v
@@ -382,27 +392,26 @@ func (a *application) repaintBackingBands(cx, cy, cw, ch, r, band, dx, dy int) {
 	}
 	ex, ey := 3+abs(dx), 3+abs(dy)
 	if ex*2 >= cw || ey*2 >= ch || ex >= cw/2 || ey >= ch/2 {
-		a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rectangle{})
-		return
+		return a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rectangle{})
 	}
 	// 上下横条（全宽）、左右竖条（避开横条已经盖过的两头）
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, 0, cw, ey))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ch-ey, cw, ch))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ey, ex, ch-ey))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-ex, ey, cw, ch-ey))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(0, 0, cw, ey))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(0, ch-ey, cw, ch))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(0, ey, ex, ch-ey))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(cw-ex, ey, cw, ch-ey))
 	// 四个角块：弧、弧外三角，**以及老角块被搬进来落下的那块** —— 老角块
 	// 在旧坐标里是 [0,cr)×[0,cr)，内容出现在新坐标为止减 (dx,dy) 的位置，
 	// 所以角落要重算的并集是 cr+|d| 见方，不只是 cr。
 	cr := r + 2
 	cq, chq := cr+abs(dx), cr+abs(dy)
 	if cq >= cw || chq >= ch {
-		a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rectangle{})
-		return
+		return a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rectangle{})
 	}
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, 0, cq, chq))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-cq, 0, cw, chq))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ch-chq, cq, ch))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-cq, ch-chq, cw, ch))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(0, 0, cq, chq))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(cw-cq, 0, cw, chq))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(0, ch-chq, cq, ch))
+	dst = a.composeBackingInto(dst, cx, cy, cw, ch, r, inset, image.Rect(cw-cq, ch-chq, cw, ch))
+	return dst
 }
 
 // composeBacking 返回客户区大小的位图：桌面 + 玻璃 + 边框环，按覆盖率相加。

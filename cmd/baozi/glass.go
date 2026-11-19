@@ -1068,6 +1068,24 @@ func (a *application) setDragFade(on bool) {
 	a.refreshBacking(true)
 }
 
+// setDragFadeSub 是子窗版：糊化开关完全一样（同一张共享磨砂图、同一套 frostImage
+// 拖动分支），但**只重烘这个子窗的底图**。
+//
+// 不能直接复用 setDragFade 的原因很具体：它烘的是面板底图（refreshBacking）。
+// 子窗抽出来之后，按下时调它只会把面板（此时还藏着）重烘一遍，子窗自己那张底图
+// 仍是清晰版 —— 于是"拖动糊化"对子窗等于没发生，观感就是"拖起来背景一点没变"。
+// 上一版就是这么报回来的（当时的结论写成"糊透了看着像死色"，其实是压根没重烘）。
+func (a *application) setDragFadeSub(g *subGlass, on bool) {
+	changed := a.dragFade != on
+	a.dragFade = on
+	if changed {
+		a.rebuildFrost()
+	}
+	if g != nil {
+		g.refresh(true)
+	}
+}
+
 // dupRGBA 拷一份图像。win.Blur / win.Tint 都是原地改，所以底片必须留一份原件，
 // 否则"改完透明度重做一次"第二次就找不到干净的桌面底片了。
 func dupRGBA(src *image.RGBA) *image.RGBA {

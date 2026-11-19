@@ -133,7 +133,10 @@ func (g *subGlass) refresh(force bool) {
 	}
 	s := a.glassScale()
 	r := int(math.Round(float64(glassRadius) * float64(s)))
-	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark}
+	// key 必须和面板那份（backing.go 的 refreshBackingFor）**逐字段一样**：
+	// 少一个字段就意味着"那个条件变了却还吃着旧图"。抽出来的时候漏了 fade，
+	// 于是拖动糊化开关切了也不重烘 —— 用户看到的就是"拖动时背景没变模糊"。
+	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark, fade: a.dragFade}
 	if !force && g.keySet && g.key == k {
 		return
 	}
@@ -178,7 +181,13 @@ func (g *subGlass) shiftTo(cx, cy int) {
 		g.refresh(true)
 		return
 	}
+	s := g.app.glassScale()
+	r := int(math.Round(float64(glassRadius) * float64(s)))
 	shiftPix(g.pix, dx, dy)
+	// 平移之后**必须**补那四条带和四角：见 backing.go 的 repaintBandsInto。
+	// 面板一直这么做，子窗抽出来时漏了 —— 漏了之后贴边那一圈仍是旧坐标的像素
+	// （抗锯齿过渡、边框环、弧外 alpha=0），压在深色桌面上是一条会跟着窗口跑的亮线。
+	g.pix = g.app.repaintBandsInto(g.pix, cx, cy, pw, ph, r, backingPad, dx, dy)
 	g.dragCx, g.dragCy = cx, cy
 	g.back.Update(g.pix)
 }

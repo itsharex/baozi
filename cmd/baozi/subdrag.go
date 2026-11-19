@@ -28,9 +28,6 @@ import (
 const (
 	subDragSubclassID = 0x53444732 // "SDG2"
 
-	// 位移超过这么多物理像素才算拖动，否则当普通点击。
-	subDragThreshold = 5
-
 	// 顶栏（含标题、副标题）的高度，DIP。下面是内容区，不接管按下。
 	// 实测顶栏（两行标题）在 1.25 缩放下约 90 物理像素 = 72 DIP，要留够，
 	// 不然在副标题那一行按下就不接管，退回系统拖动 —— 拖动时背景不动。
@@ -48,10 +45,6 @@ const (
 	// 拖窗口从来不缺地方。
 	subCloseAreaDip = 200
 
-	// 拖动中重烘底图的节流间隔。整张 1150x1025 约 8ms，60Hz 的鼠标移动也就是
-	// 16ms 一帧 —— 12ms 能让背景基本跟着手走，又不至于把 UI 线程占满。
-	subBakeInterval = 12 * time.Millisecond
-
 	wmCaptureChanged = 0x0215
 
 	// GetAsyncKeyState 的左键位。
@@ -68,9 +61,12 @@ type subDrag struct {
 	pending bool // 按下但还没过阈值
 	active  bool // 已接管
 
+	// faded 记"这一次拖动已经切到糊透的玻璃了"。面板那边叫 selfDrag.faded，
+	// 作用一样：第一帧切一次、松手退一次，见 glass.go 的 setDragFadeSub。
+	faded bool
+
 	startCurX, startCurY int32
 	startWinX, startWinY int32
-	lastBake             time.Time
 }
 
 func installSubDrag(w *mygo.Window, g *subGlass) {
@@ -158,13 +154,9 @@ func (d *subDrag) begin() {
 	d.pending = true
 	d.active = false
 	procSetCapture.Call(d.hwnd)
-	// 按下时只重烘一张"清晰"的底图，不切糊化。
-	//
-	// 之前试过拖动中糊透（setDragFade），结果是"玻璃变成一片死色"——用户
-	// 反而觉得"背景没了、没在变"。主面板真正的做法是**让底图跟着窗口平移**
-	// （refreshBackingFor 的平移快路径）：像素按屏幕坐标采样，窗口挪 (dx,dy)
-	// 就把内容搬 (dx,dy)，内容始终对应当前位置的桌面，所以看起来是真跟手。
-	// 子窗这边照抄这一手：按下烘一张，拖动中只做 shiftTo + FrameNow。
+	// 按下时只重烘一张"清晰"的底图 —— 糊化要等**越过阈值的第一帧**才切，
+	// 和主面板 dragTo() 的第 0 步（`if !d.faded { setDragFade(true) }`）一致：
+	// 只是点一下顶栏不该看到玻璃闪一下。
 	d.glass.refresh(true)
 	log.Printf("子窗拖动: %s begin（光标 %d,%d 窗口 %d,%d）",
 		d.glass.name, d.startCurX, d.startCurY, d.startWinX, d.startWinY)
@@ -182,6 +174,12 @@ func (d *subDrag) cancel() {
 	if d.hwnd != 0 {
 		procRelCapture.Call()
 	}
+	// 糊化必须一起退掉：dragFade 是**应用级**开关（磨砂图是共享的），
+	// 窗口在半路被藏起来时不清，面板和其他子窗会一直停在糊透的玻璃上。
+	if d.faded {
+		d.faded = false
+		d.glass.app.setDragFadeSub(nil, false)
+	}
 }
 
 // finish 结束一次拖动并把画面收尾：捕获、糊化、底图、投影各归各位。
@@ -194,8 +192,17 @@ func (d *subDrag) finish() {
 	if d.hwnd != 0 {
 		procRelCapture.Call()
 	}
-	d.glass.app.setDragFade(false)
-	d.glass.refresh(true)
+	if d.faded {
+		d.faded = false
+		// setDragFadeSub(false) 会重烘这一块子窗的底图（清晰版），
+		// 然后我们自己推一帧 —— 面板 up 里也是 refreshBacking + Invalidate 同一手。
+		d.glass.app.setDragFadeSub(d.glass, false)
+	} else {
+		d.glass.refresh(true)
+	}
+	if d.win != nil {
+		d.win.FrameNow()
+	}
 	d.glass.refreshShadow()
 }
 
@@ -230,7 +237,7 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		// 按下的这一刻无论旧状态是什么都该作废，先清干净再判断。
 		if d.active || d.pending {
 			d.cancel()
-			d.glass.app.setDragFade(false)
+			d.glass.app.setDragFadeSub(nil, false)
 		}
 		if d.inTopBar(x, y) {
 			d.begin()
@@ -246,8 +253,7 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		if d.pending {
 			// 没到阈值：当普通点击。仍然要把糊化退掉。
 			d.pending = false
-			d.glass.app.setDragFade(false)
-			d.glass.refresh(true)
+			d.glass.app.setDragFadeSub(d.glass, false)
 			break
 		}
 
@@ -267,12 +273,23 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		dx := p.X - d.startCurX
 		dy := p.Y - d.startCurY
 		if !d.active {
-			if abs32(dx) < subDragThreshold && abs32(dy) < subDragThreshold {
+			if abs32(dx) < dragThreshold && abs32(dy) < dragThreshold {
 				return 0
 			}
 			d.active = true
 			procSetCapture.Call(d.hwnd)
-			log.Printf("子窗拖动: %s 开始移动", d.glass.name)
+			// 第 0 步，和面板 dragTo() **一字不差地同一个顺序**：
+			// 先切糊化并重烘这一块底图，再挪窗口、再平移内容、最后推帧。
+			// 糊化必须在 shiftTo 之前完成，否则这一帧平移的是清晰图，
+			// 下一帧才糊 —— 用户看到的就是"拖起来先清了一下再糊"。
+			//
+			// 漏掉这一步就是用户这次报的"拖动时没有像启动面板那样变模糊，
+			// 而是保持背景"：玻璃一直挂着那张清晰的磨砂底片。
+			if !d.faded {
+				d.faded = true
+				d.glass.app.setDragFadeSub(d.glass, true)
+			}
+			log.Printf("子窗拖动: %s 开始移动（糊化）", d.glass.name)
 		}
 		// 每帧确认捕获还在自己手上：窗口一挪，系统/别的路径就可能把它拿走，
 		// 拿走了就再也收不到 mousemove，拖动看着就是"动一下就停住"。
@@ -291,6 +308,13 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		}
 		// 拖动中不要交给 mygo：它的 hover/点击逻辑会把光标当成"在顶栏上"。
 		return 0
+
+	case wmCancelMode:
+		// 和面板 selfDrag 的处理一致：系统把这一轮鼠标交互作废了（弹模态、
+		// Alt+Tab、UAC……），捕获和 active/pending 就地清掉，再原样传下去。
+		if d.active || d.pending {
+			d.cancel()
+		}
 
 	case wmCaptureChanged:
 		// 捕获丢了。如果左键还按着，那就是被别的窗口/系统抢走了（窗口移动、
