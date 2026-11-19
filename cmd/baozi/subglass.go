@@ -44,6 +44,9 @@ type subGlass struct {
 	// 藏着的时候它照样能显示：没有这道门，启动时两个隐藏的子窗就会各闪出一个
 	// "只有边框和投影的空框"。由 show()/hide() 维护。
 	visible bool
+
+	// follower 是挂在顶层窗口上的 WM_MOVE 子类化（见 subfollow.go）。
+	follower *shadowFollower
 }
 
 // newSubGlass 给一个已建好的窗口配一份玻璃（含阴影层）。
@@ -169,6 +172,8 @@ func (g *subGlass) refreshShadow() {
 		g.shadow.Hide()
 		return
 	}
+	// 句柄这时肯定有了：顺手把 WM_MOVE 子类化挂上（幂等），窗口挪动时投影才跟得上。
+	installShadowFollower(g.win, g)
 	hwnd := g.win.NativeHandle()
 	if hwnd == 0 {
 		return

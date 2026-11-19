@@ -117,6 +117,8 @@ func newSettingsWindow(a *application) *settingsWindow {
 		Content:           ui.View(s.view),
 	})
 	s.glass = a.newSubGlass(s.win, "设置")
+	// 投影层是独立窗口，窗口拖动它不会跟 —— 不接这个，拖完原地会留一个带直角的空框。
+	installShadowFollower(s.win, s.glass)
 	s.win.OnResize(func() {
 		if s.glass == nil {
 			return
@@ -206,6 +208,8 @@ func (s *settingsWindow) show() {
 	// （弧形画在底图里），用户看到的就是"先闪一个空框，然后才整好"。藏着的窗口
 	// ClientRect 一样有效，所以能提前烘。
 	if s.glass != nil {
+		// 句柄是 Show 时才真正建出来的，第一次调用必然摸空 —— 这里补挂一次。
+		installShadowFollower(s.win, s.glass)
 		s.glass.show()
 		s.glass.refresh(true)
 	}

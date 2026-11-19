@@ -103,6 +103,8 @@ func newShareWindow(a *application) *shareWindow {
 		Content:           ui.View(s.view),
 	})
 	s.glass = a.newSubGlass(s.win, "互传")
+	// 同设置窗：投影层得跟着窗口走，否则拖完原地留一个带直角的空框。
+	installShadowFollower(s.win, s.glass)
 	s.win.OnResize(func() {
 		if s.glass == nil {
 			return
@@ -144,6 +146,7 @@ func (s *shareWindow) show() {
 	// 不再一打开就开服务：分享是一次性的，要用户自己点「生成链接」。
 	// 底图先烘、窗口再显示、投影最后上 —— 和设置窗同一个理由，见那边注释。
 	if s.glass != nil {
+		installShadowFollower(s.win, s.glass)
 		s.glass.show()
 		s.glass.refresh(true)
 	}
