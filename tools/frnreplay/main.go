@@ -94,7 +94,7 @@ func main() {
 		parentIdx, parentOK := mut.LookupFRN(c.ParentFRN)
 		selfIdx, selfOK := mut.LookupFRN(c.FRN)
 		op, ok := mut.Apply(c, rule)
-		fmt.Printf("%2d %-34q frn=%016x%s parent=%016x%s create=%v del=%v renOld=%v renNew=%v dir=%v reparse=%v hidden=%v → 应用=%v op=%d\n",
+		fmt.Printf("%2d %-34q frn=%016x%s parent=%016x%s create=%v del=%v renOld=%v renNew=%v dir=%v reparse=%v hidden=%v → 应用=%v op=%s\n",
 			n, c.Name,
 			c.FRN, hit(selfOK), c.ParentFRN, hit(parentOK),
 			c.Create, c.Delete, c.RenameOld, c.RenameNew, c.IsDir, c.IsReparse, c.IsHidden,

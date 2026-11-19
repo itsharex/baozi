@@ -9,6 +9,7 @@ import (
 
 	"github.com/egoist/mygo/ui"
 
+	"baozi/internal/config"
 	"baozi/internal/win"
 )
 
@@ -56,14 +57,19 @@ const deskHalfStep = 2
 // 的浅色弧线，正是用户反复说的"四角内部有一道白色圆弧线"。
 const UseCornerBitmaps = false
 
-const glassRadius = 24
+// glassRadius 是面板的圆角半径（DIP）。设置页能改（0 = 直角），所以它是变量
+// 而不是常量：启动时和保存配置后由 applyAppearance 从 config 写进来，
+// 底图（backing.go）、内容层那条弧（main.go）、阴影层都读它。
+var glassRadius = config.DefaultPanelRadius
 
-// glassClipRadius 是内容层（底栏、卡片、直边线）裁圆角用的半径（DIP）。
-//
-// 比 glassRadius 小 1：最外那一像素留给底图烘出来的边框环（backing.go）。
-// 内容一路铺到边上，就会把环盖掉 —— 用户报的"圆角的地方没有边框了"正是这个。
-// 只让 1 DIP，是因为让得越多，弧上露出来的底图带越宽，弧看着就越"粗"。
-const glassClipRadius = glassRadius - 1
+// glassClipRadius 由 applyAppearance 跟着 glassRadius 一起维护（永远比它小 1，
+// 最小 0）。
+var glassClipRadius = glassRadius - 1
+
+// glassTintAlpha 是磨砂图上那层近似白的不透明度（0~255）。设置页的"玻璃不透明度"
+// 百分比折算到它：100% ≈ 255（几乎不透），0% ≈ 0（只剩模糊，桌面颜色全透上来）。
+// 缺省 150 ≈ 59%。
+var glassTintAlpha uint8 = 150
 
 // snapshotScreen 抓一次全屏、做成磨砂图。
 // 必须在 Show 之前调用，否则抓到的是面板自己。
@@ -854,9 +860,9 @@ func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	}
 	// 缩略图上模糊半径按同一比例小（放大了看是一片均匀的糊）。
 	small = win.Blur(small, 5, 3)
-	// 压一层近似白（247,248,252，alpha 150 ≈ 盖住六成）：牛奶白磨砂，
-	// 背后透得出颜色和明暗。
-	small = win.Tint(small, 247, 248, 252, 150)
+	// 压一层近似白（247,248,252）：牛奶白磨砂，背后透得出颜色和明暗。
+	// 那一层白有多不透明由设置页的"玻璃不透明度"决定（glassTintAlpha）。
+	small = win.Tint(small, 247, 248, 252, glassTintAlpha)
 	// 阴影层取"玻璃色"用：磨砂图上任意一点就是面板玻璃在那里的颜色。
 	a.frostSmall = small
 	// 图在界面上的尺寸 = 整个虚拟屏的 DIP 尺寸，窗口在里面取景。
@@ -949,6 +955,18 @@ func (a *application) applyRoundRegion() {
 	// 区域画，四角是圆的。
 }
 
+// shadowEnabled 报那层自绘阴影要不要上屏：设置页的"投影"开关 + 强度不为 0，
+// 以及调试用的 BAOZI_NOSHADOW。
+func (a *application) shadowEnabled() bool {
+	if os.Getenv("BAOZI_NOSHADOW") == "1" {
+		return false
+	}
+	if a.cfg == nil {
+		return true
+	}
+	return a.cfg.ShadowPct() > 0
+}
+
 // refreshShadow 按面板当前的位置和尺寸重画自绘阴影层，并让它显出来。
 //
 // 为什么是自绘：Win10 上**窗口只要有 SetWindowRgn 的区域，DWM 就不投阴影** ——
@@ -975,7 +993,9 @@ func (a *application) refreshShadow() {
 	// 调试开关（只在手动跑 dist\baozi.debug.exe 时用）：
 	//   BAOZI_NOSHADOW=1  阴影层整块不上屏（看"没有自绘层时四角到底有没有白"）
 	//   BAOZI_NOCORNER=1  只保留外圈阴影，不补四角弧外的桌面色/边框弧
-	if os.Getenv("BAOZI_NOSHADOW") == "1" {
+	if !a.shadowEnabled() {
+		// 设置页把投影关掉了（或强度调到 0）：整层不显示。弧和弧外都在底图里，
+		// 关掉不影响圆角，只是面板外没有影子。
 		a.hideShadow()
 		return
 	}
@@ -1118,6 +1138,12 @@ func (a *application) ensureShell(reason string) {
 	if a.shellProbes < 3 {
 		a.shellProbes++
 		log.Printf("外观复查 %s: 窗口区域=%v 阴影上屏=%v", reason, hasRegion, shadowShown)
+	}
+	// 投影被设置页关掉了：这一层本来就该一直藏着。下面那套"被藏了就补回"的自愈
+	// 得整段跳过 —— 否则它每次复查都会把阴影又拽回屏幕上（实测每秒一次）。
+	if !a.shadowEnabled() {
+		a.hideShadow()
+		return
 	}
 	if !bakedPanel && !hasRegion {
 		log.Printf("玻璃: 圆角区域丢了（%s），补设一次", reason)

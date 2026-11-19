@@ -54,9 +54,25 @@ const (
 	// ShadowMargin 是阴影从面板边缘往外扩散的宽度（DIP）：DWM 在 Win10 上大约是
 	// 10~14px，这里取 16 让它再软一点。
 	ShadowMargin = 16
-	// constMaxAlpha 是阴影最深处的黑度。面板底色很浅，再深就显脏。
-	constMaxAlpha = 0.34
+	// DefaultShadowAlpha 是阴影最深处的默认黑度。面板底色很浅，再深就显脏。
+	DefaultShadowAlpha = 0.34
 )
+
+// shadowAlpha 是当前生效的最深黑度（0~1）。设置页能调，所以不能再是编译期
+// 常量：启动时和保存配置后由 cmd/baozi 调 SetShadowAlpha 写进来。
+// 只在 UI 线程写、只在 Place 里读，不存在跨协程并发。
+var shadowAlpha = DefaultShadowAlpha
+
+// SetShadowAlpha 改阴影最深处的黑度。0 表示不画（调用方那边会直接不上屏）。
+func SetShadowAlpha(v float64) {
+	if v < 0 {
+		v = 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	shadowAlpha = v
+}
 
 var (
 	procUpdateLayeredWindow = user32.NewProc("UpdateLayeredWindow")
@@ -236,7 +252,7 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	if qh < 0 {
 		qh = 0
 	}
-	const maxAlpha = constMaxAlpha
+	maxAlpha := shadowAlpha
 	mf := float64(m)
 	cx0, cy0 := hw, hh // 和上面的中心保持一致，见那条注释（差半格会在右下露出一条亮线）
 	// 只画"边带"：面板盖住的那一大片内部 alpha 恒为 0，没必要每帧都算一遍。
@@ -635,7 +651,7 @@ func CornerDarken(bx, by, radius, margin int) float64 {
 		return 0
 	}
 	f := 1 - d/float64(margin)
-	return constMaxAlpha * f * f * f
+	return shadowAlpha * f * f * f
 }
 
 // DumpRGBA 把当前位图原样导成 PNG（BGRA → RGBA），诊断用：量四角抗锯齿、
@@ -695,7 +711,9 @@ type cornerCoverageT struct {
 }
 
 var (
-	cornerCovKey [3]int
+	// 缓存键里带一位"强度"（量化到千分之一）：设置页把强度调了以后表必须重算，
+	// 只按 radius/margin/borderW 缓存的话新强度不会生效。
+	cornerCovKey [4]int
 	cornerCovVal *cornerCoverageT
 	cornerCovMu  sync.Mutex
 )
@@ -703,7 +721,8 @@ var (
 func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 	cornerCovMu.Lock()
 	defer cornerCovMu.Unlock()
-	if cornerCovVal != nil && cornerCovKey == [3]int{radius, margin, borderW} {
+	alphaQ := int(math.Round(shadowAlpha * 1000))
+	if cornerCovVal != nil && cornerCovKey == [4]int{radius, margin, borderW, alphaQ} {
 		return cornerCovVal
 	}
 	size := radius + margin + 2
@@ -762,11 +781,11 @@ func cornerCoverage(radius, margin, borderW int) *cornerCoverageT {
 			d := -idc
 			if d > 0 && d < mf {
 				f := 1 - d/mf
-				cov.shade[i] = constMaxAlpha * f * f * f
+				cov.shade[i] = shadowAlpha * f * f * f
 			}
 		}
 	}
-	cornerCovKey = [3]int{radius, margin, borderW}
+	cornerCovKey = [4]int{radius, margin, borderW, alphaQ}
 	cornerCovVal = &cov
 	return &cov
 }

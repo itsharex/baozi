@@ -723,7 +723,7 @@ func (a *application) view(c *ui.Context) {
 				// 边上就会把环盖掉（以前"圆角那段没有边框"就是这么来的）。
 				ui.Column(c).Absolute().Left(0).Top(0).
 					Size(float32(pw), float32(ph)).
-					Radius(glassClipRadius).Clip().
+					Radius(float32(glassClipRadius)).Clip().
 					DragWindow().Children(body)
 				// 四条直边。直边段和弧上的边线同色同宽，拼成一整圈框。
 				//
@@ -2454,6 +2454,48 @@ func (a *application) toggle() {
 	a.show()
 }
 
+// applyAppearance 把配置里的外观项落到绘制时读的包级变量上：
+// 圆角决定底图/内容层弧/阴影层的形状，不透明度决定磨砂图上那层白有多浓，
+// 投影强度决定阴影最深有多黑。
+//
+// 这些都是绘制时现读的量，所以改完不用重建窗口 —— 重烘一次底图、重画一次
+// 阴影层就够（见 settings.go 的保存流程）。磨砂图是"唤出那一刻抓屏做的"，
+// 不透明度要下一次唤出才看得见：重新抓屏那一刻才有桌面可抓，这是设计如此。
+func applyAppearance(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	r := cfg.PanelRadius()
+	glassRadius = r
+	glassClipRadius = r - 1
+	if glassClipRadius < 0 {
+		// 直角时内容层不裁（Radius(0) 就是不要圆角）；让 1 DIP 的约定在 0 处失效。
+		glassClipRadius = 0
+	}
+	pct := cfg.GlassOpacityPct()
+	glassTintAlpha = uint8((pct*255 + 50) / 100) // 四舍五入，59% → 150
+	// 投影强度百分比 → 黑度：100% 对应 0.6（再深就显脏，见 internal/win/shadow.go）。
+	win.SetShadowAlpha(float64(cfg.ShadowPct()) / 100 * 0.6)
+}
+
+// applyAppearanceNow 让设置页刚改的外观立刻在屏幕上成立：底图的弧/覆盖率按新
+// 半径重烘，内容层那条弧跟着重画，投影层按新强度重画。
+//
+// 磨砂图不重建：它得用"唤出那一刻的整屏快照"，而面板藏着的时候手边没有
+// （deskHalf 在 hidePanel 里就放掉了），下一次唤出自然按新不透明度做。
+func (a *application) applyAppearanceNow() {
+	if a.panel == nil || !a.panelUp.Load() {
+		return
+	}
+	// 走主线程：refreshBacking 要造 GPU 纹理，和渲染线程同时碰 D3D 没保证。
+	mygo.RunOnMain(func() {
+		a.applyRoundRegion()
+		a.refreshBacking(true)
+		a.panel.Update(func() {})
+		a.refreshShadow()
+	})
+}
+
 func (a *application) ready() {
 	a.icons = map[string]*ui.Bitmap{}
 	// 阴影层先建好（隐藏状态）。放在最前面：后面的窗口初始化里不会用到它，
@@ -2671,12 +2713,15 @@ func (a *application) ready() {
 		a.shutdown()
 	})
 	// 开机自启拉起时不弹面板，直接待在托盘（静默启动）。
+	// 设置里的"启动时自动隐藏"让手动启动也走这条路（只留托盘 + 双击 Ctrl）。
 	// BAOZI_HEADLESS=1 给冒烟测试留下同一条路径，不用真去改注册表。
 	autoLogin := mygo.App.WasOpenedAtLogin()
-	if !autoLogin && os.Getenv("BAOZI_HEADLESS") == "" {
+	if !autoLogin && !a.cfg.HideOnStart() && os.Getenv("BAOZI_HEADLESS") == "" {
 		a.show()
-	} else {
+	} else if autoLogin {
 		log.Printf("启动：来自开机自启，面板保持隐藏（托盘可用，双击 Ctrl 随时唤出）")
+	} else {
+		log.Printf("启动：按设置保持隐藏（托盘可用，双击 Ctrl 随时唤出）")
 	}
 	// 命令行直达某个窗口：BAOZI_OPEN=settings / share。
 	// 必须延迟到事件循环里再 Show：窗口刚创建完时 Show 会被忽略（表现为窗口存在但一直隐藏）。
@@ -3143,6 +3188,9 @@ func main() {
 		log.Fatalf("数据目录: %v", err)
 	}
 	app.cfg, app.cfgPath, app.dataDir = cfg, cfgPath, dir
+	// 外观必须在建面板窗口之前落地：圆角半径会作为 WindowOptions.CornerRadius
+	// 传给 mygo（窗口级参数，只在创建时读一次），晚一步就得改完重启才生效。
+	applyAppearance(cfg)
 
 	hist, err := history.Open(app.historyFile(), cfg.History.MaxItems, 400*time.Millisecond)
 	if err != nil {

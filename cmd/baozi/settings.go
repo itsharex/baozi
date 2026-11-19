@@ -28,6 +28,17 @@ type settingsWindow struct {
 	combo       string
 	fullscreen  bool
 	openAtLogin bool
+	// 启动时不弹面板：只留托盘和双击 Ctrl。
+	hideOnStart bool
+
+	// 外观：三项各自"开关 + 程度"。值都用"人话单位"（DIP / 百分比），
+	// 保存时由 main.go 的 applyAppearance 折算给绘制层。
+	radiusOn   bool
+	radiusVal  float64
+	opacityOn  bool
+	opacityVal float64
+	shadowOn   bool
+	shadowVal  float64
 
 	wFreq float64
 	wType float64
@@ -120,6 +131,16 @@ func (s *settingsWindow) load() {
 	// （application.openAtLogin），这里直接读缓存——App.OpenAtLogin 会走
 	// mygo 主循环，在 ui.Tester 下没有主循环，调它会永久阻塞。
 	s.openAtLogin = s.app.openAtLogin.Load()
+	s.hideOnStart = cfg.HideOnStart()
+
+	// 外观：开关和程度都读出来。程度不看开关、直接读存着的值 —— 关掉再打开
+	// 得回到用户上次调到的那个数，而不是跳回默认。
+	s.radiusOn = cfg.Appearance.Radius.On(true)
+	s.radiusVal = float64(cfg.Appearance.Radius.Int(config.DefaultPanelRadius, 0, config.MaxPanelRadius))
+	s.opacityOn = cfg.Appearance.Opacity.On(true)
+	s.opacityVal = float64(cfg.Appearance.Opacity.Int(config.DefaultGlassOpacity, 0, 100))
+	s.shadowOn = cfg.Appearance.Shadow.On(true)
+	s.shadowVal = float64(cfg.Appearance.Shadow.Int(config.DefaultShadowPct, 0, 100))
 
 	s.wFreq = cfg.Search.Weights.Frequency
 	s.wType = cfg.Search.Weights.Type
@@ -165,10 +186,11 @@ func (s *settingsWindow) show() {
 // settingsNavItems 是左栏的设置项，顺序和右栏的段落一一对应。
 // 「自定义命令」要一整屏（左清单 + 右表单），所以它是单独一页；其余四项同在一页，
 // 点哪一项就把右栏滚到哪一段——不切页，别的段还在原地，想接着往下看不用点回来。
-var settingsNavItems = []string{"唤出", "文件对话框跟随", "排序", "索引", "自定义命令"}
+var settingsNavItems = []string{"唤出", "界面外观", "文件对话框跟随", "排序", "索引", "自定义命令"}
 
 const (
 	secHotkey = iota
+	secAppearance
 	secFollow
 	secRank
 	secIndex
@@ -247,6 +269,8 @@ func (s *settingsWindow) sectionsColumn(c *ui.Context, t *ui.Theme) {
 		ui.Column(c).Gap(0).Children(func() {
 			s.section(c, secHotkey, func() { s.hotkeySection(c, t) })
 			ui.Divider(c)
+			s.section(c, secAppearance, func() { s.appearanceSection(c, t) })
+			ui.Divider(c)
 			s.section(c, secFollow, func() { s.followSection(c, t) })
 			ui.Divider(c)
 			s.section(c, secRank, func() { s.rankSection(c, t) })
@@ -282,6 +306,7 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 		})
 		ui.Checkbox(c, &s.fullscreen, "全屏应用（游戏、全屏视频）前台时不响应")
 		ui.Checkbox(c, &s.openAtLogin, "开机自动启动（登录后静默待在托盘，不弹面板）")
+		ui.Checkbox(c, &s.hideOnStart, "启动时不弹面板（手动启动也一样，只在托盘里等着，双击 Ctrl 随时唤出）")
 		ui.Text(c, "自启靠系统的 Run 键，任务管理器「启动」页里能单独禁用；禁用后这里的勾选会跟着变回未勾选。").FontSize(11).TextColor(t.TextMuted)
 	})
 }
@@ -681,6 +706,39 @@ func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
 	})
 }
 
+// appearanceSection 是面板外观：圆角、玻璃不透明度、投影，各自"开关 + 程度"。
+//
+// 只影响主面板，不影响设置窗和文件互传窗：那两个是 mygo 的系统玻璃窗口，
+// 形状由系统管；面板是整窗自绘的（见 glass.go / backing.go），因此这三项都能自己调。
+func (s *settingsWindow) appearanceSection(c *ui.Context, t *ui.Theme) {
+	ui.Column(c).Gap(14).Children(func() {
+		sectionTitle(c, t, "界面外观",
+			"圆角和投影保存后立刻生效；玻璃不透明度要等下一次唤出面板（磨砂图是唤出那一刻抓屏做的）")
+		toggleSliderRow(c, t, &s.radiusOn, &s.radiusVal, "圆角", 0, config.MaxPanelRadius, "DIP",
+			"关掉 = 直角。24 是现在这个半径")
+		toggleSliderRow(c, t, &s.opacityOn, &s.opacityVal, "玻璃不透明度", 0, 100, "%",
+			"越大越白越不透明；越小越透，0% 只剩模糊，桌面颜色全透上来")
+		toggleSliderRow(c, t, &s.shadowOn, &s.shadowVal, "投影", 0, 100, "%",
+			"面板外那圈影子；关掉 = 完全不投影")
+	})
+}
+
+// toggleSliderRow 是"一个勾选 + 一条滑杆 + 一个数"的一行：勾选管要不要，
+// 滑杆管程度。滑杆和数值在第二行，第一行留给说明文字，读起来不挤。
+func toggleSliderRow(c *ui.Context, t *ui.Theme, on *bool, val *float64,
+	label string, lo, hi float64, unit, hint string) {
+	ui.Column(c).Gap(6).Children(func() {
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Checkbox(c, on, label)
+			ui.Text(c, hint).FontSize(11).TextColor(t.TextMuted)
+		})
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Slider(c, val, lo, hi).Grow(1)
+			ui.Text(c, fmt.Sprintf("%.0f%s", *val, unit)).FontSize(12).Width(64)
+		})
+	})
+}
+
 func labelledTextArea(c *ui.Context, t *ui.Theme, label string, value *string) {
 	ui.Column(c).Grow(1).Gap(6).Children(func() {
 		ui.Text(c, label).FontSize(12).TextColor(t.TextMuted)
@@ -738,6 +796,20 @@ func (s *settingsWindow) save() {
 	}
 	s.cmdSync = -1
 
+	// 外观：三项"开关 + 程度"都写具体值（指针全填上）。不写的话读回来会落到
+	// "缺省即开 / 用默认值"，用户刚调的数就没了。
+	rOn, oOn, shOn := s.radiusOn, s.opacityOn, s.shadowOn
+	rVal := int(math.Round(s.radiusVal))
+	oVal := int(math.Round(s.opacityVal))
+	shVal := int(math.Round(s.shadowVal))
+	cfg.Appearance = config.Appearance{
+		Radius:  config.Toggle{Enabled: &rOn, Value: &rVal},
+		Opacity: config.Toggle{Enabled: &oOn, Value: &oVal},
+		Shadow:  config.Toggle{Enabled: &shOn, Value: &shVal},
+	}
+	hide := s.hideOnStart
+	cfg.Startup = config.Startup{HideOnStart: &hide}
+
 	// 文件对话框跟随：总开关 + 各来源。写具体布尔值（不是省略），
 	// 这样用户一旦手动关掉某个来源，下次读配置不会被"缺省即开"又打开。
 	followOn := s.followOn
@@ -759,6 +831,11 @@ func (s *settingsWindow) save() {
 
 	oldCombo := s.app.cfg.Hotkey.Combo
 	s.app.cfg = &cfg
+
+	// 外观：先让包级变量跟着配置走（圆角 / 不透明度 / 阴影强度），再把屏幕上
+	// 已经画着的东西重建一遍 —— 底图的弧、内容层那条弧、投影层。
+	applyAppearance(s.app.cfg)
+	s.app.applyAppearanceNow()
 
 	// 自启开关落到系统里（不写 config.json）。失败要把原因说出来，不能假装成功。
 	if s.openAtLogin != s.app.openAtLogin.Load() {

@@ -27,6 +27,103 @@ type Config struct {
 	// PathSources 指定从哪些文件管理器取当前目录。每项缺省为开：
 	// 老配置里没有这一块，用户已有的行为不变。
 	PathSources *PathSources `json:"pathSources,omitempty"`
+	// Appearance 是面板外观（圆角 / 玻璃不透明度 / 投影）。三项都能单独关掉、
+	// 单独调程度；缺省值就是"现在的样子"，老配置读进来什么都不变。
+	Appearance Appearance `json:"appearance"`
+	// Startup 是启动时的行为（手动启动后要不要直接把面板弹出来）。
+	Startup Startup `json:"startup"`
+}
+
+// Appearance 是面板外观：圆角、玻璃不透明度、投影强度。
+// 每一项都是"开关 + 程度"：关掉就是不要这项效果，程度决定做到多少。
+type Appearance struct {
+	// Radius 是圆角半径（DIP，0~40，缺省 24）。关掉 = 直角。
+	Radius Toggle `json:"radius"`
+	// Opacity 是玻璃"压白"的不透明度（百分比，缺省 59）：越大越白越不透明，
+	// 越小越透 —— 调到 0 就只剩模糊，背后桌面的颜色和明暗全透上来。
+	Opacity Toggle `json:"opacity"`
+	// Shadow 是面板外那圈投影的强度（百分比，缺省 57）：0 等于没有投影。
+	Shadow Toggle `json:"shadow"`
+}
+
+// Toggle 是"开关 + 程度"这一对值。
+//
+// 两个字段都必须是指针：零值结构要能表示"用户没配过"。否则 0 到底是
+// "用户要直角"还是"没配过"就分不清了 —— 前者该生效，后者该用默认值。
+type Toggle struct {
+	Enabled *bool `json:"enabled,omitempty"`
+	Value   *int  `json:"value,omitempty"`
+}
+
+// On 报这一项是否启用；没配过按 def 算。
+func (t Toggle) On(def bool) bool {
+	if t.Enabled == nil {
+		return def
+	}
+	return *t.Enabled
+}
+
+// Int 报程度值；没配过按 def 算，并夹进 lo..hi（挡掉手改配置写进去的离谱值）。
+func (t Toggle) Int(def, lo, hi int) int {
+	v := def
+	if t.Value != nil {
+		v = *t.Value
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+const (
+	// DefaultPanelRadius 是缺省的圆角半径（DIP）。24 这条弧在 125% 缩放下
+	// 正好 30 物理像素，是反复对过 iced 效果之后定下来的值。
+	DefaultPanelRadius = 24
+	// MaxPanelRadius 是半径上限：再大面板就成胶囊了。
+	MaxPanelRadius = 40
+	// DefaultGlassOpacity 是缺省的玻璃不透明度（百分比），对应压白 alpha ≈ 150。
+	DefaultGlassOpacity = 59
+	// DefaultShadowPct 是缺省的投影强度（百分比），对应黑度 ≈ 0.34。
+	DefaultShadowPct = 57
+)
+
+// PanelRadius 返回生效的圆角半径（DIP）；关掉返回 0，也就是直角。
+func (c *Config) PanelRadius() int {
+	if !c.Appearance.Radius.On(true) {
+		return 0
+	}
+	return c.Appearance.Radius.Int(DefaultPanelRadius, 0, MaxPanelRadius)
+}
+
+// GlassOpacityPct 返回生效的玻璃不透明度（百分比 0~100）。
+func (c *Config) GlassOpacityPct() int {
+	if !c.Appearance.Opacity.On(true) {
+		return 0
+	}
+	return c.Appearance.Opacity.Int(DefaultGlassOpacity, 0, 100)
+}
+
+// ShadowPct 返回生效的投影强度（百分比 0~100）；0 表示不要投影。
+func (c *Config) ShadowPct() int {
+	if !c.Appearance.Shadow.On(true) {
+		return 0
+	}
+	return c.Appearance.Shadow.Int(DefaultShadowPct, 0, 100)
+}
+
+// Startup 是启动时的行为。
+type Startup struct {
+	// HideOnStart 为真时，启动后不弹面板，只在托盘里等着（双击 Ctrl 随时唤出）。
+	// 开机自启拉起时本来就静默；这一项管的是"手动双击图标启动"的情况。
+	HideOnStart *bool `json:"hideOnStart,omitempty"`
+}
+
+// HideOnStart 报启动时要不要保持隐藏。
+func (c *Config) HideOnStart() bool {
+	return c.Startup.HideOnStart != nil && *c.Startup.HideOnStart
 }
 
 // PathSources 是"文件对话框跟随"的目录来源开关，和 internal/win 的 Source* 常量一一对应。
@@ -286,7 +383,14 @@ func (c Command) Keywords() []string {
 
 // Default 给出一份能直接跑的配置：索引所有固定磁盘，排除系统噪声目录。
 func Default() *Config {
+	// 外观三项的缺省值写成具体数，让 config.json 里一眼能看到"现在是多少"。
+	radius, opacity, shadow := DefaultPanelRadius, DefaultGlassOpacity, DefaultShadowPct
 	return &Config{
+		Appearance: Appearance{
+			Radius:  Toggle{Value: &radius},
+			Opacity: Toggle{Value: &opacity},
+			Shadow:  Toggle{Value: &shadow},
+		},
 		Hotkey: Hotkey{
 			DoubleCtrl:           true,
 			DoubleCtrlIntervalMs: 400,
