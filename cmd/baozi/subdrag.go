@@ -143,12 +143,13 @@ func (d *subDrag) begin() {
 	d.pending = true
 	d.active = false
 	procSetCapture.Call(d.hwnd)
-	// 和主面板一样：一按下就切到"糊透"的玻璃（setDragFade），松手再恢复。
+	// 按下时只重烘一张"清晰"的底图，不切糊化。
 	//
-	// 这一步才是主面板拖动"看着正常"的真相：拖动时玻璃被糊成一整片，
-	// 里面的桌面色本来就看不出位移，所以不会出现"背景停在原地"的观感。
-	// 子窗之前没做这步，玻璃还停在起点那块桌面上 —— 用户一眼就看出来。
-	d.glass.app.setDragFade(true)
+	// 之前试过拖动中糊透（setDragFade），结果是"玻璃变成一片死色"——用户
+	// 反而觉得"背景没了、没在变"。主面板真正的做法是**让底图跟着窗口平移**
+	// （refreshBackingFor 的平移快路径）：像素按屏幕坐标采样，窗口挪 (dx,dy)
+	// 就把内容搬 (dx,dy)，内容始终对应当前位置的桌面，所以看起来是真跟手。
+	// 子窗这边照抄这一手：按下烘一张，拖动中只做 shiftTo + FrameNow。
 	d.glass.refresh(true)
 	log.Printf("子窗拖动: %s begin（光标 %d,%d 窗口 %d,%d）",
 		d.glass.name, d.startCurX, d.startCurY, d.startWinX, d.startWinY)
@@ -228,17 +229,10 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		procSetWinPos.Call(d.host, 0, uintptr(nx), uintptr(ny), 0, 0,
 			swpNoSize|swpNoZOrder|swpNoActivate)
 		d.glass.followShadow()
-		// 拖动跟手的关键：不整张重烘，只把底图按位移整体平移（1~2ms），
-		// 和主面板 refreshBackingFor 的平移快路径是同一手。
+		// 和主面板 dragTo() 同一手：把底图按位移整体平移（1~2ms），再推一帧上屏。
+		// 底图是按屏幕坐标采样的，平移后每个像素仍落在正确的屏幕上 —— 看起来
+		// 就是"背景跟着窗口走"，不是死色。
 		d.glass.shiftTo(int(nx), int(ny))
-		// 关键的一步：把这一帧**真的推上屏**。主面板的 dragTo() 里也是这么做的
-		// （panel.FrameNow()）。少了它，窗口被 SetWindowPos 搬走、我们这边也把
-		// 底图烘好了，画面却还停在上一帧上 —— 用户看到的就是"拖动时背景根本
-		// 不动，要松开鼠标才变"，而且搬走的那块还是矩形（四个直角）。
-		d.win.FrameNow()
-		// 关键的一步：把这一帧**真的推上屏**。主面板的 dragTo() 里也是这么做的
-		// （panel.FrameNow()）。少了它，窗口被 SetWindowPos 搬走、底图也平移好了，
-		// 画面却还停在上一帧 —— 用户看到的就是"拖动时背景根本不动"。
 		if d.win != nil {
 			d.win.FrameNow()
 		}
