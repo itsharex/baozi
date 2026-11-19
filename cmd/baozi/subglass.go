@@ -49,18 +49,21 @@ func (a *application) newSubGlass(w *mygo.Window, name string) *subGlass {
 // bitmap 返回这一帧该铺的底图（还没烘过就是 nil）。
 func (g *subGlass) bitmap() *ui.Bitmap { return g.back }
 
-// ensureFrost 保证应用级那份整屏磨砂图存在。
+// ensureFrost 保证应用级那份磨砂图（frostSmall）是有的。
 //
-// 子窗可以先于面板被打开（托盘里直接点"设置"），那时还没抓过屏。只补一次、
-// 不重抓：有了就复用面板那份，否则每开一次设置窗都要重新抓屏 + 糊一遍。
+// 关键：**不重新抓屏**，除非连桌面底片都没有。抓屏抓的是"当前屏幕上有什么"，
+// 而这时候子窗往往已经显示出来了 —— 重抓就会把自己的窗口糊进玻璃里。
+// 面板唤出时那张底片（frostBase）是干净的（那一刻窗口还没上屏），拿它重做一张
+// 磨砂图就够了。
 func (g *subGlass) ensureFrost() {
 	a := g.app
-	if a.frost != nil && a.frostSmall != nil {
-		return
+	if a.frostBase == nil {
+		a.refreshGlass()
+		a.pickDeskColor(nil)
 	}
-	a.refreshGlass()
-	a.pickDeskColor(nil)
-	a.rebuildFrost()
+	if a.frostSmall == nil {
+		a.rebuildFrost()
+	}
 }
 
 // refresh 按窗口当前位置重烘底图。force 为 true 时不看缓存 key。
@@ -116,6 +119,24 @@ func (g *subGlass) drawBitmap(c *ui.Context) {
 	pad := 1 / s
 	ui.Image(c, g.back).Absolute().Left(-pad).Top(-pad).
 		Size(float32(g.pw)/s, float32(g.ph)/s)
+}
+
+// shadowShown 报投影层当前是不是已经在屏上（view 里用来判断要不要补一次）。
+func (g *subGlass) shadowShown() bool {
+	return g.shadow != nil && g.shadow.Shown()
+}
+
+// dipSize 返回客户区的 DIP 尺寸（内容层铺开和裁圆角都用它）。
+func (g *subGlass) dipSize() (float32, float32) {
+	if g.win == nil {
+		return 0, 0
+	}
+	_, _, w, h := win.ClientRectPixels(g.win.NativeHandle())
+	s := g.app.glassScale()
+	if s <= 0 {
+		s = 1
+	}
+	return float32(w) / s, float32(h) / s
 }
 
 // refreshShadow 让投影层按当前窗口位置尺寸重画一次并显示。

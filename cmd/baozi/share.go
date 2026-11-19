@@ -245,9 +245,15 @@ func (s *shareWindow) view(c *ui.Context) {
 	// 和面板同一套字体，切窗口时不换字形。
 	usePanelFont(t)
 	c.Root().Background(ui.Transparent)
-	// 兜底：这一帧还没有底图就补烘一次（有了就不动）。
-	if s.glass != nil && s.glass.bitmap() == nil {
-		s.glass.refresh(true)
+	// 兜底：这一帧还没有底图就补烘一次（有了就不动）；投影层同理，少了它
+	// 底图弧外那块桌面色就会裸露成"方角"。
+	if s.glass != nil {
+		if s.glass.bitmap() == nil {
+			s.glass.refresh(true)
+		}
+		if !s.glass.shadowShown() {
+			s.glass.refreshShadow()
+		}
 	}
 
 	ui.Column(c).Fill().Children(func() {
@@ -255,105 +261,122 @@ func (s *shareWindow) view(c *ui.Context) {
 		if s.glass != nil {
 			s.glass.drawBitmap(c)
 		}
-		ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).DragWindow().Children(func() {
-			ui.Column(c).Grow(1).Gap(2).Children(func() {
-				ui.Text(c, "文件互传").FontSize(20).Bold()
-				if s.tab == 1 {
-					ui.Text(c, "跨网直连（WebRTC）：两端各跑一个 Baozi，用 6 位短码配对，文件不经过任何云盘中转").
-						FontSize(11).TextColor(t.TextMuted)
-				} else {
-					ui.Text(c, "局域网直连，不经过云端；生成一条带有效期的临时链接，到期自动失效").FontSize(11).TextColor(t.TextMuted)
-				}
-			})
-			if ui.Button(c, "✕ 关闭").Clicked() {
-				s.win.Hide()
-				if s.glass != nil {
-					s.glass.hideShadow()
-				}
-			}
-		})
-		ui.Row(c).Padding(0, 24).Children(func() {
-			ui.Tabs(c, &s.tab, "局域网链接", "跨网直传")
-		})
-		ui.Divider(c)
-
-		ui.Scroll(c).Grow(1).Children(func() {
-			ui.Column(c).Padding(24, 24).Gap(18).Children(func() {
-				if s.tab == 1 {
-					s.p2pTab(c, t)
-					return
-				}
-				s.bindRow(c, t)
-				s.ttlRow(c, t)
-				ui.Divider(c)
-				// 链接到点就自动停：这里先把会话收掉，界面立刻回到"未共享"。
-				if s.session != nil && s.session.Expired() {
-					s.stop()
-					s.status = "链接已到期，已自动停止共享"
-				}
-				if s.session == nil {
-					s.stoppedView(c, t)
-					return
-				}
-				s.activeView(c, t)
-			})
-		})
-
-		// 跨网这一页的按钮都在页面里自成一体（发送栏自带添加、接收栏自带开始），
-		// 底栏再摆一份只会让人犹豫点哪边，所以整条收掉。
-		// 但状态不能跟着一起收：底栏原本还兼职报"短码已复制""已取消""保存位置"，
-		// 收掉之后这些事就变成"点了没反应"。这里留一条只读的细状态线。
-		if s.tab == 1 {
-			if s.status != "" {
-				ui.Row(c).Padding(0, 24, 12, 24).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "·").FontSize(11).TextColor(t.TextMuted)
-					ui.Text(c, s.status).FontSize(11).TextColor(t.TextMuted).Grow(1)
-				})
-			}
-			return
+		pw, ph := float32(760), float32(680)
+		if s.glass != nil {
+			pw, ph = s.glass.dipSize()
 		}
+		// 内容放进 Overlay，压在底图上面：Absolute 的底图是**后绘制**的（z 序按
+		// 添加顺序定），直接平铺在同一层会把它下面所有内容盖住。
+		ui.Overlay(c, func() {
+			ui.Column(c).Absolute().Left(0).Top(0).Size(pw, ph).
+				Radius(float32(glassClipRadius)).Clip().
+				Children(func() {
+					s.body(c, t)
+				})
+		})
+	})
+}
 
-		// 底部一条就够：左边放"加东西"的入口，中间状态，右边主操作。
-		// 和主面板的底栏同构（Pane 也是底部一条），不再上下叠两层按钮。
-		ui.Divider(c)
-		ui.Row(c).Padding(10, 20).Gap(10).AlignItems(ui.Center).Children(func() {
-			// 加东西的入口一直在：先挑文件、再生成链接，是这个窗口的正常顺序。
-			if ui.Button(c, "添加文件").Clicked() {
-				go s.pickFiles()
-			}
-			if ui.Button(c, "添加文件夹").Clicked() {
-				go s.pickFolder()
-			}
-			ui.Text(c, s.status).FontSize(11).TextColor(t.TextMuted).Grow(1).SingleLine()
-			// 跨网那条路的启停按钮在页面里，底栏只留"加东西"。
+// body 是窗口的全部内容（顶栏 + 页签 + 内容 + 底栏）。
+func (s *shareWindow) body(c *ui.Context, t *ui.Theme) {
+	ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).DragWindow().Children(func() {
+		ui.Column(c).Grow(1).Gap(2).Children(func() {
+			ui.Text(c, "文件互传").FontSize(20).Bold()
 			if s.tab == 1 {
+				ui.Text(c, "跨网直连（WebRTC）：两端各跑一个 Baozi，用 6 位短码配对，文件不经过任何云盘中转").
+					FontSize(11).TextColor(t.TextMuted)
+			} else {
+				ui.Text(c, "局域网直连，不经过云端；生成一条带有效期的临时链接，到期自动失效").FontSize(11).TextColor(t.TextMuted)
+			}
+		})
+		if ui.Button(c, "✕ 关闭").Clicked() {
+			s.win.Hide()
+			if s.glass != nil {
+				s.glass.hideShadow()
+			}
+		}
+	})
+	ui.Row(c).Padding(0, 24).Children(func() {
+		ui.Tabs(c, &s.tab, "局域网链接", "跨网直传")
+	})
+	ui.Divider(c)
+
+	ui.Scroll(c).Grow(1).Children(func() {
+		ui.Column(c).Padding(24, 24).Gap(18).Children(func() {
+			if s.tab == 1 {
+				s.p2pTab(c, t)
 				return
 			}
-			switch {
-			case s.session == nil:
-				if ui.PrimaryButton(c, "生成链接").Clicked() {
-					if len(s.pending) == 0 && strings.TrimSpace(s.textDraft) == "" {
-						s.status = "先加文件，或者在下面写一段文本"
-						s.win.Update(func() {})
-					} else {
-						s.start()
-						s.win.Update(func() {})
-					}
-				}
-			case s.session.Breached():
-				// 输错太多次被自动停掉：换一个访问码重开。
-				if ui.PrimaryButton(c, "重新生成链接").Clicked() {
-					s.stop()
+			s.bindRow(c, t)
+			s.ttlRow(c, t)
+			ui.Divider(c)
+			// 链接到点就自动停：这里先把会话收掉，界面立刻回到"未共享"。
+			if s.session != nil && s.session.Expired() {
+				s.stop()
+				s.status = "链接已到期，已自动停止共享"
+			}
+			if s.session == nil {
+				s.stoppedView(c, t)
+				return
+			}
+			s.activeView(c, t)
+		})
+	})
+
+	// 跨网这一页的按钮都在页面里自成一体（发送栏自带添加、接收栏自带开始），
+	// 底栏再摆一份只会让人犹豫点哪边，所以整条收掉。
+	// 但状态不能跟着一起收：底栏原本还兼职报"短码已复制""已取消""保存位置"，
+	// 收掉之后这些事就变成"点了没反应"。这里留一条只读的细状态线。
+	if s.tab == 1 {
+		if s.status != "" {
+			ui.Row(c).Padding(0, 24, 12, 24).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "·").FontSize(11).TextColor(t.TextMuted)
+				ui.Text(c, s.status).FontSize(11).TextColor(t.TextMuted).Grow(1)
+			})
+		}
+		return
+	}
+
+	// 底部一条就够：左边放"加东西"的入口，中间状态，右边主操作。
+	// 和主面板的底栏同构（Pane 也是底部一条），不再上下叠两层按钮。
+	ui.Divider(c)
+	ui.Row(c).Padding(10, 20).Gap(10).AlignItems(ui.Center).Children(func() {
+		// 加东西的入口一直在：先挑文件、再生成链接，是这个窗口的正常顺序。
+		if ui.Button(c, "添加文件").Clicked() {
+			go s.pickFiles()
+		}
+		if ui.Button(c, "添加文件夹").Clicked() {
+			go s.pickFolder()
+		}
+		ui.Text(c, s.status).FontSize(11).TextColor(t.TextMuted).Grow(1).SingleLine()
+		// 跨网那条路的启停按钮在页面里，底栏只留"加东西"。
+		if s.tab == 1 {
+			return
+		}
+		switch {
+		case s.session == nil:
+			if ui.PrimaryButton(c, "生成链接").Clicked() {
+				if len(s.pending) == 0 && strings.TrimSpace(s.textDraft) == "" {
+					s.status = "先加文件，或者在下面写一段文本"
+					s.win.Update(func() {})
+				} else {
 					s.start()
 					s.win.Update(func() {})
 				}
-			default:
-				if ui.Button(c, "停止共享").Clicked() {
-					s.stop()
-					s.win.Update(func() {})
-				}
 			}
-		})
+		case s.session.Breached():
+			// 输错太多次被自动停掉：换一个访问码重开。
+			if ui.PrimaryButton(c, "重新生成链接").Clicked() {
+				s.stop()
+				s.start()
+				s.win.Update(func() {})
+			}
+		default:
+			if ui.Button(c, "停止共享").Clicked() {
+				s.stop()
+				s.win.Update(func() {})
+			}
+		}
 	})
 }
 

@@ -242,8 +242,14 @@ func (s *settingsWindow) view(c *ui.Context) {
 	c.Root().Background(ui.Transparent)
 	// 兜底：万一这一帧还没有底图（窗口不是经由 show() 显示的，比如系统恢复、
 	// 或者测试里直接 ShowWindow），补烘一次。有了就什么都不做。
-	if s.glass != nil && s.glass.bitmap() == nil {
-		s.glass.refresh(true)
+	// 投影层同理 —— 没有它，底图弧外那块桌面色就会裸露成"方角"。
+	if s.glass != nil {
+		if s.glass.bitmap() == nil {
+			s.glass.refresh(true)
+		}
+		if !s.glass.shadowShown() {
+			s.glass.refreshShadow()
+		}
 	}
 
 	// 测试里是直接 &settingsWindow{app: a} 构造的，未必走过 newSettingsWindow，
@@ -260,49 +266,67 @@ func (s *settingsWindow) view(c *ui.Context) {
 
 	ui.Column(c).Fill().Children(func() {
 		// 最底层：整窗自绘的玻璃底图（圆角、边框、逐像素 alpha 全在里面）。
-		// 必须在其它内容之前画，后面的元素盖在它上面。
 		if s.glass != nil {
 			s.glass.drawBitmap(c)
 		}
-		// 顶栏（整条都能拖动窗口：这一版没有系统标题栏，没有它就拿不走窗口）
-		ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).DragWindow().Children(func() {
-			ui.Column(c).Grow(1).Gap(2).Children(func() {
-				ui.Text(c, "Baozi 设置").FontSize(20).Bold()
-				ui.Text(c, "改动保存后立即生效；配置文件在 "+s.app.cfgPath).FontSize(11).TextColor(t.TextMuted)
-			})
-			// 隐藏了窗口按钮，得自己给一个关到托盘的口子。
-			if ui.Button(c, "✕ 关闭").Clicked() {
-				s.win.Hide()
-				if s.glass != nil {
-					s.glass.hideShadow()
-				}
-			}
+		pw, ph := float32(920), float32(820)
+		if s.glass != nil {
+			pw, ph = s.glass.dipSize()
+		}
+		// 内容必须放进 Overlay：Absolute 的底图是**后绘制**的（z 序由添加顺序定），
+		// 直接平铺在同一层里会把下面所有内容盖住 —— 上一版就是这样：底图铺满、
+		// 文字按钮全被压在底下，于是"页面是空的、点不动、也拖不动"。
+		ui.Overlay(c, func() {
+			ui.Column(c).Absolute().Left(0).Top(0).Size(pw, ph).
+				Radius(float32(glassClipRadius)).Clip().
+				Children(func() {
+					s.body(c, t)
+				})
 		})
-		ui.Divider(c)
+	})
+}
 
-		// 左右两栏：左边是设置项，右边是实际内容。
-		ui.Row(c).Grow(1).Children(func() {
-			s.navColumn(c, t)
-			ui.Column(c).Width(1).FillHeight().Background(t.Border)
-			ui.Column(c).Grow(1).FillHeight().Children(func() {
-				if s.navSel == secCommands {
-					s.commandsPage(c, t)
-				} else {
-					s.sectionsColumn(c, t)
-				}
-			})
+// body 是窗口的全部内容（顶栏 + 两栏 + 底栏）。单独拿出来是给 Overlay 里那层
+// "铺满客户区、裁圆角"的容器当 child 用。
+func (s *settingsWindow) body(c *ui.Context, t *ui.Theme) {
+	// 顶栏（整条都能拖动窗口：这一版没有系统标题栏，没有它就拿不走窗口）
+	ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).DragWindow().Children(func() {
+		ui.Column(c).Grow(1).Gap(2).Children(func() {
+			ui.Text(c, "Baozi 设置").FontSize(20).Bold()
+			ui.Text(c, "改动保存后立即生效；配置文件在 "+s.app.cfgPath).FontSize(11).TextColor(t.TextMuted)
 		})
+		// 隐藏了窗口按钮，得自己给一个关到托盘的口子。
+		if ui.Button(c, "✕ 关闭").Clicked() {
+			s.win.Hide()
+			if s.glass != nil {
+				s.glass.hideShadow()
+			}
+		}
+	})
+	ui.Divider(c)
 
-		ui.Divider(c)
-		ui.Row(c).Padding(12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, s.message).FontSize(11).TextColor(t.TextMuted).Grow(1).SingleLine()
-			if ui.Button(c, "重新载入").Clicked() {
-				s.load()
-			}
-			if ui.PrimaryButton(c, "保存并应用").Clicked() {
-				s.save()
+	// 左右两栏：左边是设置项，右边是实际内容。
+	ui.Row(c).Grow(1).Children(func() {
+		s.navColumn(c, t)
+		ui.Column(c).Width(1).FillHeight().Background(t.Border)
+		ui.Column(c).Grow(1).FillHeight().Children(func() {
+			if s.navSel == secCommands {
+				s.commandsPage(c, t)
+			} else {
+				s.sectionsColumn(c, t)
 			}
 		})
+	})
+
+	ui.Divider(c)
+	ui.Row(c).Padding(12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Text(c, s.message).FontSize(11).TextColor(t.TextMuted).Grow(1).SingleLine()
+		if ui.Button(c, "重新载入").Clicked() {
+			s.load()
+		}
+		if ui.PrimaryButton(c, "保存并应用").Clicked() {
+			s.save()
+		}
 	})
 }
 
