@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
 	"baozi/internal/config"
@@ -251,9 +252,66 @@ func patchLooksBlank(img *image.RGBA) bool {
 }
 
 func (a *application) snapshotScreen() {
+	a.captureFilm(nil, false)
+}
+
+// snapshotScreenForPanel 是面板唤出时的抓屏：这一刻的"面板"不算脏 ——
+// 它还没 Show 到屏上（见 main.go 的 show()：先 refreshGlass 再 panel.Show）。
+// 面板每次唤出都要换一张新底片，这是刻意的：桌面变了就得跟上。
+func (a *application) snapshotScreenForPanel() {
+	a.captureFilm(nil, true)
+}
+
+// selfWindowOnScreen 报一个"现在正摆在屏上、会钻进底片"的自家窗口名（没有就返回空）。
+// except 是"这次抓屏就是为它抓的"那个子窗：它自己上屏不算脏。
+func (a *application) selfWindowOnScreen(except *subGlass, ownPanel bool) string {
+	if a.panelUp.Load() && !ownPanel {
+		return "启动面板"
+	}
+	if a.settings != nil && a.settings.glass != nil &&
+		a.settings.glass != except && a.settings.glass.visible {
+		return "设置窗"
+	}
+	if a.share != nil && a.share.glass != nil &&
+		a.share.glass != except && a.share.glass.visible {
+		return "文件互传窗"
+	}
+	return ""
+}
+
+// snapshotScreenExcept 抓一次全屏、做成磨砂图。
+//
+// **底片必须是桌面。** 这不是一句口号，是两次实测换来的：
+//   - SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) 只能设在**顶层窗口**上，
+//     MyGoSurface 子窗一律被拒（日志里的"抓屏排除自家窗口 3/6"就是三个顶层
+//     成功、三个子窗失败）；而真正把像素画出来的是那个子窗，于是"排除"了顶层
+//     照样能在截图里看到自己 —— 用户的原话是"背后其实是桌面，抓到的却是启动面板"。
+//   - 所以真正的解法不是"抓的时候把自家窗口藏起来"，而是**自家窗口在屏上的时候
+//     根本别抓**：那张旧底片（上一次没有任何自家窗口时抓的）几何上仍然对得上屏幕，
+//     拿来磨砂就够了，最多是桌面内容旧一点。
+//
+// 排除那一手仍然留着：窗口都在屏下的时候它本来也不花钱，万一将来换了渲染方式、
+// 子窗可以被排除了，它就是白赚的一道保险。
+func (a *application) snapshotScreenExcept(except *subGlass) {
+	a.captureFilm(except, false)
+}
+
+func (a *application) captureFilm(except *subGlass, ownPanel bool) {
 	if a.panel == nil {
 		return
 	}
+	if who := a.selfWindowOnScreen(except, ownPanel); who != "" {
+		if a.frostBase != nil {
+			log.Printf("玻璃: 跳过抓屏（%s 还在屏上，抓到的会是它自己），沿用上一张底片", who)
+			return
+		}
+		// 一张底片都没有（极少见：开机后第一次抓就撞上自家窗口）。
+		// 这时宁可抓一张脏的也不要让玻璃空着 —— 下一次干净的时刻会把它换掉。
+		log.Printf("玻璃: 底片缺失且 %s 在屏上，只能先抓一张脏的", who)
+	}
+	// 抓屏前把自家所有窗口设成"截图不可见"，抓完立刻恢复（见上）。
+	restore := a.excludeSelfCapture()
+	defer restore()
 	// 四角那小块桌面顺手抓下来（此刻窗口还没显示）。
 	a.captureCornerPatches()
 	// 半分辨率整屏快照：四角"弧外"那块以后就靠它现场裁，面板拖动/缩放都不会过期。
@@ -1034,24 +1092,71 @@ func (a *application) glassOffset() (float32, float32) {
 
 // refreshGlass 是"唤出前那一套"：抓一次快照。
 func (a *application) refreshGlass() {
+	a.snapshotScreenForPanel()
+}
+
+// snapshotScreenClean 抓一张"只含桌面"的快照。
+//
+// 排除自家窗口这一步已经挪进 snapshotScreen（每一次抓屏都做），这里只留个
+// 语义化的名字给老的调用点，免得再有人以为"干净的抓法只有这一条路"。
+func (a *application) snapshotScreenClean() {
 	a.snapshotScreen()
 }
 
-// snapshotScreenClean 抓一张"只含桌面"的快照：抓的瞬间把启动面板设成
-// WDA_EXCLUDEFROMCAPTURE（照常显示给人看，但截屏里看不到），抓完立刻恢复。
-//
-// 没有这一步，子窗的玻璃底片里会印着启动面板 —— 用户的原话是"背后其实是
-// 我的桌面，但是他实际抓取到了启动面板"。
-func (a *application) snapshotScreenClean() {
+// selfCaptureWindows 列出抓屏时"不能让相机看见"的窗口：主面板、设置窗、互传窗，
+// 以及它们各自的 MyGoSurface 子窗口（真正画内容的是那个子窗，父窗口上设了
+// WDA_EXCLUDEFROMCAPTURE 未必管得住子窗的合成表面，两边都设一遍最稳）。
+func (a *application) selfCaptureWindows() []uintptr {
+	var hosts []*mygo.Window
 	if a.panel != nil {
-		if h := a.panel.NativeHandle(); h != 0 {
-			win.SetDisplayAffinity(h, true)
-			a.snapshotScreen()
-			win.SetDisplayAffinity(h, false)
-			return
+		hosts = append(hosts, a.panel)
+	}
+	if a.settings != nil {
+		hosts = append(hosts, a.settings.win)
+	}
+	if a.share != nil {
+		hosts = append(hosts, a.share.win)
+	}
+	out := make([]uintptr, 0, len(hosts)*2)
+	for _, w := range hosts {
+		if w == nil {
+			continue
+		}
+		h := w.NativeHandle()
+		if h == 0 {
+			continue
+		}
+		out = append(out, h)
+		if surf := findMyGoSurface(h); surf != 0 {
+			out = append(out, surf)
 		}
 	}
-	a.snapshotScreen()
+	return out
+}
+
+// excludeSelfCapture 把自家窗口临时设成 WDA_EXCLUDEFROMCAPTURE，返回恢复函数。
+//
+// 只排除设置成功的那几个：老系统/远程会话里这个 API 可能直接拒绝，那就回到
+// "能排几个是几个"，至少不会把没设上的句柄在事后错误地"恢复"成可见。
+func (a *application) excludeSelfCapture() func() {
+	hs := a.selfCaptureWindows()
+	if len(hs) == 0 {
+		return func() {}
+	}
+	var set []uintptr
+	for _, h := range hs {
+		if win.SetDisplayAffinity(h, true) {
+			set = append(set, h)
+		}
+	}
+	if len(set) < len(hs) {
+		log.Printf("玻璃: 抓屏排除自家窗口 %d/%d（其余设置被系统拒绝）", len(set), len(hs))
+	}
+	return func() {
+		for _, h := range set {
+			win.SetDisplayAffinity(h, false)
+		}
+	}
 }
 
 // glassScale 是这块屏的 DPI 缩放，没问到就按 1 算。

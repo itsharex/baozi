@@ -45,6 +45,15 @@ type subGlass struct {
 	// "只有边框和投影的空框"。由 show()/hide() 维护。
 	visible bool
 
+	// hostShown 记的是系统那边的事实：顶层窗口收到 WM_SHOWWINDOW(SW_HIDE/SW_SHOW)。
+	//
+	// visible 是"应用想让它显示"，hostShown 是"它真的在屏上"。两者分开是因为
+	// 隐藏窗口不一定走 hide()：mygo 自己收窗口、系统恢复、Alt+F4 都会绕过去。
+	// 一旦 visible 还停在 true 而窗口其实已经藏了，投影层就会被人重新画到屏幕上 ——
+	// 用户看到的就是"关掉之后桌面上留着一个带阴影的空框"。见 subfollow.go 的
+	// WM_SHOWWINDOW 处理，那里会把这两个标志一起收拾掉。
+	hostShown bool
+
 	// needCleanSnap 表示下一次 refresh 要先抓一张"不含自家窗口"的桌面快照。
 	// 抓的时候把启动面板设成 WDA_EXCLUDEFROMCAPTURE，底片里才不会印着它。
 	needCleanSnap bool
@@ -85,7 +94,8 @@ func (g *subGlass) bitmap() *ui.Bitmap { return g.back }
 func (g *subGlass) ensureFrost() {
 	a := g.app
 	if a.frostBase == nil {
-		a.refreshGlass()
+		// 抓屏时把自己也让开：这个子窗此刻正在上屏，抓进来就是它自己的影子。
+		a.snapshotScreenExcept(g)
 		a.pickDeskColor(nil)
 	}
 	if a.frostSmall == nil {
@@ -112,11 +122,13 @@ func (g *subGlass) refresh(force bool) {
 		return
 	}
 	// 第一次上屏（或重新打开）先抓一张不含自家窗口的桌面快照，底片才干净。
+	//
+	// 排除自家窗口这件事已经由 snapshotScreen 自己做了（见 glass.go 的
+	// excludeSelfCapture），这里只管"值不值得重抓"。
 	if g.needCleanSnap {
 		g.needCleanSnap = false
-		win.SetDisplayAffinity(hwnd, true)
-		a.snapshotScreenClean()
-		win.SetDisplayAffinity(hwnd, false)
+		a.snapshotScreenExcept(g)
+		a.pickDeskColor(nil)
 		force = true
 	}
 	s := a.glassScale()
@@ -203,6 +215,9 @@ func (g *subGlass) dipSize() (float32, float32) {
 // show 标记"这个窗口要上屏了"：投影层这时才允许显示。
 func (g *subGlass) show() {
 	g.visible = true
+	// 顶层窗口马上要 Show 了；先按"已显示"记上，随后的 WM_SHOWWINDOW 会以系统为准
+	// 校一次（万一 Show 没生效，那条消息会把这里改回 false）。
+	g.hostShown = true
 	// 下一次 refresh 顺便抓一张**干净**的桌面快照（抓的时候把启动面板设成
 	// "捕获不可见"）。否则底片里会印着启动面板自己 —— 用户看到的就是
 	// "背后明明是我的桌面，玻璃里却是启动面板"。
@@ -245,8 +260,8 @@ func (g *subGlass) refreshShadow() {
 	if g.shadow == nil || g.win == nil {
 		return
 	}
-	// 窗口还没（或已经不再）在屏幕上：投影层不许露面。见 visible 的注释。
-	if !g.visible {
+	// 窗口还没（或已经不再）在屏幕上：投影层不许露面。见 visible / hostShown 的注释。
+	if !g.visible || !g.hostShown {
 		g.shadow.Hide()
 		return
 	}
@@ -296,7 +311,15 @@ func (g *subGlass) hideShadow() {
 
 // followShadow 窗口只是挪了位置：只挪投影层，不重画位图。
 func (g *subGlass) followShadow() {
-	if g.shadow == nil || !g.shadow.Shown() || g.win == nil {
+	if g.shadow == nil || g.win == nil {
+		return
+	}
+	// 窗口已经不在了就别跟着挪 —— 投影层是独立窗口，挪过去就是一块没人认领的空框。
+	if !g.visible || !g.hostShown {
+		g.shadow.Hide()
+		return
+	}
+	if !g.shadow.Shown() {
 		return
 	}
 	hwnd := g.win.NativeHandle()

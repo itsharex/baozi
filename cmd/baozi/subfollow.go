@@ -24,6 +24,7 @@ import (
 
 const (
 	wmMove                    = 0x0003
+	wmShowWindow              = 0x0018
 	wmEnterSizeMove           = 0x0231
 	wmExitSizeMove            = 0x0232
 	wmNonClientLeftButtonDown = 0x00A1
@@ -79,6 +80,29 @@ func installShadowFollower(w *mygo.Window, g *subGlass) {
 
 func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 	switch msg {
+	case wmShowWindow:
+		// 窗口在系统层面的显示/隐藏。这是**唯一可靠**的"它到底还在不在屏上"的
+		// 信号 —— 收窗口不一定走 glass.hide()：mygo 自己收、系统恢复、别的路径
+		// 直接 ShowWindow 都会绕过去，那之后 visible 还停在 true，投影层就又被
+		// 画回屏幕上，用户看到的就是"关掉之后桌面上留着一个带阴影的空框"。
+		//
+		// 藏起来时把三样东西一起收：投影层、visible/hostShown 两个标志、拖动状态。
+		// 拖动状态尤其关键：SetCapture 还攥在手里、active 还是 true 的话，窗口
+		// 重新打开后每一次按下都被当成"继续拖"，点击全被吞 —— 表现就是"打开了
+		// 却点不动关闭"。
+		if f.glass != nil {
+			if wparam == 0 {
+				f.glass.hostShown = false
+				f.glass.visible = false
+				f.glass.hideShadow()
+				if f.glass.drag != nil {
+					f.glass.drag.cancel()
+				}
+				log.Printf("子窗: %s 已隐藏（投影/拖动状态一并收起）", f.glass.name)
+			} else {
+				f.glass.hostShown = true
+			}
+		}
 	case wmEnterSizeMove:
 		f.drag = true
 		// 万一这条路径真的被走到（系统拖动），也要和自绘拖动表现一致：

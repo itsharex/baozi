@@ -41,7 +41,12 @@ const (
 	// 这个数必须**大于按钮真实宽度**：按钮在 1.25 缩放下从 x≈1050 到 1140
 	// （约 112 DIP）。之前给 60 DIP，把手区一直伸到 1075 —— 按钮左半边落在
 	// 把手区里，按下就被我们吃掉、单击永远传不到 mygo，用户点关闭毫无反应。
-	subCloseAreaDip = 130
+	//
+	// 后来又发现"刚好够"也不行：按钮宽度会随字号/文案变，把手区边界只差十几像素，
+	// 换个 DPI 就又压回按钮上。现在直接留到 200 DIP（1.25 缩放下 250px），
+	// 换算出来永远盖住整个按钮，代价只是顶栏右边这一截不能当把手 —— 顶栏够宽，
+	// 拖窗口从来不缺地方。
+	subCloseAreaDip = 200
 
 	// 拖动中重烘底图的节流间隔。整张 1150x1025 约 8ms，60Hz 的鼠标移动也就是
 	// 16ms 一帧 —— 12ms 能让背景基本跟着手走，又不至于把 UI 线程占满。
@@ -72,18 +77,14 @@ func installSubDrag(w *mygo.Window, g *subGlass) {
 	if w == nil || g == nil {
 		return
 	}
-	if g.drag != nil {
-		// 已经挂上了。每次重新挂一次，把自己提到子类化链的**最前面**：
-		// SetWindowSubclass 是后进先出，mygo 在渲染/重设时可能又挂了自己的那层，
-		// 挡在我们前面把按下吃掉（表现就是"我们的拖动根本没收到消息"）。
-		g.drag.rearm()
-		return
-	}
 	host := w.NativeHandle()
 	if host == 0 {
 		g.retrySubDrag(w)
 		return
 	}
+	// 先摸 surface：窗口藏过再显示，句柄有可能整个换新（mygo 重建渲染面）。
+	// 以前是"挂过就不再挂"，于是我们这层子类化还留在那个已经作废的句柄上，
+	// 新 surface 上没有把手 —— 拖动迟钝甚至点不动，看着像窗口"半死"。
 	surf := findMyGoSurface(host)
 	if surf == 0 {
 		// mygo 的 MyGoSurface 是 Show 之后才 createWindow 的，时序偶尔差一拍。
@@ -91,6 +92,18 @@ func installSubDrag(w *mygo.Window, g *subGlass) {
 		// "没挂上"，用户那边就是"又拖不动了"，然后又退回系统拖动，四角继续变直。
 		g.retrySubDrag(w)
 		return
+	}
+	if g.drag != nil {
+		if g.drag.host == host && g.drag.hwnd == surf {
+			// 已经挂上了。每次重新挂一次，把自己提到子类化链的**最前面**：
+			// SetWindowSubclass 是后进先出，mygo 在渲染/重设时可能又挂了自己的那层，
+			// 挡在我们前面把按下吃掉（表现就是"我们的拖动根本没收到消息"）。
+			g.drag.rearm()
+			return
+		}
+		// 句柄换了：旧的作废，重新挂一份。
+		g.drag.cancel()
+		g.drag = nil
 	}
 	d := &subDrag{win: w, host: host, hwnd: surf, glass: g}
 	d.tramp = windows.NewCallback(d.proc)
@@ -171,6 +184,21 @@ func (d *subDrag) cancel() {
 	}
 }
 
+// finish 结束一次拖动并把画面收尾：捕获、糊化、底图、投影各归各位。
+//
+// 和 cancel 的区别：cancel 是"窗口都要没了，别画了"；finish 是"手松了，把这一
+// 帧收拾好"。分开是因为在窗口已经隐藏时重烘底图纯属白花 8~10ms。
+func (d *subDrag) finish() {
+	d.active = false
+	d.pending = false
+	if d.hwnd != 0 {
+		procRelCapture.Call()
+	}
+	d.glass.app.setDragFade(false)
+	d.glass.refresh(true)
+	d.glass.refreshShadow()
+}
+
 func (d *subDrag) inTopBar(x, y int32) bool {
 	_, _, cw, chh := win.ClientRectPixels(d.hwnd)
 	if cw <= 0 || chh <= 0 {
@@ -196,6 +224,14 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 	case wmLButtonDown:
 		x := int32(int16(lparam & 0xFFFF))
 		y := int32(int16((lparam >> 16) & 0xFFFF))
+		// 一次新按下。要是上一次拖动的"抬手"根本没送到（在窗口外松手、被系统
+		// 抢走了消息），active/pending 还留着，这一按就会被当成"还在拖"，
+		// 于是点击全被吞掉 —— 用户看到的就是"窗口在，但怎么点都没反应"。
+		// 按下的这一刻无论旧状态是什么都该作废，先清干净再判断。
+		if d.active || d.pending {
+			d.cancel()
+			d.glass.app.setDragFade(false)
+		}
 		if d.inTopBar(x, y) {
 			d.begin()
 			// 吃掉这次按下：不让 mygo 再走它自己的（系统）拖动。
@@ -204,12 +240,7 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 
 	case wmLButtonUp:
 		if d.active {
-			d.active = false
-			d.pending = false
-			procRelCapture.Call()
-			d.glass.app.setDragFade(false)
-			d.glass.refresh(true)
-			d.glass.refreshShadow()
+			d.finish()
 			return 0
 		}
 		if d.pending {
@@ -222,6 +253,13 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 
 	case wmMouseMove:
 		if !d.pending && !d.active {
+			break
+		}
+		// 抬手的消息丢了（在窗口外松手、或者被别的窗口抢走）：左键其实早就不
+		// 按着了。异步键态是这里唯一可信的"现在到底按没按"，一旦发现松了就地
+		// 收尾，别把 active/pending 留给下一次点击。
+		if !leftButtonDown() {
+			d.finish()
 			break
 		}
 		var p point
@@ -263,12 +301,7 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 				procSetCapture.Call(d.hwnd)
 				break
 			}
-			d.active = false
-			d.pending = false
-			procRelCapture.Call()
-			d.glass.app.setDragFade(false)
-			d.glass.refresh(true)
-			d.glass.refreshShadow()
+			d.finish()
 		}
 	}
 	r, _, _ := procDefSubclass.Call(hwnd, msg, wparam, lparam, id, data)
