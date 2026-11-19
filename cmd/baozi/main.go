@@ -255,6 +255,7 @@ type application struct {
 	dragWhite              *ui.Bitmap
 	dragWhiteW, dragWhiteH int
 	dragWhiteR             float64
+	dragWhiteDark          bool // 这张白面板是按亮/暗桌面生成的
 	// redrawNext 是"拖动时自己推一帧上屏"的节流点（见 OnMove 里的 win.RedrawNow）。
 	// 拖动走系统模态循环，帧请求在那儿排队，光算完底图屏幕不会变。
 	redrawNext atomic.Int64
@@ -264,6 +265,9 @@ type application struct {
 	// dragRetryLeft 是"还没摸到 MyGoSurface 时还能再试几拍"的余量：mygo 的子窗口
 	// 是 Show 之后才建出来的，偶尔差一拍。每成功挂上一次就补满。
 	dragRetryLeft int
+	// deskDark 记录这次唤出时那张桌面底片是不是暗的：暗就切深色配色、玻璃压深，
+	// 亮就切浅色配色、玻璃压白。由 glass.go 的 isDarkImage 在抓完快照时判定。
+	deskDark bool
 	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
 	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
 	// internal/win/shadow.go）。
@@ -559,13 +563,18 @@ func (a *application) pinMoveFor(from int, dx, dy float32) *pinMove {
 
 func (a *application) view(c *ui.Context) {
 	// 玻璃上原来那套浅色字读不出来，所以玻璃模式下整块面板走浅色主题：
-	// 深色字 + 浅底。
+	// 深色字 + 浅底。桌面是深色的时候反过来 —— 浅色主题的深色字压在暗玻璃上
+	// 几乎看不见（用户报的"暗色背景变成这样"）。判据是桌面底片的平均亮度，
+	// 见 glass.go 的 isDarkImage：跟壁纸走，不跟系统的明暗外观走。
 	if a.frost != nil {
-		lt := ui.LightTheme()
-		// 圆角裁掉的那四个角要露出桌面，不能露出一块白：清屏色就是
+		th := ui.LightTheme()
+		if a.deskDark {
+			th = ui.DarkTheme()
+		}
+		// 圆角裁掉的那四个角要露出桌面，不能露出一块白/黑：清屏色就是
 		// Theme.Background，所以这里必须给一个真透明（alpha=0）的背景。
-		lt.Background = ui.Transparent
-		c.SetTheme(lt)
+		th.Background = ui.Transparent
+		c.SetTheme(th)
 	}
 	t := c.Theme()
 	// 面板统一用一套字体，见 panelFont。

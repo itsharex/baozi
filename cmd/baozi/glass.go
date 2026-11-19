@@ -863,6 +863,34 @@ func (a *application) pickDeskColor(small *image.RGBA) {
 	log.Printf("玻璃: 桌面底色 #%02X%02X%02X（缩略图兜底）", sr/n, sg/n, sb/n)
 }
 
+// isDarkImage 判断这张桌面底片整体是不是暗的（决定面板该用深色配色还是浅色）。
+//
+// 面板是透明的，字压在桌面颜色上，所以配色不该跟系统的明暗外观走，而该跟
+// **它后面那张桌面**走：系统是浅色、壁纸却是深色的时候，深色字压在暗玻璃上
+// 几乎读不出来（用户报的就是这个）。判据用整屏平均亮度，采样步长 64 像素 ——
+// 一张 2560x1440 只取 900 个点，几微秒的事，也不用担心某块亮斑带偏。
+func isDarkImage(img *image.RGBA) bool {
+	if img == nil {
+		return false
+	}
+	b := img.Bounds()
+	var sum float64
+	var n int
+	for y := b.Min.Y; y < b.Max.Y; y += 64 {
+		for x := b.Min.X; x < b.Max.X; x += 64 {
+			i := img.PixOffset(x, y)
+			sum += 0.299*float64(img.Pix[i]) + 0.587*float64(img.Pix[i+1]) + 0.114*float64(img.Pix[i+2])
+			n++
+		}
+	}
+	if n == 0 {
+		return false
+	}
+	// 0.42 是经验阈值：桌面平均亮度低于它时，深色字（#18181b，亮度约 0.09）
+	// 和玻璃的对比已经低于 7:1，换成浅色字才读得清。亮度过半的壁纸继续用浅色。
+	return sum/float64(n)/255 < 0.42
+}
+
 // frostFromScaled 把一张已缩好的整屏底片做成磨砂图：模糊 → 压白。
 func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	if small == nil {
@@ -872,6 +900,16 @@ func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	// 不用等下次唤出重新抓屏。必须单独存一份 —— win.Blur 和 win.Tint 都是原地
 	// 改这张图，直接留引用的话底片自己就变成模糊+压白的结果了。
 	a.frostBase = dupRGBA(small)
+	a.deskDark = isDarkImage(a.frostBase)
+	glassFallback = [3]uint8{247, 248, 252}
+	if a.deskDark {
+		glassFallback = [3]uint8{22, 22, 26}
+	}
+	if a.deskDark {
+		log.Printf("玻璃: 桌面偏暗，切深色配色（浅字 + 压深玻璃）")
+	} else {
+		log.Printf("玻璃: 桌面偏亮，用浅色配色（深字 + 压白玻璃）")
+	}
 	small = a.frostImage()
 	if small == nil {
 		return nil
@@ -903,6 +941,12 @@ func (a *application) frostImage() *image.RGBA {
 	}
 	work := dupRGBA(a.frostBase)
 	work = win.Blur(work, glassBlurRadius, 3)
+	if a.deskDark {
+		// 暗桌面：压深而不是压白，字换成浅色（见 main.go 的 view）。
+		// 颜色取 #16161A 一类的中性深灰，别用纯黑 —— 纯黑会把壁纸的色相全吃掉，
+		// 面板看着像一块不透明的黑板。
+		return win.Tint(work, 22, 22, 26, glassTintAlpha)
+	}
 	return win.Tint(work, 247, 248, 252, glassTintAlpha)
 }
 

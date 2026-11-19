@@ -90,6 +90,7 @@ type backKey struct {
 	cw, ch    int
 	r         int
 	screenGen int
+	dark      bool // 桌面明暗参与 key：换了一套配色，旧底图不能复用
 }
 
 // backingPad 是底图四周比客户区多烘出来的物理像素数（见 refreshBacking 里的
@@ -101,20 +102,28 @@ type roundRect struct {
 	hx, hy, r float64
 }
 
-// dragWhiteBitmap 是**拖动时**盖在玻璃上的那块白面板：形状和底图同一套圆角
-// 覆盖率（直边一致、弧上抗锯齿），内部纯白、外面全透明。
+// glassFallback 是拿不到磨砂图时兜底的"玻璃色"：亮桌面是浅白，暗桌面是深灰。
+// 由 frostFromScaled 在判完明暗之后设置，composeBacking 直接读。
+var glassFallback = [3]uint8{247, 248, 252}
+
+// dragWhiteBitmap 是**拖动时**盖在玻璃上的那块面板：形状和底图同一套圆角
+// 覆盖率（直边一致、弧上抗锯齿），内部实心、外面全透明。
 //
 // 为什么要有它：面板挪动 (SetWindowPos) 和内容提交 (DComp commit) 分属相邻两帧，
 // 快速拖动时那一帧的相对位移有十几像素，眼睛靠"玻璃里的桌面细节"就能看出错位。
-// 拖动时把面板变成一块不透明的白，里面没有桌面可比，误差就看不见了 —— 这也是
+// 拖动时把面板变成一块实心，里面没有桌面可比，误差就看不见了 —— 这也是
 // Windows 自己拖动毛玻璃窗口时退化成纯色的同一个思路。
+//
+// 颜色跟着桌面明暗走（亮桌面铺白、暗桌面铺深灰，取 glassFallback），否则
+// 暗色壁纸上一拖就闪出一块白板。
 func (a *application) dragWhiteBitmap() *ui.Bitmap {
 	if a.backPix == nil {
 		return nil
 	}
 	cw, ch := a.backPix.Rect.Dx(), a.backPix.Rect.Dy()
 	r := float64(int(math.Round(float64(glassRadius) * float64(a.glassScale()))))
-	if a.dragWhite != nil && a.dragWhiteW == cw && a.dragWhiteH == ch && a.dragWhiteR == r {
+	if a.dragWhite != nil && a.dragWhiteW == cw && a.dragWhiteH == ch &&
+		a.dragWhiteR == r && a.dragWhiteDark == a.deskDark {
 		return a.dragWhite
 	}
 	rr := newRoundRect(cw, ch, backingPad, r)
@@ -133,7 +142,7 @@ func (a *application) dragWhiteBitmap() *ui.Bitmap {
 				c = 1
 			}
 			i := x * 4
-			row[i], row[i+1], row[i+2] = 247, 248, 252
+			row[i], row[i+1], row[i+2] = glassFallback[0], glassFallback[1], glassFallback[2]
 			row[i+3] = uint8(c * 255)
 		}
 	}
@@ -143,6 +152,7 @@ func (a *application) dragWhiteBitmap() *ui.Bitmap {
 		a.dragWhite = ui.NewBitmap(img)
 	}
 	a.dragWhiteW, a.dragWhiteH, a.dragWhiteR = cw, ch, r
+	a.dragWhiteDark = a.deskDark
 	return a.dragWhite
 }
 
@@ -227,7 +237,7 @@ func (a *application) refreshBackingFor(cx, cy int, force bool) {
 	}
 	s := a.glassScale()
 	r := int(math.Round(float64(glassRadius) * float64(s)))
-	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen}
+	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark}
 
 	// 形状没变、只是窗口挪了地方：**不整张重烘**，把内容整体平移到位就行。
 	//
@@ -566,7 +576,7 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.
 					out.Pix[o+2] = gNearRow[o0+2]
 					out.Pix[o+3] = 255
 				} else {
-					out.Pix[o+0], out.Pix[o+1], out.Pix[o+2], out.Pix[o+3] = 247, 248, 252, 255
+					out.Pix[o+0], out.Pix[o+1], out.Pix[o+2], out.Pix[o+3] = glassFallback[0], glassFallback[1], glassFallback[2], 255
 				}
 				continue
 			}
@@ -586,7 +596,7 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.
 				r2 = float64(gRow1[o0+2])*(1-fx) + float64(gRow1[o1+2])*fx
 				gb = rr*(1-gfy) + r2*gfy
 			} else {
-				gr, gg, gb = 247, 248, 252
+				gr, gg, gb = float64(glassFallback[0]), float64(glassFallback[1]), float64(glassFallback[2])
 			}
 
 			// 覆盖率。
