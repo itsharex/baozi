@@ -1089,6 +1089,9 @@ func (a *application) ensureShell(reason string) {
 	if hwnd == 0 {
 		return
 	}
+	// DWM 的非客户区边框：Win10 上就是窗口顶上那 1 像素的白线，只在 alpha=0 的
+	// 圆角缺口里透出来。每次复查都关一次（mygo 在 Show/Hide 之间会重新打开它）。
+	win.DisableWindowFrame(hwnd)
 	hasRegion := win.HasRegion(hwnd)
 	shadowShown := a.shadow.Shown()
 	// 每次唤出后的前三次复查各记一行：这样"圆角/阴影什么时候丢、过了多久补上"

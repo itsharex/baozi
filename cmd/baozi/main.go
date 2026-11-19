@@ -679,7 +679,13 @@ func (a *application) view(c *ui.Context) {
 					// 画回去时又正好是同一批整数像素，右边/下边一格都不缺。
 					dip := float32(a.backPixW) / s
 					dipH := float32(a.backPixH) / s
-					ui.Image(c, a.back).Absolute().Left(0).Top(0).
+					// 往外压一个物理像素：底图四周多烘了一圈（backingPad=1，见
+					// refreshBacking），形状本身还在客户区里。mygo 摆放这张图时会
+					// 带零点几像素的取整偏差 —— 客户区最上面那一行曾整行没被盖住，
+					// 露的是 mygo 清屏的纯白（BAOZI_ROWPROBE 探针实测）。多出来的
+					// 这一圈当余量，上下左右无论往哪边取整都盖得住。
+					pad := 1 / s
+					ui.Image(c, a.back).Absolute().Left(-pad).Top(-pad).
 						Size(dip, dipH)
 					if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
 						pw, ph := a.panelSize()
@@ -2386,6 +2392,10 @@ func (a *application) show() {
 	// 区域同时决定 DWM 阴影的形状，这也是阴影能跟着圆角走的唯一办法。
 	// Show 内部会动窗口样式/尺寸，所以上屏后再设一次（两次都只是 1ms 级的调用）。
 	a.applyRoundRegion()
+	// DWM 的那一圈非客户区边框要在 Show 之后再关一次：mygo 每次显示窗口都会把
+	// 窗口样式动一遍，属性不一定留着。它画在窗口像素底下，只在圆角被裁掉的
+	// alpha=0 缺口里透出来 —— 就是面板顶边那一段 1 像素的白线。
+	win.DisableWindowFrame(a.panel.NativeHandle())
 	// 四角的桌面色要在窗口移到本次位置之后再取（取的是窗外 2px 的实时光片，
 	// 现在优先从刚刚抓的那张半分辨率快照里读，见 glass.go 的 colorAt）—— 这
 	// 件事不能放到 Show 之前，否则读到的还是上一处桌面。

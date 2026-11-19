@@ -57,6 +57,10 @@ var alphaBacking = func() bool {
 	return os.Getenv("BAOZI_BACKALPHA") != "0"
 }()
 
+// rowProbe：诊断用。BAOZI_ROWPROBE=1 时把底图最上面两行涂成洋红/青色，
+// 用来判断"屏幕最上面那一行到底是图没铺到，还是有别的东西盖在上面"。
+var rowProbe = os.Getenv("BAOZI_ROWPROBE") == "1"
+
 // ringMode 决定四角和四条边那条 1px 线怎么画 —— 用户"能看出来"的那道白弧
 // 就是它。三种：
 //
@@ -92,7 +96,10 @@ type roundRect struct {
 func newRoundRect(cw, ch, inset int, radius float64) roundRect {
 	w := float64(cw) - 2*float64(inset)
 	h := float64(ch) - 2*float64(inset)
-	r := radius - float64(inset)
+	// 半径**不减 inset**：形状只是整体往里挪了 inset 像素，四个圆角还是同一个
+	// 半径（圆心也跟着挪）。减掉 inset 会让角比直边多收 1 像素，弧和直边的切点
+	// 就对不上，接缝处露出一小段台阶。
+	r := radius
 	if r < 0 {
 		r = 0
 	}
@@ -138,16 +145,23 @@ func (a *application) refreshBacking(force bool) {
 	}
 	a.lastBackAt = time.Now()
 
+	// 四周各多烘 1 个物理像素（backingPad），再把这张图整个往外铺 1 像素：
+	// mygo 把这张图摆下来的时候会带零点几像素的取整偏差 —— 客户区最上面那一行
+	// 曾经就整行没被盖住，露的是 mygo 清屏的纯白（BAOZI_ROWPROBE=1 的探针实测：
+	// 图往外铺一像素后，屏幕第 0 行才轮到图自己的第 1 行）。多烘一圈、外面再
+	// 压一像素，无论它往上还是往下取整，客户区都被图盖满，不会再露白。
+	const backingPad = 1
+	pw, ph := w+2*backingPad, h+2*backingPad
 	t0 := time.Now()
-	pix := a.composeBacking(cx, cy, w, h, r)
+	pix := a.composeBacking(cx, cy, pw, ph, r, backingPad)
 	if pix == nil {
 		return
 	}
-	if a.back != nil && a.backPixW == w && a.backPixH == h {
+	if a.back != nil && a.backPixW == pw && a.backPixH == ph {
 		a.back.Update(pix)
 	} else {
 		a.back = ui.NewBitmap(pix)
-		a.backPixW, a.backPixH = w, h
+		a.backPixW, a.backPixH = pw, ph
 	}
 	a.backKeySet = true
 	a.backKeyVal = k
@@ -165,8 +179,10 @@ func (a *application) refreshBacking(force bool) {
 	}
 }
 
-// composeBacking 返回客户区大小的不透明位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
-func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
+// composeBacking 返回客户区大小的位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
+// cw/ch 是**含内边距**的尺寸，inset 是四周多出来的物理像素数（backingPad），
+// 形状本身仍然铺在 [inset, inset+cw-2inset] 这一段，也就是客户的真实范围。
+func (a *application) composeBacking(cx, cy, cw, ch, r, inset int) *image.RGBA {
 	if a.backPix == nil || a.backPix.Rect.Dx() != cw || a.backPix.Rect.Dy() != ch {
 		a.backPix = image.NewRGBA(image.Rect(0, 0, cw, ch))
 	}
@@ -188,16 +204,17 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 		bw = 1
 	}
 
-	outer := newRoundRect(cw, ch, 0, float64(r))
+	outer := newRoundRect(cw, ch, inset, float64(r))
 
 	halfW := float64(cw) / 2
 	halfH := float64(ch) / 2
 
-	// 玻璃 / 桌面采样用的原点（相对客户区左上角的屏幕坐标）
-	gox := cx - a.screenX
-	goy := cy - a.screenY
-	dox := cx - a.deskHalfX
-	doy := cy - a.deskHalfY
+	// 玻璃 / 桌面采样用的原点（相对客户区左上角的屏幕坐标）。
+	// 多出来的那一圈内边距要把坐标系挪回去：位图的 (inset,inset) 才是客户区的 (0,0)。
+	gox := cx - a.screenX - inset
+	goy := cy - a.screenY - inset
+	dox := cx - a.deskHalfX - inset
+	doy := cy - a.deskHalfY - inset
 	step := glassStep
 	if step < 1 {
 		step = 1
@@ -468,6 +485,20 @@ func (a *application) composeBacking(cx, cy, cw, ch, r int) *image.RGBA {
 			out.Pix[o+1] = clamp8(rgc)
 			out.Pix[o+2] = clamp8(rb)
 			out.Pix[o+3] = 255
+		}
+	}
+	if rowProbe {
+		// 最上面四行涂成洋红/青/黄/绿：屏幕上看到哪一行，就说明这张图的第几行
+		// 落在了客户区第 0 行（判断 mygo 摆放位图时到底偏了几个像素）。
+		probe := [4][3]uint8{{255, 0, 255}, {0, 255, 255}, {255, 255, 0}, {0, 255, 0}}
+		for row := 0; row < 4 && row < ch; row++ {
+			for x := 0; x < cw; x++ {
+				o := row*cw*4 + x*4
+				out.Pix[o+0] = probe[row][0]
+				out.Pix[o+1] = probe[row][1]
+				out.Pix[o+2] = probe[row][2]
+				out.Pix[o+3] = 255
+			}
 		}
 	}
 	return out

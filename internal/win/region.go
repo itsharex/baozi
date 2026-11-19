@@ -47,7 +47,29 @@ func HasRegion(hwnd uintptr) bool {
 const (
 	dwmwaNCRenderingPolicy = 2
 	dwmNCRPEnabled         = 2
+	dwmNCRPDisabled        = 1
 )
+
+// DisableWindowFrame 关掉 DWM 给窗口画的那一圈非客户区 —— Win10 上它就是窗口
+// **最上面那 1 个像素**的白线（浅色主题下是纯白）。
+//
+// 这一格白才是"四角一直有一条白线 / 弧外面多一个透明直角"的真凶：DWM 的边框画在
+// 窗口自己的像素**底下**，我们的像素不透明时看不见；一旦圆角那一块被裁成 alpha=0，
+// 它就从缺口里透出来。所以它只在顶边出现、只在圆角那一小段看得见，怎么调底图都
+// 去不掉（BAOZI_ROWPROBE 探针实测：面板自己第 0 行的像素是对的，白线是别人画的）。
+//
+// 面板的阴影是自己画的（见 shadow.go），不需要 DWM 这一圈，关掉不会有损失。
+func DisableWindowFrame(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	off := uint32(dwmNCRPDisabled)
+	r, _, _ := procDwmSetWindowAttr.Call(hwnd, dwmwaNCRenderingPolicy, uintptr(unsafe.Pointer(&off)), unsafe.Sizeof(off))
+	// 边框往客户区扩的 1px 也要收回去，否则那 1px 的"非客户区"还在。
+	var m margins
+	rf, _, _ := procDwmExtendFrame.Call(hwnd, uintptr(unsafe.Pointer(&m)))
+	return r == 0 || rf == 0
+}
 
 // EnableWindowFrameShadow 让 DWM 给这个窗口画阴影：先开非客户区绘制，再把
 // 边框往客户区里扩 1px。
