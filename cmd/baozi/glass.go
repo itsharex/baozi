@@ -940,14 +940,35 @@ func (a *application) frostImage() *image.RGBA {
 		return nil
 	}
 	work := dupRGBA(a.frostBase)
-	work = win.Blur(work, glassBlurRadius, 3)
+	blur := glassBlurRadius
+	alpha := glassTintAlpha
+	if a.dragFade {
+		// 拖动中把磨砂图糊透：模糊半径翻十几倍，桌面细节（图标、字、窗框）全化成
+		// 色斑。错位判不出来是因为"没有细节可以比对"，而不是因为"面板变白了"——
+		// 面板还是半透明的玻璃，只是糊到只剩色块，观感上仍然跟着手在动。
+		//
+		// 半径上限压住 34：缩略图是 1/3 缩的，34 在缩略图上就是屏幕 100 像素级的
+		// 糊，再往上只是更慢、看不出区别（Blur 是 3 遍盒式，成本随半径线性涨）。
+		blur = blur * 6
+		if blur < 24 {
+			blur = 24
+		}
+		if blur > 34 {
+			blur = 34
+		}
+		// 白层/深层同时加厚一点：糊透之后背景色很淡，不加厚面板会显得"空了"。
+		if int(alpha) < 200 {
+			alpha = uint8(int(alpha) + 44)
+		}
+	}
+	work = win.Blur(work, blur, 3)
 	if a.deskDark {
 		// 暗桌面：压深而不是压白，字换成浅色（见 main.go 的 view）。
 		// 颜色取 #16161A 一类的中性深灰，别用纯黑 —— 纯黑会把壁纸的色相全吃掉，
 		// 面板看着像一块不透明的黑板。
-		return win.Tint(work, 22, 22, 26, glassTintAlpha)
+		return win.Tint(work, 22, 22, 26, alpha)
 	}
-	return win.Tint(work, 247, 248, 252, glassTintAlpha)
+	return win.Tint(work, 247, 248, 252, alpha)
 }
 
 // rebuildFrost 用现有的底片重做一张磨砂图（改透明度、或拖动前后切换糊化）。
@@ -968,11 +989,25 @@ func (a *application) rebuildFrost() {
 	a.frost = ui.NewBitmap(small)
 }
 
-// setDragFade 开关"拖动中的白面板"。白面板是单独一张图（dragWhiteBitmap），
-// 画在底图**上面**，所以这里不需要重烘底图 —— 拖动开始/结束都只是翻一个标志，
-// 由 view 那一帧把它画上/撤掉。拖动中本来就不该有桌面细节可比。
+// setDragFade 开关"拖动中把玻璃糊透"。
+//
+// 为什么拖动时要糊透：面板挪动 (SetWindowPos) 和内容提交 (DComp commit) 分属相邻
+// 两帧，快拖时那一帧的相对位移有十几像素。眼睛是靠"玻璃里的桌面细节"（图标、
+// 字、窗框）和窗外那张桌面比对才看出来的 —— 细节没了，错位也就无从比对。
+//
+// 早先这条路上用的是"拖动时铺一块不透明的白"，错位确实没了，但白得刺眼：
+// 面板像是被贴了张纸，拖动时观感从"玻璃在动"变成"白板在动"。现在改成把磨砂图
+// 糊到只剩色斑（见 frostImage 的拖动分支），保留玻璃的半透明与压白 —— 面板还
+// 是那块玻璃，只是里面什么都认不出来了，看上去依然在跟着动。
+//
+// 代价是切换时各重烘一次磨砂图 + 底图（十几毫秒），只在按下/抬起各做一次。
 func (a *application) setDragFade(on bool) {
+	if a.dragFade == on {
+		return
+	}
 	a.dragFade = on
+	a.rebuildFrost()
+	a.refreshBacking(true)
 }
 
 // dupRGBA 拷一份图像。win.Blur / win.Tint 都是原地改，所以底片必须留一份原件，

@@ -721,14 +721,6 @@ func (a *application) view(c *ui.Context) {
 					pad := 1 / s
 					ui.Image(c, a.back).Absolute().Left(-pad).Top(-pad).
 						Size(dip, dipH)
-					// 拖动中：同一位置、同一形状再压一张不透明白面板，把玻璃里的
-					// 桌面细节整个盖掉（见 dragWhiteBitmap 的说明）。
-					if a.dragFade {
-						if w := a.dragWhiteBitmap(); w != nil {
-							ui.Image(c, w).Absolute().Left(-pad).Top(-pad).
-								Size(float32(a.dragWhiteW)/s, float32(a.dragWhiteH)/s)
-						}
-					}
 					if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
 						pw, ph := a.panelSize()
 						log.Printf("玻璃: 底图铺开 %dx%d px → %.2fx%.2f DIP（面板 %dx%d DIP，scale %.2f）",
