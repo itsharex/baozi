@@ -47,8 +47,12 @@ const (
 	swHide           = 0
 	swpNoActivate    = 0x0010
 	swpNoSize        = 0x0001
+	swpNoMove        = 0x0002
 	swpNoZOrder      = 0x0004
 	hwndTopmost      = ^uintptr(0)
+	hwndNoTopmost    = ^uintptr(1)
+	wsExTopmost      = 0x00000008
+	gwlExStyleIndex  = ^uintptr(19)
 
 	ulwAlpha = 2
 
@@ -111,6 +115,12 @@ type Shadow struct {
 	x, y  int32 // 阴影窗口左上角的屏幕坐标（物理像素）
 
 	shown bool
+
+	// insertAfter 是这一层应当落在哪个 z 序位置（Place 里按宿主的 z 带算出来）：
+	// 宿主是顶层窗口（启动面板）就是 hwndTopmost；宿主是普通窗口（设置/互传）就是
+	// 宿主自己的 hwnd —— 紧贴宿主下面。Show/ForceShow 之后要照着它重新落一次位，
+	// 否则窗口一现原形就被系统放回顶层带里去。
+	insertAfter uintptr
 
 	// 诊断：最近一次 UpdateLayeredWindow 的结果。
 	dbg     bool
@@ -622,7 +632,28 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	// 区域的处理让下面的分层窗口整片不透出来（位图 alpha 明明有值、
 	// UpdateLayeredWindow 也返回成功）。放上面就没这个问题 —— 面板里面那块的
 	// alpha 恒为 0，所以面板本身一点不受影响；鼠标穿透由 WM_NCHITTEST 兜住。
-	pr, _, _ := procSetWindowPos.Call(s.hwnd, hwndTopmost, uintptr(dst.X), uintptr(dst.Y),
+	//
+	// 但"上面"必须限定在**宿主自己那一带**：启动面板本身是 WS_EX_TOPMOST，
+	// 所以压顶层带没问题；设置窗和文件互传窗**不是**顶层窗口（ex=0x00200100，
+	// 只有 NOREDIRECTION|VISIBLE）。如果这一圈影还硬压顶层带，就会出现
+	// "宿主被别的程序盖住了、影还浮在最上面"——用户看到的就是一个和设置窗一样大、
+	// 里面能透出下面那个程序内容、带边框和阴影的空壳，点它还没反应（那是
+	// NOACTIVATE 的分层窗口，点不到下面的真窗口）。
+	// 所以：宿主的 z 带决定这一层的位置；宿主是普通窗口就紧贴宿主下面。
+	// 顶层窗口用统筹带里的宿主自己也没有意义（它不属于那一带），退回 hwndTopmost。
+	after := hwndTopmost
+	if panel != 0 {
+		ex, _, _ := procGetWindowLongPtrW.Call(panel, gwlExStyleIndex)
+		if ex&wsExTopmost == 0 {
+			after = panel
+			// 先把这一层自己的顶层标志摘掉，否则 SetWindowPos 会拒绝把它排到
+			// 普通窗口下面（顶层窗口永远在所有普通窗口之上）。
+			procSetWindowPos.Call(s.hwnd, hwndNoTopmost, 0, 0, 0, 0,
+				swpNoSize|swpNoZOrder|swpNoActivate)
+		}
+	}
+	s.insertAfter = after
+	pr, _, _ := procSetWindowPos.Call(s.hwnd, after, uintptr(dst.X), uintptr(dst.Y),
 		uintptr(tw), uintptr(th), swpNoActivate)
 	s.dbgInfo = fmt.Sprintf("ulw=%v swp=%v %s", ulr != 0, pr != 0, s.dbgInfo)
 	s.buildCost, s.ulwCost = tULW.Sub(tBuild), ulwCost
@@ -951,6 +982,19 @@ func (s *Shadow) Move(x, y, m int) {
 	s.x, s.y = dst.X, dst.Y
 }
 
+// restack 把这一层重新落回 Place 算出来的 z 位置。调用方必须已经持有 s.mu。
+//
+// ShowWindow 把一块藏起来的窗口重新放上屏时，系统会把它塞到自己那一带的最前面
+// —— 普通带里的"最前面"就是压在所有其它普通窗口之上。宿主不在最前面的时候，
+// 这一圈影就又浮出来了，所以每次上屏都照着 Place 记下的位置落一次。
+func (s *Shadow) restack() {
+	if s == nil || s.hwnd == 0 || s.insertAfter == 0 {
+		return
+	}
+	procSetWindowPos.Call(s.hwnd, s.insertAfter, 0, 0, 0, 0,
+		swpNoMove|swpNoSize|swpNoActivate)
+}
+
 // Show 让阴影层上屏。
 //
 // 这里**不能**只看缓存里的 shown 标志：窗口可能被系统或别的程序藏起来（隐藏/显示
@@ -965,9 +1009,11 @@ func (s *Shadow) Show() {
 	defer s.mu.Unlock()
 	s.shown = true
 	if vis, _, _ := procIsWindowVisible.Call(s.hwnd); vis != 0 {
+		s.restack()
 		return // 已经真的在屏上，不必再 ShowWindow
 	}
 	procShowWindow.Call(s.hwnd, swShowNoActivate)
+	s.restack()
 }
 
 // ForceShow 无条件把阴影层推上屏，并把状态标记拉回"开着"。
@@ -991,6 +1037,7 @@ func (s *Shadow) ForceShow() bool {
 		wasVisible = true
 	}
 	procShowWindow.Call(s.hwnd, swShowNoActivate)
+	s.restack()
 	return wasVisible
 }
 
