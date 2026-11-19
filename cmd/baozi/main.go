@@ -2478,19 +2478,38 @@ func applyAppearance(cfg *config.Config) {
 		// 直角时内容层不裁（Radius(0) 就是不要圆角）；让 1 DIP 的约定在 0 处失效。
 		glassClipRadius = 0
 	}
-	// 透明度 → 压白 alpha：0% 是实心 255（完全看不见桌面），59% ≈ 158（原来那套观感），
-	// 100% 到 90 为止 —— 这就是"禁止完全透明"：再薄面板就没有玻璃感、字也压不住。
+	// 透明度 → 压白 alpha，分两段：0% 是实心 255（完全看不见桌面），59% 是 158
+	// （原来那套观感，缺省值，不能变），再往上加陡 —— 100% 压到 62。
+	// 早先高段和低段用同一条斜线，100% 只能到 90，用户实际拉满还是觉得"太不透明"；
+	// 62 仍留四分之一层白（字压得住、面板有边界），但桌面明显能看清。
 	pct := cfg.GlassTransparencyPct()
-	alpha := 255 - pct*165/100
-	if alpha < 90 {
-		alpha = 90
+	alpha := 158
+	switch {
+	case pct <= config.DefaultGlassTransparency:
+		alpha = 255 - int(math.Round(float64(pct)*97.0/float64(config.DefaultGlassTransparency)))
+	case pct > config.DefaultGlassTransparency:
+		alpha = 158 - int(math.Round(float64(pct-config.DefaultGlassTransparency)*96.0/
+			float64(100-config.DefaultGlassTransparency)))
+	}
+	if alpha < 62 {
+		alpha = 62
+	}
+	if alpha > 255 {
+		alpha = 255
 	}
 	glassTintAlpha = uint8(alpha)
-	// 模糊跟着透明度走：越透糊得越轻（想看见桌面就该少糊一点）。59% 时还是 5，
-	// 0% 到 8，100% 到 3（2 是 Blur 的下限，再小就等于没模糊）。
-	blur := 5 + (config.DefaultGlassTransparency-pct)*5/100
-	if blur < 2 {
-		blur = 2
+	// 模糊跟着透明度走：越透糊得越轻（想看见桌面就该少糊一点）。
+	// 59% 还是 5；往上到 100% 只剩 1（磨砂图本身已经降采样，1 相当于屏幕 4 像素的
+	// 极轻糊，桌面轮廓基本能认出来），往下到 0% 给到 8。
+	blur := 5
+	switch {
+	case pct <= config.DefaultGlassTransparency:
+		blur = 5 + int(math.Round(float64(config.DefaultGlassTransparency-pct)*3.0/59.0))
+	case pct > config.DefaultGlassTransparency:
+		blur = 5 - int(math.Round(float64(pct-config.DefaultGlassTransparency)*4.0/41.0))
+	}
+	if blur < 1 {
+		blur = 1
 	}
 	if blur > 8 {
 		blur = 8
@@ -2626,6 +2645,11 @@ func (a *application) ready() {
 	a.panel.OnMove(func() {
 		a.uiTick.Store(time.Now().UnixNano())
 		a.dragUntil.Store(time.Now().Add(600 * time.Millisecond).UnixNano())
+		// 底图平移必须**当帧**做。以前这里只排一次 panel.Update，等那一帧布局跑完
+		// 才在 view 里重算 —— 窗口已经被系统挪到新位置、图还是旧的，屏幕上就是
+		// "拖动开始的一瞬间背景慢一拍"。增量平移只需要 1~2ms（整张重烘仍然受下面的
+		// 16ms 节流和"一次只排一帧"约束），所以在 OnMove 里直接做。
+		a.refreshBacking(false)
 		// 玻璃跟着面板走：整屏磨砂图不动，只改窗口在图上取景的偏移。
 		//
 		// 但**不能每帧都重建**：panel.Update 是"整棵内容树重新布局 + 重新栅格化

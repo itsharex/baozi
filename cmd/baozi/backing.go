@@ -38,7 +38,7 @@ const bakedPanel = true
 // backingThrottle 是底图重算的最小间隔。底图要逐像素重采样（1100×660 这一级
 // 大约几毫秒），拖动时鼠标每秒报几百次，不节流会把 UI 线程占满 —— 这正是
 // 之前"快速拖动卡死"的来源。阴影层挪位、窗口几何照旧每帧走。
-const backingThrottle = 30 * time.Millisecond
+const backingThrottle = 16 * time.Millisecond
 
 // testBacking：BAOZI_BACKTEST=1 时把底图渲染成"形状诊断图"（形状外红、
 // 边框环蓝、形状内白），用来在截图上量形状的真实边界。正常运行恒为 0。

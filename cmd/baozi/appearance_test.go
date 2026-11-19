@@ -23,7 +23,7 @@ func TestApplyAppearance(t *testing.T) {
 		t.Fatalf("缺省半径应 %d/%d，实际 %d/%d",
 			config.DefaultPanelRadius, config.DefaultPanelRadius-1, glassRadius, glassClipRadius)
 	}
-	// 255 - 59*165/100 = 158；模糊保持原来的 5。
+	// 缺省 59%：alpha 158（原来那套观感）；模糊保持原来的 5。
 	if glassTintAlpha != 158 {
 		t.Fatalf("缺省压白 alpha 应 158，实际 %d", glassTintAlpha)
 	}
@@ -38,19 +38,20 @@ func TestApplyAppearance(t *testing.T) {
 	if glassTintAlpha != 255 {
 		t.Fatalf("透明度 0 应完全不透明（alpha 255），实际 %d", glassTintAlpha)
 	}
-	if glassBlurRadius != 7 {
-		t.Fatalf("透明度 0 模糊应最重（7），实际 %d", glassBlurRadius)
+	if glassBlurRadius != 8 {
+		t.Fatalf("透明度 0 模糊应最重（8），实际 %d", glassBlurRadius)
 	}
 
-	// 透明度 100 = 最透，但 alpha 有 90 的下限（禁止完全透明），模糊也只减到 3。
+	// 透明度 100 = 最透：alpha 压到 62（还有四分之一层白，禁止完全透明），
+	// 模糊只剩 1 —— 再小就等于没糊，桌面看得最清。
 	hundred := 100
 	cfg.Appearance.Opacity.Value = &hundred
 	applyAppearance(cfg)
-	if glassTintAlpha != 90 {
-		t.Fatalf("透明度 100 应夹在 alpha 90，实际 %d", glassTintAlpha)
+	if glassTintAlpha != 62 {
+		t.Fatalf("透明度 100 应 alpha 62，实际 %d", glassTintAlpha)
 	}
-	if glassBlurRadius != 3 {
-		t.Fatalf("透明度 100 模糊应最轻（3），实际 %d", glassBlurRadius)
+	if glassBlurRadius != 1 {
+		t.Fatalf("透明度 100 模糊应最轻（1），实际 %d", glassBlurRadius)
 	}
 
 	// 把开关关掉 = 不要玻璃能看穿 → 等同透明度 0（实心）。
