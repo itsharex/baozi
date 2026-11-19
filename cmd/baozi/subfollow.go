@@ -24,6 +24,10 @@ import (
 
 const (
 	wmMove                    = 0x0003
+	wmActivate                = 0x0006
+	wmPaint                   = 0x000F
+	wmEraseBkgnd              = 0x0014
+	wmNcActivate              = 0x0086
 	wmShowWindow              = 0x0018
 	wmEnterSizeMove           = 0x0231
 	wmExitSizeMove            = 0x0232
@@ -41,6 +45,10 @@ type shadowFollower struct {
 	glass *subGlass
 	tramp uintptr
 	drag  bool
+
+	// 上一次主动推帧的时间（WM_PAINT/WM_ERASEBKGND 那条兜底用，防止推帧
+	// 又触发一次"要重画"把自己套进死循环）。
+	lastPush time.Time
 }
 
 // installShadowFollower 给子窗的**顶层窗口**挂 WM_MOVE 子类化。
@@ -76,6 +84,29 @@ func installShadowFollower(w *mygo.Window, g *subGlass) {
 
 func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 	switch msg {
+	case wmActivate, wmNcActivate:
+		// 激活状态一变，客户区那一帧可能就没人管了：实测点别的窗口让设置窗失活之后，
+		// 窗口本体和投影层都还在屏上（IsWindowVisible 都是 true、MyGoSurface 尺寸也对），
+		// 客户区却一个像素都不画 —— 用户看到的就是"只剩边框和阴影"的空框，
+		// 再点回去也点不动。原因是我们这套是**按需推帧**（show / 挪位 / 拖完才
+		// FrameNow），合成表面一旦被系统清掉，没有任何人把它画回来。
+		// 所以这里状态一变就重烘一次底图、重摆一次投影、立刻推一帧。
+		if f.glass != nil {
+			f.glass.refresh(true)
+			f.glass.refreshShadow()
+			if f.win != nil {
+				f.lastPush = time.Now()
+				f.win.FrameNow()
+			}
+		}
+	case wmPaint, wmEraseBkgnd:
+		// 系统说"这块要重画"，通常意味着合成表面被清空了。这套窗口是**按需
+		// 推帧**的，没人推就一直空白 —— 用户看到的是"框还在、里透出下面窗口"。
+		// 这里只补一帧、不重烘底图（重烘 8ms，在拖动/缩放里会放大抖动）。
+		if f.win != nil && time.Since(f.lastPush) > 50*time.Millisecond {
+			f.lastPush = time.Now()
+			f.win.FrameNow()
+		}
 	case wmShowWindow:
 		// 窗口在系统层面的显示/隐藏。这是**唯一可靠**的"它到底还在不在屏上"的
 		// 信号 —— 收窗口不一定走 glass.hide()：mygo 自己收、系统恢复、别的路径
