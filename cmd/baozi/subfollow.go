@@ -38,6 +38,10 @@ type shadowFollower struct {
 	glass *subGlass
 	tramp uintptr
 	drag  bool
+
+	// 拖动中重烘底图的节流。整张重烘一次 8~10ms（1150x1025），拖动时每帧都做
+	// 会把帧率吃掉一半，30ms 一次已经够"背景跟着走"了。
+	lastBake time.Time
 }
 
 // installShadowFollower 给子窗的**顶层窗口**挂 WM_MOVE 子类化。
@@ -74,20 +78,29 @@ func installShadowFollower(w *mygo.Window, g *subGlass) {
 func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 	switch msg {
 	case wmEnterSizeMove:
-		// 系统拖动/缩放开始：投影先收，别让它留在原地。
 		f.drag = true
-		f.glass.hideShadow()
+		// 注意**不要**在这里 hideShadow：投影一收，窗口边缘就直接贴着桌面，
+		// 底图弧外那一圈"桌面色"（1px）和窗口的矩形形状就露出来 —— 用户看到的正是
+		// "四角还是直角"。投影留着并跟着走，反而把直边盖住。
+		f.glass.followShadow()
 	case wmMove:
+		// 底图是**按屏幕坐标采样的**：窗口一挪，窗口里那块玻璃就不对了 —— 弧还画在
+		// 老位置的边缘上，弧外那圈桌面色也是老的。用户看到的就是"背景一动不动"。
+		// 所以拖动中也得重烘，只是要节流（整张 8~10ms，30ms 一次）。
 		if f.drag {
-			// 拖动中投影是收着的，不用跟；但要压着窗口重绘一帧，不然 noRedirect
-			// 窗口在移动时可能把旧内容原样搬过来，边缘看着就是个"直角框"。
-			procInvalidate.Call(hwnd, 0, 0)
+			if time.Since(f.lastBake) >= 30*time.Millisecond {
+				f.lastBake = time.Now()
+				f.glass.refresh(true)
+			}
 		} else {
-			f.glass.followShadow()
+			f.glass.refresh(true)
 		}
+		f.glass.followShadow()
+		procInvalidate.Call(hwnd, 0, 0)
 	case wmExitSizeMove:
 		f.drag = false
-		// 停手了：按窗口的新位置重画投影并显示。
+		// 停手：底图按最终位置重烘一次，投影按新位置重画并显示。
+		f.glass.refresh(true)
 		f.glass.refreshShadow()
 	case wmNonClientLeftButtonDown:
 		// 点的是标题栏（mygo 的 DragWindow 也是走这条），系统马上要开始拖了。
