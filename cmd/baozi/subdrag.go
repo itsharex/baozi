@@ -41,6 +41,9 @@ const (
 	subBakeInterval = 25 * time.Millisecond
 
 	wmCaptureChanged = 0x0215
+
+	// GetAsyncKeyState 的左键位。
+	vkLeftButton = 0x01
 )
 
 type subDrag struct {
@@ -62,26 +65,44 @@ func installSubDrag(w *mygo.Window, g *subGlass) {
 	if w == nil || g == nil {
 		return
 	}
-	// 句柄是 Show 时才建出来的：摸空就安静返回，show()/refreshShadow() 会再调。
 	if g.drag != nil {
 		return
 	}
 	host := w.NativeHandle()
 	if host == 0 {
+		g.retrySubDrag(w)
 		return
 	}
 	surf := findMyGoSurface(host)
 	if surf == 0 {
+		// mygo 的 MyGoSurface 是 Show 之后才 createWindow 的，时序偶尔差一拍。
+		// 摸空就隔 50ms 再试几拍 —— 主面板当年就栽在这上面：日志只留一句
+		// "没挂上"，用户那边就是"又拖不动了"，然后又退回系统拖动，四角继续变直。
+		g.retrySubDrag(w)
 		return
 	}
 	d := &subDrag{win: w, host: host, hwnd: surf, glass: g}
 	d.tramp = windows.NewCallback(d.proc)
 	if r, _, err := procSetSubclass.Call(surf, d.tramp, subDragSubclassID, 0); r == 0 {
 		log.Printf("子窗拖动: %s 没挂上（%v）", g.name, err)
+		g.retrySubDrag(w)
 		return
 	}
 	g.drag = d
 	log.Printf("子窗拖动: %s 已接管（surface=%d）", g.name, surf)
+}
+
+// retrySubDrag 隔一拍再试（最多几次）。没有它，surface 建得比 Show 晚一点，
+// 这一辈子就都挂不上。
+func (g *subGlass) retrySubDrag(w *mygo.Window) {
+	if w == nil || g.dragRetry <= 0 {
+		return
+	}
+	g.dragRetry--
+	time.AfterFunc(50*time.Millisecond, func() {
+		w.Update(func() {})
+		installSubDrag(w, g)
+	})
 }
 
 func abs32(v int32) int32 {
@@ -121,6 +142,12 @@ func (d *subDrag) inTopBar(x, y int32) bool {
 	return y >= 0 && y < topH && x >= 0 && x < int32(cw)-closeW
 }
 
+// leftButtonDown 问一下"左键现在还按着吗"。捕获丢了要靠它分辨是拖完了还是被抢了。
+func leftButtonDown() bool {
+	r, _, _ := procGetAsyncKey.Call(vkLeftButton)
+	return int16(r) < 0
+}
+
 func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 	switch msg {
 	case wmLButtonDown:
@@ -158,6 +185,9 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 			d.active = true
 			procSetCapture.Call(d.hwnd)
 		}
+		// 每帧确认捕获还在自己手上：窗口一挪，系统/别的路径就可能把它拿走，
+		// 拿走了就再也收不到 mousemove，拖动看着就是"动一下就停住"。
+		procSetCapture.Call(d.hwnd)
 		nx := d.startWinX + dx
 		ny := d.startWinY + dy
 		procSetWinPos.Call(d.host, 0, uintptr(nx), uintptr(ny), 0, 0,
@@ -171,10 +201,17 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		return 0
 
 	case wmCaptureChanged:
-		// 被系统/别的窗口抢走了捕获：结束这次拖动，别留下半截状态。
-		if d.active {
+		// 捕获丢了。如果左键还按着，那就是被别的窗口/系统抢走了（窗口移动、
+		// 提最前、mygo 的重设都会来这一下），必须抢回来继续拖 —— 否则"拖一下
+		// 就停在那里"，用户那边就是"又拖不动了"、而且是拖一点点就卡住的怪样子。
+		if d.active || d.pending {
+			if leftButtonDown() {
+				procSetCapture.Call(d.hwnd)
+				break
+			}
 			d.active = false
 			d.pending = false
+			procRelCapture.Call()
 			d.glass.refresh(true)
 			d.glass.refreshShadow()
 		}

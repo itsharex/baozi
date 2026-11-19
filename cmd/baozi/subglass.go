@@ -51,12 +51,15 @@ type subGlass struct {
 	// drag 是挂在 MyGoSurface 上的自绘拖动（见 subdrag.go）。系统拖动会把
 	// 自绘 alpha 的窗口当矩形搬运，四角立刻变直 —— 顶栏必须自己拖。
 	drag *subDrag
+
+	// dragRetry 是"还没挂上，隔一拍再试"的剩余次数（surface 建得比 Show 晚）。
+	dragRetry int
 }
 
 // newSubGlass 给一个已建好的窗口配一份玻璃（含阴影层）。
 // 必须在窗口创建之后调：阴影层要窗口句柄才能定位。
 func (a *application) newSubGlass(w *mygo.Window, name string) *subGlass {
-	g := &subGlass{app: a, win: w, name: name}
+	g := &subGlass{app: a, win: w, name: name, dragRetry: 8}
 	g.shadow = win.NewShadow()
 	return g
 }

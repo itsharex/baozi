@@ -48,6 +48,9 @@ var (
 	procRelCapture = dragUser32.NewProc("ReleaseCapture")
 	procGetCursor  = dragUser32.NewProc("GetCursorPos")
 	procSetWinPos  = dragUser32.NewProc("SetWindowPos")
+
+	// 问"某个键现在还按着吗"：捕获丢了要靠它分辨"拖完了"还是"被抢了"。
+	procGetAsyncKey = dragUser32.NewProc("GetAsyncKeyState")
 )
 
 const (
