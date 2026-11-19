@@ -23,6 +23,7 @@ var (
 	procGetDesktopWindow       = user32.NewProc("GetDesktopWindow")
 	procSystemParametersInfoW  = user32.NewProc("SystemParametersInfoW")
 	procIsZoomed               = user32.NewProc("IsZoomed")
+	procRedrawWindow           = user32.NewProc("RedrawWindow")
 )
 
 // RECT 是 Win32 矩形。

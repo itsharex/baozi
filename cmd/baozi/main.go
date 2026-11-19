@@ -247,6 +247,9 @@ type application struct {
 	uiTick     atomic.Int64
 	dragUntil  atomic.Int64
 	hangDumped atomic.Bool
+	// redrawNext 是"拖动时自己推一帧上屏"的节流点（见 OnMove 里的 win.RedrawNow）。
+	// 拖动走系统模态循环，帧请求在那儿排队，光算完底图屏幕不会变。
+	redrawNext atomic.Int64
 	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
 	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
 	// internal/win/shadow.go）。
@@ -2650,6 +2653,21 @@ func (a *application) ready() {
 		// "拖动开始的一瞬间背景慢一拍"。增量平移只需要 1~2ms（整张重烘仍然受下面的
 		// 16ms 节流和"一次只排一帧"约束），所以在 OnMove 里直接做。
 		a.refreshBacking(false)
+		// 光算完底图还不算"跟手"：拖动期间主线程在系统的模态拖动循环里，帧请求
+		// 都在排队，屏幕上是上一帧。RedrawWindow(UPDATENOW) 返回前就会把 WM_PAINT
+		// 派发掉，mygo 的 surface 收到就画一帧 —— 窗口挪到哪，玻璃同一刻跟到哪。
+		// 节流 16ms：这一帧是整张内容的重画，实测都在 10ms 以内（超过会打日志）——
+		// 跟手优先，宁可每帧多几毫秒，也别让玻璃落在窗口后头。
+		if t := time.Now(); t.UnixNano() >= a.redrawNext.Load() {
+			a.redrawNext.Store(t.Add(16 * time.Millisecond).UnixNano())
+			if hwnd := a.panel.NativeHandle(); hwnd != 0 {
+				t0 := time.Now()
+				win.RedrawNow(hwnd)
+				if d := time.Since(t0); d > 10*time.Millisecond {
+					log.Printf("玻璃: 拖动重绘一帧 %.1fms", float64(d.Microseconds())/1000)
+				}
+			}
+		}
 		// 玻璃跟着面板走：整屏磨砂图不动，只改窗口在图上取景的偏移。
 		//
 		// 但**不能每帧都重建**：panel.Update 是"整棵内容树重新布局 + 重新栅格化
