@@ -47,6 +47,10 @@ type subGlass struct {
 
 	// follower 是挂在顶层窗口上的 WM_MOVE 子类化（见 subfollow.go）。
 	follower *shadowFollower
+
+	// drag 是挂在 MyGoSurface 上的自绘拖动（见 subdrag.go）。系统拖动会把
+	// 自绘 alpha 的窗口当矩形搬运，四角立刻变直 —— 顶栏必须自己拖。
+	drag *subDrag
 }
 
 // newSubGlass 给一个已建好的窗口配一份玻璃（含阴影层）。
@@ -172,8 +176,9 @@ func (g *subGlass) refreshShadow() {
 		g.shadow.Hide()
 		return
 	}
-	// 句柄这时肯定有了：顺手把 WM_MOVE 子类化挂上（幂等），窗口挪动时投影才跟得上。
+	// 句柄这时肯定有了：顺手把两个子类化挂上（都幂等）。
 	installShadowFollower(g.win, g)
+	installSubDrag(g.win, g)
 	hwnd := g.win.NativeHandle()
 	if hwnd == 0 {
 		return
