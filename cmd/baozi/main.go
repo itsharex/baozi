@@ -3002,6 +3002,39 @@ func rootsChanged(old, want []string) bool {
 	return false
 }
 
+// excludesChanged 判断排除规则有没有实质变化。和 rootsChanged 一样按集合比：
+// 用户多敲一个空行、或者把两条换个顺序，都不该触发一次分钟级的全量重建。
+// 大小写也无关 —— 规则匹配本来就是大小写不敏感的。
+func excludesChanged(old, want []string) bool {
+	old = nonEmptyTrimmed(old)
+	want = nonEmptyTrimmed(want)
+	if len(old) != len(want) {
+		return true
+	}
+	oldSet := make(map[string]int, len(old))
+	for _, s := range old {
+		oldSet[s]++
+	}
+	for _, s := range want {
+		if oldSet[s] == 0 {
+			return true
+		}
+		oldSet[s]--
+	}
+	return false
+}
+
+// nonEmptyTrimmed 去掉空白项并统一小写，供集合比较用。
+func nonEmptyTrimmed(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s = strings.ToLower(strings.TrimSpace(s)); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // idxReplace 换索引快照。名字 arena 和 nodes 一起换，旧快照被替换后依然完整。
 func (a *application) idxReplace(t *index.Table) {
 	a.cat.Store(t)

@@ -873,6 +873,8 @@ func (s *settingsWindow) save() {
 	cfg.Search.IconSize = 0
 
 	oldRoots := s.app.cfg.Index.Roots
+	oldExcludes := s.app.cfg.Index.Excludes
+	oldIncludeHidden := s.app.cfg.Index.IncludeHidden
 	cfg.Index.Roots = splitLines(s.roots)
 	cfg.Index.Excludes = splitLines(s.excludes)
 	cfg.Index.IncludeHidden = s.includeHidden
@@ -971,14 +973,30 @@ func (s *settingsWindow) save() {
 	// 跟随器的总开关 / 来源勾选：不重启进程，改完立刻按新配置走。
 	s.app.syncFollow()
 
+	// 索引规则变了就得重建：排除规则 / 包含隐藏文件都是**扫描时**才看的东西，
+	// 光把新值写进配置，索引里那批"已经被排除、但当初扫进来了"的条目照样在，
+	// 用户搜得到、却被告知"已保存并生效"。根目录变化一直会重建，排除规则和它
+	// 同源同命（一样是后台跑，不挡面板）。
 	rootsDirty := rootsChanged(oldRoots, cfg.Index.Roots)
-	if rootsDirty {
+	rulesDirty := oldIncludeHidden != cfg.Index.IncludeHidden ||
+		excludesChanged(oldExcludes, cfg.Index.Excludes)
+	switch {
+	case rootsDirty:
 		s.message = "已保存，正在按新的索引范围重建"
 		go s.app.rescan()
-	} else {
+	case rulesDirty:
+		s.message = "已保存，正在按新的排除规则重建索引"
+		go s.app.rescan()
+	default:
 		s.message = "已保存并生效"
 	}
 	s.app.refilter()
+	// refilter 在"查询为空"那条路上只换了 a.results，没有排帧（它平时跑在
+	// 输入事件里，输入本身就会带一帧）。设置页是静着保存的，得自己叫一声，
+	// 否则改图标大小 / 最多结果数之后，面板要等下次敲键才变样。
+	if s.app.panelUp.Load() {
+		s.app.panel.Update(func() {})
+	}
 	s.win.Update(func() {})
 }
 
