@@ -96,13 +96,13 @@ func TestBackingShiftMatchesFullRebake(t *testing.T) {
 	for _, d := range [][2]int{{16, 24}, {-8, -16}, {32, 0}, {0, 8}, {-24, 40}} {
 		dx, dy := d[0], d[1]
 		// 2) 增量：平移 + 只重算贴边那圈
-		a.backPix = cloneRGBA(base)
-		shiftPix(a.backPix, dx, dy)
+		a.pane.pix = cloneRGBA(base)
+		shiftPix(a.pane.pix, dx, dy)
 		a.repaintBackingBands(cx+dx, cy+dy, pw, ph, r, r+4, dx, dy)
-		got := cloneRGBA(a.backPix)
+		got := cloneRGBA(a.pane.pix)
 
 		// 3) 参照：在新位置整张重烘
-		a.backPix = nil
+		a.pane.pix = nil
 		want := cloneRGBA(a.composeBacking(cx+dx, cy+dy, pw, ph, r, backingPad, image.Rectangle{}))
 
 		maxDelta, bad := diffRGBA(got, want)

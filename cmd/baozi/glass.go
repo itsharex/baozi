@@ -269,11 +269,11 @@ func (a *application) selfWindowOnScreen(except *subGlass, ownPanel bool) string
 		return "启动面板"
 	}
 	if a.settings != nil && a.settings.glass != nil &&
-		a.settings.glass != except && a.settings.glass.visible {
+		a.settings.glass != except && a.settings.glass.pane.visible {
 		return "设置窗"
 	}
 	if a.share != nil && a.share.glass != nil &&
-		a.share.glass != except && a.share.glass.visible {
+		a.share.glass != except && a.share.glass.pane.visible {
 		return "文件互传窗"
 	}
 	return ""
@@ -1258,29 +1258,17 @@ func (a *application) shadowEnabled() bool {
 // 区域（SetWindowRgn 是 1 位掩码），两者不能共存，所以自己画一层
 // （见 internal/win/shadow.go：一个 layered 窗口垫在面板底下，交一张带 alpha 的
 // 位图，阴影就跟着圆角走，跟面板形状锁死）。
-func (a *application) refreshShadow() {
-	if a.shadow == nil {
-		return
-	}
-	hwnd := a.panel.NativeHandle()
-	if hwnd == 0 {
-		return
-	}
-	x, y, w, h := win.WindowRectPixels(hwnd)
-	if w <= 0 || h <= 0 {
-		return
-	}
-	s := a.glassScale()
-	r := int(math.Round(float64(glassRadius) * float64(s)))
-	// 调试开关（只在手动跑 dist\baozi.debug.exe 时用）：
-	//   BAOZI_NOSHADOW=1  阴影层整块不上屏（看"没有自绘层时四角到底有没有白"）
-	//   BAOZI_NOCORNER=1  只保留外圈阴影，不补四角弧外的桌面色/边框弧
-	if !a.shadowEnabled() {
-		// 设置页把投影关掉了（或强度调到 0）：整层不显示。弧和弧外都在底图里，
-		// 关掉不影响圆角，只是面板外没有影子。
-		a.hideShadow()
-		return
-	}
+// panelShadowSpec 是**面板**这块玻璃交给投影层的参数：四角月牙 + 边框弧色。
+//
+// 子窗那边用的是另一份更简单的（cores 为空、SkipPatch 恒真），但"该不该显示、
+// 什么时候 Place、什么时候 Show"的骨架完全共享 —— 见 pane.go 的 placeShadow。
+// 以前这两份各写一遍，子窗漏了 visible/hostShown 门控、投影 z 带也没跟着宿主走。
+//
+// 调试开关（只在手动跑 dist\baozi.debug.exe 时用）：
+//
+//	BAOZI_NOSHADOW=1  阴影层整块不上屏（看"没有自绘层时四角到底有没有白"）
+//	BAOZI_NOCORNER=1  只保留外圈阴影，不补四角弧外的桌面色/边框弧
+func (a *application) panelShadowSpec(hwnd uintptr, x, y, w, h, r int) win.ShadowSpec {
 	// 四角"弧外"那块要铺的是**当前位置**的真实桌面：用唤出那一刻抓的半分辨率
 	// 整屏图现场裁，而不是用旧位置 BitBlt 下来的 patch —— 后者在面板被拖动/缩放
 	// 之后就过期了，壁纸是照片时那块颜色会明显串味，看起来就是"角上画了一道圆弧"。
@@ -1288,13 +1276,12 @@ func (a *application) refreshShadow() {
 	// bakedPanel 之后这块**不再交给阴影层**：弧和弧外全在底图里，阴影层只负责
 	// 面板外那一圈投影。它再补一遍角，就是两份数据叠在同一处 —— 之前"弧外多出
 	// 一小片色/一条线"全是这么来的。
-	patches := a.cornerPatchesAt(x, y, w, h, int(math.Round(float64(glassRadius)*float64(s)))+10)
+	patches := a.cornerPatchesAt(x, y, w, h, r+10)
 	if bakedPanel || os.Getenv("BAOZI_NOCORNER") == "1" {
 		patches = [4]*image.RGBA{}
 	}
-	t0 := time.Now()
 	gl := a.pickGlassColors(x, y, w, h)
-	ok := a.shadow.Place(hwnd, win.ShadowSpec{
+	return win.ShadowSpec{
 		X: x, Y: y, W: w, H: h,
 		Radius:  r,
 		Margin:  a.shadowMargin(),
@@ -1310,63 +1297,52 @@ func (a *application) refreshShadow() {
 		EdgeGlass:    a.pickEdgeGlass(x, y, w, h),
 		// 角和弧全在底图里了，这一层只保留投影（见 ShadowSpec.SkipPatch）。
 		SkipPatch: bakedPanel,
-	})
+	}
+}
+
+func (a *application) refreshShadow() {
+	if a.pane.shadow == nil {
+		return
+	}
+	t0 := time.Now()
+	placed, attempted := a.pane.placeShadow()
 	if d := time.Since(t0); d > 3*time.Millisecond {
 		log.Printf("阴影: 重建 %.2fms（位图 %.2f + 上传 %.2f）",
 			float64(d.Microseconds())/1000,
-			float64(a.shadow.BuildCost().Microseconds())/1000,
-			float64(a.shadow.ULWCost().Microseconds())/1000)
+			float64(a.pane.shadow.BuildCost().Microseconds())/1000,
+			float64(a.pane.shadow.ULWCost().Microseconds())/1000)
 	}
-	if !ok {
+	if attempted && !placed {
 		log.Print("阴影: 图层布局失败")
 	}
 	// 诊断：把这一帧真正交给 DWM 的位图存成 PNG（分层窗口用 GetPixel 拍不到，
 	// 想量四角的抗锯齿只能看这份原始数据）。
 	//   BAOZI_SHADOWDUMP=<路径>  每次重建覆盖一次
 	if p := os.Getenv("BAOZI_SHADOWDUMP"); p != "" {
-		if err := a.shadow.DumpRGBA(p); err != nil {
+		if err := a.pane.shadow.DumpRGBA(p); err != nil {
 			log.Printf("阴影: 导出失败 %v", err)
 		}
 	}
-	a.shadow.Show()
 }
 
 // hideShadow 收起阴影层（面板藏起来、或者正在被拖动缩放时）。
 func (a *application) hideShadow() {
-	if a.shadow != nil {
-		a.shadow.Hide()
-	}
+	a.pane.hideShadow()
 }
 
 // followShadow 面板被拖动时只挪阴影，不重算位图 —— 位图尺寸没变，重算一次要
 // 遍历几十万像素，拖动中间每帧都算就跟不动了。
+//
+// 用窗口矩形（不是客户区）：圆角区域、阴影位图的参照矩形都是窗口矩形，
+// 混着用会在拖动时错开那圈边框带的宽度，阴影相对面板跳一下。
 func (a *application) followShadow() {
-	if a.shadow == nil || !a.shadow.Shown() {
-		return
-	}
-	hwnd := a.panel.NativeHandle()
-	if hwnd == 0 {
-		return
-	}
-	// 用窗口矩形（不是客户区）：圆角区域、阴影位图的参照矩形都是窗口矩形，
-	// 混着用会在拖动时错开那圈边框带的宽度，阴影相对面板跳一下。
-	x, y, _, _ := win.WindowRectPixels(hwnd)
-	// 拖动中尺寸不变，宽度按上次建好的位图来（由 Place 记着）。
-	a.shadow.Move(x, y, a.shadowMargin())
+	a.pane.followShadow(false)
 }
 
 // followShadowNudge 拖动期间用的轻量版：只挪阴影窗口，不重传位图。
 // 见 win.Shadow.Nudge —— UpdateLayeredWindow 每帧整张提交是拖动的延迟来源。
 func (a *application) followShadowNudge() {
-	if a.shadow == nil || !a.shadow.Shown() {
-		return
-	}
-	hwnd := a.panel.NativeHandle()
-	if hwnd == 0 {
-		return
-	}
-	x, y, _, _ := win.WindowRectPixels(hwnd)
-	a.shadow.Nudge(x, y, a.shadowMargin())
+	a.pane.followShadow(true)
 }
 
 func (a *application) shadowMargin() int {
@@ -1410,7 +1386,7 @@ func (a *application) disableDwmFrame() {
 // 一次检查就是两次廉价的 Win32 查询（GetWindowRgn + IsWindowVisible），
 // 所以唤出之后可以按节拍复查；只有真的缺了才会付重画的代价。
 func (a *application) ensureShell(reason string) {
-	if a.frost == nil || a.shadow == nil {
+	if a.frost == nil || a.pane.shadow == nil {
 		return
 	}
 	// 用程序自己的开关当门，而不是问系统"窗口可见吗"：面板是 noRedirect 的
@@ -1428,7 +1404,7 @@ func (a *application) ensureShell(reason string) {
 	// 的圆角缺口里透出来，而且只在面板是前台活动窗口时才画。mygo 在 Show/Hide
 	// 之间会把窗口样式动一遍，所以每次复查都关一次（两次 Win32 调用，可以忽略）。
 	a.disableDwmFrame()
-	shadowShown := a.shadow.Shown()
+	shadowShown := a.pane.shadow.Shown()
 	// 每次唤出后的前三次复查各记一行：这样"圆角/阴影什么时候丢、过了多久补上"
 	// 在日志里是可见的，不用等用户报现象再猜。三次之后只在真的补的时候记。
 	if a.shellProbes < 3 {
@@ -1445,7 +1421,7 @@ func (a *application) ensureShell(reason string) {
 		log.Printf("玻璃: 圆角区域丢了（%s），补设一次", reason)
 		a.applyRoundRegion()
 	}
-	if bakedPanel && a.back == nil {
+	if bakedPanel && a.pane.back == nil {
 		// 形状在底图里，底图没了就是四个直角 —— 这里重烘一张。
 		log.Printf("玻璃: 底图缺了（%s），重画一次", reason)
 		a.refreshBacking(true)
@@ -1458,7 +1434,7 @@ func (a *application) ensureShell(reason string) {
 	// 状态标记和系统状态都可能骗人（实测出现过"标记说开着、窗口其实被藏了"，
 	// 于是这个自愈一次都不跑，四个直角就一直留着）。推一次的成本可以忽略，
 	// 返回值是"推之前是否已可见"，false 才说明真被藏过，这时重建一次位图。
-	if !a.shadow.ForceShow() {
+	if !a.pane.shadow.ForceShow() {
 		log.Printf("阴影: 层被藏过（%s），强制补回", reason)
 		a.refreshShadow()
 	}

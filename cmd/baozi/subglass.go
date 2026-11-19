@@ -1,9 +1,7 @@
 package main
 
 import (
-	"image"
 	"log"
-	"math"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -14,45 +12,32 @@ import (
 
 // subGlass 是"子窗口版"的玻璃：设置窗、文件互传窗各持一份。
 //
-// 为什么不把面板那套整个抽成基类：面板的玻璃状态（磨砂图、四角月牙、拖动糊透、
-// 平移快路径、窗口区域、拖动接管）全都长在 application 上，和"面板这个窗口"绑得
-// 很死。硬抽一个基类要把几十个方法、几十个字段一起搬家，风险全落在他最在意的
-// 那块面板上。
+// 底图、投影、刷新这些**和面板共用同一份实现**（pane.go 的 paneState）：
+// 形状键、平移快路径、四条带重算、投影门控、投影 z 带全都只有一份代码。
+// 子窗真正独有的只剩三样：干净快照的时机（needCleanSnap）、WM_MOVE 跟随、
+// 表面上的自绘拖动。
 //
-// 这里走另一条：**合成逻辑完全共享**（composeBackingInto），子窗只多持有自己的
-// 两样东西 —— 本窗的底图和本窗的阴影层。磨砂图是"屏幕坐标系"的整屏图，窗口只是
-// 在上面取一块，没必要每窗重做；取景基准、明暗判定、桌面兜底色、边框色、DPI 缩放、
-// 圆角半径全是应用级共享的，于是子窗和面板看到的就是同一块玻璃。
+// 历史上这里是 second copy（pix/pw/ph/key/keySet/shadow/visible/hostShown/
+// dragCx… 各来一遍），于是"抽出来时漏一处"就漏出一次观感问题：backKey 漏 fade
+// （拖动不糊）、shiftTo 漏带状重绘（贴边一条亮线）、投影漏 hostShown 门控
+// （关掉后留空框）、投影 z 带没跟宿主（空心框）。现在这些结构上不可能再分叉。
+//
+// 磨砂图仍然是"屏幕坐标系"的整屏图，窗口只是从上面取一块：取景基准、明暗判定、
+// 桌面兜底色、边框色、DPI 缩放、圆角半径全是应用级共享的，所以子窗和面板看到的
+// 就是同一块玻璃。
 type subGlass struct {
 	app  *application
 	win  *mygo.Window
 	name string
 
-	back   *ui.Bitmap // 本窗的整窗底图（圆角覆盖率 + 边框 + 逐像素 alpha）
-	pix    *image.RGBA
-	pw     int
-	ph     int
-	key    backKey
-	keySet bool
-
-	shadow *win.Shadow // 本窗的自绘投影层（layered 窗口，垫在窗口底下）
-
-	// visible 是"这个窗口现在该不该出现在屏幕上"。
+	// pane 是与启动面板**同一个类型**的玻璃状态（pane.go 的 paneState）：
+	// 底图、合成缓冲、形状键、取景原点、投影层、visible/hostShown 全在里面，
+	// 刷新与投影的实现也只有那一份。
 	//
-	// 不能问系统的 IsWindowVisible：noRedirect 窗口上它会撒谎（实测一直报 false）。
-	// 而这个标志决定投影层能不能上屏 —— 投影层是**独立的 layered 窗口**，宿主窗口
-	// 藏着的时候它照样能显示：没有这道门，启动时两个隐藏的子窗就会各闪出一个
-	// "只有边框和投影的空框"。由 show()/hide() 维护。
-	visible bool
-
-	// hostShown 记的是系统那边的事实：顶层窗口收到 WM_SHOWWINDOW(SW_HIDE/SW_SHOW)。
-	//
-	// visible 是"应用想让它显示"，hostShown 是"它真的在屏上"。两者分开是因为
-	// 隐藏窗口不一定走 hide()：mygo 自己收窗口、系统恢复、Alt+F4 都会绕过去。
-	// 一旦 visible 还停在 true 而窗口其实已经藏了，投影层就会被人重新画到屏幕上 ——
-	// 用户看到的就是"关掉之后桌面上留着一个带阴影的空框"。见 subfollow.go 的
-	// WM_SHOWWINDOW 处理，那里会把这两个标志一起收拾掉。
-	hostShown bool
+	// 这里只留子窗真正独有的东西：干净快照的时机、WM_MOVE 跟随、表面拖动、
+	// 挂载重试计数。以前这一整块状态是 second copy（pix/pw/ph/key/keySet/shadow/
+	// visible/hostShown/dragCx…），抽的时候漏一处就漏出一次观感问题。
+	pane paneState
 
 	// needCleanSnap 表示下一次 refresh 要先抓一张"不含自家窗口"的桌面快照。
 	// 抓的时候把启动面板设成 WDA_EXCLUDEFROMCAPTURE，底片里才不会印着它。
@@ -67,23 +52,37 @@ type subGlass struct {
 
 	// dragRetry 是"还没挂上，隔一拍再试"的剩余次数（surface 建得比 Show 晚）。
 	dragRetry int
-
-	// dragCx/dragCy 是这张底图对应的窗口屏幕位置（左上角）。拖动时只按差值
-	// 把内容整体平移，不整张重烘 —— 主面板就是靠这一手做到跟手的（见
-	// backing.go 的 refreshBackingFor：shiftPix + 只重算四条带，1~2ms）。
-	dragCx, dragCy int
 }
 
 // newSubGlass 给一个已建好的窗口配一份玻璃（含阴影层）。
 // 必须在窗口创建之后调：阴影层要窗口句柄才能定位。
 func (a *application) newSubGlass(w *mygo.Window, name string) *subGlass {
 	g := &subGlass{app: a, win: w, name: name, dragRetry: 8}
-	g.shadow = win.NewShadow()
+	g.pane = paneState{ap: a, name: name, win: w, shadow: win.NewShadow()}
+	// 子窗和面板的两处差异，只有这两个回调不一样：
+	//   · gate：这个窗该不该在屏上（visible 是"想显示"，hostShown 是"系统那边确实显示着"）
+	//   · spec：投影位图怎么给参数 —— 子窗只要窗口外那一圈投影，角和弧都在底图里
+	g.pane.gate = func() bool { return g.pane.visible && g.pane.hostShown }
+	g.pane.spec = func(hwnd uintptr, x, y, w, h, r int) win.ShadowSpec {
+		gl := a.pickGlassColors(x, y, w, h)
+		return win.ShadowSpec{
+			X: x, Y: y, W: w, H: h,
+			Radius:       r,
+			Margin:       a.shadowMargin(),
+			Desk:         uint32(a.deskColor.R)<<16 | uint32(a.deskColor.G)<<8 | uint32(a.deskColor.B),
+			Glass:        gl[0],
+			GlassCorners: [4]uint32{gl[0], gl[1], gl[2], gl[3]},
+			EdgeGlass:    a.pickEdgeGlass(x, y, w, h),
+			BorderW:      0,
+			// 弧和弧外都在底图里，这一层只负责窗口外那一圈投影。
+			SkipPatch: true,
+		}
+	}
 	return g
 }
 
 // bitmap 返回这一帧该铺的底图（还没烘过就是 nil）。
-func (g *subGlass) bitmap() *ui.Bitmap { return g.back }
+func (g *subGlass) bitmap() *ui.Bitmap { return g.pane.bitmap() }
 
 // ensureFrost 保证应用级那份磨砂图（frostSmall）是有的。
 //
@@ -131,81 +130,35 @@ func (g *subGlass) refresh(force bool) {
 		a.pickDeskColor(nil)
 		force = true
 	}
-	s := a.glassScale()
-	r := int(math.Round(float64(glassRadius) * float64(s)))
-	// key 必须和面板那份（backing.go 的 refreshBackingFor）**逐字段一样**：
-	// 少一个字段就意味着"那个条件变了却还吃着旧图"。抽出来的时候漏了 fade，
-	// 于是拖动糊化开关切了也不重烘 —— 用户看到的就是"拖动时背景没变模糊"。
-	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark, fade: a.dragFade}
-	if !force && g.keySet && g.key == k {
-		return
-	}
-	pw, ph := w+2*backingPad, h+2*backingPad
-	t0 := time.Now()
-	pix := a.composeBackingInto(g.pix, cx, cy, pw, ph, r, backingPad, image.Rectangle{})
-	if pix == nil {
-		return
-	}
-	g.pix = pix
-	if g.back != nil && g.pw == pw && g.ph == ph {
-		g.back.Update(pix)
-	} else {
-		g.back = ui.NewBitmap(pix)
-	}
-	g.pw, g.ph = pw, ph
-	g.key = k
-	g.keySet = true
-	g.dragCx, g.dragCy = cx, cy
-	if d := time.Since(t0); d > 8*time.Millisecond {
-		log.Printf("玻璃: %s 底图 %.1fms（%dx%d）", g.name, float64(d.Microseconds())/1000, w, h)
-	}
+	// 剩下的全交给共享实现（pane.go 的 bakeAt）：形状键、平移快路径、四条带、
+	// 还原缓冲、日志。子窗不节流（throttle=0）。
+	g.pane.bakeAt(cx, cy, force, 0)
 }
 
 // shiftTo 把底图按 (cx,cy) 相对上次的位置整体平移。
 //
 // 这是主面板拖动跟手的关键手法：底图里每个像素记的是它对应的屏幕位置，窗口
 // 挪 (dx,dy)，就把像素按 (dx,dy) 搬一遍 —— 1~2ms，比整张重烘（8~10ms）便宜
-// 一个量级。拖动中玻璃是糊透的，贴边那一条没补也看不出来；松手时再整张重烘
-// 一次就精确了。
+// 一个量级。一次挪太远、或者形状键变了（比如拖动糊化开关切换），共享实现自己
+// 会退回整张重烘。
 func (g *subGlass) shiftTo(cx, cy int) {
-	if g.pix == nil || g.back == nil {
-		return
-	}
-	dx, dy := cx-g.dragCx, cy-g.dragCy
-	if dx == 0 && dy == 0 {
-		return
-	}
-	pw, ph := g.pix.Rect.Dx(), g.pix.Rect.Dy()
-	// 一次挪太多（比如窗口被程序直接摆到别处）就别省了，整张重烘。
-	if dx < -(pw*2/5) || dx > pw*2/5 || dy < -(ph*2/5) || dy > ph*2/5 {
-		g.refresh(true)
-		return
-	}
-	s := g.app.glassScale()
-	r := int(math.Round(float64(glassRadius) * float64(s)))
-	shiftPix(g.pix, dx, dy)
-	// 平移之后**必须**补那四条带和四角：见 backing.go 的 repaintBandsInto。
-	// 面板一直这么做，子窗抽出来时漏了 —— 漏了之后贴边那一圈仍是旧坐标的像素
-	// （抗锯齿过渡、边框环、弧外 alpha=0），压在深色桌面上是一条会跟着窗口跑的亮线。
-	g.pix = g.app.repaintBandsInto(g.pix, cx, cy, pw, ph, r, backingPad, dx, dy)
-	g.dragCx, g.dragCy = cx, cy
-	g.back.Update(g.pix)
+	g.pane.bakeAt(cx, cy, false, 0)
 }
 
 // drawBitmap 把底图铺满客户区（按物理像素 1:1，和面板同一套摆法）。
 func (g *subGlass) drawBitmap(c *ui.Context) {
-	if g.back == nil || g.pw <= 0 || g.ph <= 0 {
+	if g.pane.back == nil || g.pane.pw <= 0 || g.pane.ph <= 0 {
 		return
 	}
 	s := g.app.glassScale()
 	pad := 1 / s
-	ui.Image(c, g.back).Absolute().Left(-pad).Top(-pad).
-		Size(float32(g.pw)/s, float32(g.ph)/s)
+	ui.Image(c, g.pane.back).Absolute().Left(-pad).Top(-pad).
+		Size(float32(g.pane.pw)/s, float32(g.pane.ph)/s)
 }
 
 // shadowShown 报投影层当前是不是已经在屏上（view 里用来判断要不要补一次）。
 func (g *subGlass) shadowShown() bool {
-	return g.shadow != nil && g.shadow.Shown()
+	return g.pane.shadowShown()
 }
 
 // dipSize 返回客户区的 DIP 尺寸（内容层铺开和裁圆角都用它）。
@@ -223,10 +176,10 @@ func (g *subGlass) dipSize() (float32, float32) {
 
 // show 标记"这个窗口要上屏了"：投影层这时才允许显示。
 func (g *subGlass) show() {
-	g.visible = true
+	g.pane.visible = true
 	// 顶层窗口马上要 Show 了；先按"已显示"记上，随后的 WM_SHOWWINDOW 会以系统为准
 	// 校一次（万一 Show 没生效，那条消息会把这里改回 false）。
-	g.hostShown = true
+	g.pane.hostShown = true
 	// 下一次 refresh 顺便抓一张**干净**的桌面快照（抓的时候把启动面板设成
 	// "捕获不可见"）。否则底片里会印着启动面板自己 —— 用户看到的就是
 	// "背后明明是我的桌面，玻璃里却是启动面板"。
@@ -243,7 +196,7 @@ func (g *subGlass) show() {
 
 // hide 标记"窗口收起来了"：投影层必须一起收，否则它会自己留在屏幕上。
 func (g *subGlass) hide() {
-	g.visible = false
+	g.pane.visible = false
 	// 拖动状态必须一并清掉：SetCapture 还攥着、active 还是 true 的话，用户
 	// 下次打开这个窗，所有按下都被当成"继续拖"，点击全被吞 —— 表现就是
 	// "面板打开了，关闭按钮点不动"。
@@ -256,7 +209,7 @@ func (g *subGlass) hide() {
 	// 还留着一个空框"（第二次打开再关就正常了）。
 	if g.win != nil {
 		time.AfterFunc(120*time.Millisecond, func() {
-			if !g.visible {
+			if !g.pane.visible {
 				g.hideShadow()
 			}
 		})
@@ -265,76 +218,26 @@ func (g *subGlass) hide() {
 
 // refreshShadow 让投影层按当前窗口位置尺寸重画一次并显示。
 func (g *subGlass) refreshShadow() {
-	a := g.app
-	if g.shadow == nil || g.win == nil {
-		return
-	}
-	// 窗口还没（或已经不再）在屏幕上：投影层不许露面。见 visible / hostShown 的注释。
-	if !g.visible || !g.hostShown {
-		g.shadow.Hide()
+	if g.pane.shadow == nil || g.win == nil {
 		return
 	}
 	// 句柄这时肯定有了：顺手把两个子类化挂上（都幂等）。
 	installShadowFollower(g.win, g)
 	installSubDrag(g.win, g)
-	hwnd := g.win.NativeHandle()
-	if hwnd == 0 {
-		return
-	}
-	x, y, w, h := win.WindowRectPixels(hwnd)
-	if w <= 0 || h <= 0 {
-		return
-	}
-	if !a.shadowEnabled() {
-		g.shadow.Hide()
-		return
-	}
-	s := a.glassScale()
-	r := int(math.Round(float64(glassRadius) * float64(s)))
-	gl := a.pickGlassColors(x, y, w, h)
-	desk := uint32(a.deskColor.R)<<16 | uint32(a.deskColor.G)<<8 | uint32(a.deskColor.B)
-	ok := g.shadow.Place(hwnd, win.ShadowSpec{
-		X: x, Y: y, W: w, H: h,
-		Radius:       r,
-		Margin:       a.shadowMargin(),
-		Desk:         desk,
-		Glass:        gl[0],
-		GlassCorners: [4]uint32{gl[0], gl[1], gl[2], gl[3]},
-		EdgeGlass:    a.pickEdgeGlass(x, y, w, h),
-		BorderW:      0,
-		// 弧和弧外都在底图里，这一层只负责窗口外那一圈投影。
-		SkipPatch: true,
-	})
-	if !ok {
+	// 门控（visible && hostShown）、投影关掉时收起、Place 参数、Show —— 全在共享实现里。
+	// 子窗和面板的差别只有 spec 回调（这里只要窗口外那一圈投影）。
+	placed, attempted := g.pane.placeShadow()
+	if attempted && !placed {
 		log.Printf("阴影: %s 图层布局失败", g.name)
 	}
-	g.shadow.Show()
 }
 
 // hideShadow 收起投影层（窗口藏起来或正在缩放时）。
 func (g *subGlass) hideShadow() {
-	if g.shadow != nil {
-		g.shadow.Hide()
-	}
+	g.pane.hideShadow()
 }
 
 // followShadow 窗口只是挪了位置：只挪投影层，不重画位图。
 func (g *subGlass) followShadow() {
-	if g.shadow == nil || g.win == nil {
-		return
-	}
-	// 窗口已经不在了就别跟着挪 —— 投影层是独立窗口，挪过去就是一块没人认领的空框。
-	if !g.visible || !g.hostShown {
-		g.shadow.Hide()
-		return
-	}
-	if !g.shadow.Shown() {
-		return
-	}
-	hwnd := g.win.NativeHandle()
-	if hwnd == 0 {
-		return
-	}
-	x, y, _, _ := win.WindowRectPixels(hwnd)
-	g.shadow.Nudge(x, y, int(math.Round(float64(win.ShadowMargin)*float64(g.app.glassScale()))))
+	g.pane.followShadow(true)
 }

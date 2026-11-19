@@ -20,8 +20,6 @@ package main
 
 import (
 	"image"
-	"image/png"
-	"log"
 	"math"
 	"os"
 	"time"
@@ -122,10 +120,10 @@ var glassFallback = [3]uint8{247, 248, 252}
 // 颜色跟着桌面明暗走（亮桌面铺白、暗桌面铺深灰，取 glassFallback），否则
 // 暗色壁纸上一拖就闪出一块白板。
 func (a *application) dragWhiteBitmap() *ui.Bitmap {
-	if a.backPix == nil {
+	if a.pane.pix == nil {
 		return nil
 	}
-	cw, ch := a.backPix.Rect.Dx(), a.backPix.Rect.Dy()
+	cw, ch := a.pane.pix.Rect.Dx(), a.pane.pix.Rect.Dy()
 	r := float64(int(math.Round(float64(glassRadius) * float64(a.glassScale()))))
 	if a.dragWhite != nil && a.dragWhiteW == cw && a.dragWhiteH == ch &&
 		a.dragWhiteR == r && a.dragWhiteDark == a.deskDark {
@@ -232,97 +230,10 @@ func (a *application) refreshBackingFor(cx, cy int, force bool) {
 	if !bakedPanel || a.frost == nil || a.panel == nil {
 		return
 	}
-	hwnd := a.panel.NativeHandle()
-	if hwnd == 0 {
-		return
-	}
-	_, _, w, h := win.ClientRectPixels(hwnd)
-	if w <= 0 || h <= 0 {
-		return
-	}
-	s := a.glassScale()
-	r := int(math.Round(float64(glassRadius) * float64(s)))
-	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen, dark: a.deskDark, fade: a.dragFade}
-
-	// 形状没变、只是窗口挪了地方：**不整张重烘**，把内容整体平移到位就行。
-	//
-	// 这是拖动跟手的关键。磨砂图和桌面快照都是"整屏固定"的图，底图里每个像素
-	// 记的是它对应的屏幕位置；窗口挪 (dx,dy)，就把旧图的像素按 (dx,dy) 搬一遍，
-	// 每个像素照样落在正确的桌面位置上 —— 除了贴着窗边的那一圈：形状边界的
-	// 覆盖率、弧外那段 alpha=0、边框环，都要按新坐标重算。
-	// 所以每帧只重算四条带（约 11 万像素，整张是 74 万），1~2ms；整张重烘要 8~10ms。
-	if a.back != nil && a.backKeySet && a.backKeyVal == k && a.backPix != nil {
-		dx, dy := cx-a.backCx, cy-a.backCy
-		if dx == 0 && dy == 0 {
-			return
-		}
-		pw0, ph0 := a.backPix.Rect.Dx(), a.backPix.Rect.Dy()
-		band := r + 4
-		// 位移超过四成尺寸时，重算面积跟整张差不多，直接走整张。
-		if dx > -(pw0*2/5) && dx < pw0*2/5 && dy > -(ph0*2/5) && dy < ph0*2/5 {
-			t0 := time.Now()
-			shiftPix(a.backPix, dx, dy)
-			t1 := time.Now()
-			a.repaintBackingBands(cx, cy, pw0, ph0, r, band, dx, dy)
-			t2 := time.Now()
-			a.backCx, a.backCy = cx, cy
-			a.back.Update(a.backPix)
-			t3 := time.Now()
-			if backTime {
-				log.Printf("玻璃: 平移 shift %.2fms rebake %.2fms update %.2fms（%+d,%+d）",
-					float64(t1.Sub(t0).Microseconds())/1000,
-					float64(t2.Sub(t1).Microseconds())/1000,
-					float64(t3.Sub(t2).Microseconds())/1000, dx, dy)
-			}
-			if d := time.Since(t0); d > 8*time.Millisecond {
-				log.Printf("玻璃: 底图平移 %.1fms（%+d,%+d）",
-					float64(d.Microseconds())/1000, dx, dy)
-			}
-			return
-		}
-	}
-	if !force {
-		now := time.Now()
-		if !a.lastBackAt.IsZero() && now.Sub(a.lastBackAt) < backingThrottle {
-			return
-		}
-	}
-	a.lastBackAt = time.Now()
-
-	// 四周各多烘 1 个物理像素（backingPad），再把这张图整个往外铺 1 像素：
-	// mygo 把这张图摆下来的时候会带零点几像素的取整偏差 —— 客户区最上面那一行
-	// 曾经就整行没被盖住，露的是 mygo 清屏的纯白（BAOZI_ROWPROBE=1 的探针实测：
-	// 图往外铺一像素后，屏幕第 0 行才轮到图自己的第 1 行）。多烘一圈、外面再
-	// 压一像素，无论它往上还是往下取整，客户区都被图盖满，不会再露白。
-	// 四个角只有一个来源：这张图。弧外的 alpha=0 由 DWM 透出真背景，
-	// 弧上是覆盖率相加，没有第二层来跟它打架。
-	pw, ph := w+2*backingPad, h+2*backingPad
-	t0 := time.Now()
-	pix := a.composeBacking(cx, cy, pw, ph, r, backingPad, image.Rectangle{})
-	if pix == nil {
-		return
-	}
-	if a.back != nil && a.backPixW == pw && a.backPixH == ph {
-		a.back.Update(pix)
-	} else {
-		a.back = ui.NewBitmap(pix)
-		a.backPixW, a.backPixH = pw, ph
-	}
-	a.backCx, a.backCy = cx, cy
-	a.backKeySet = true
-	a.backKeyVal = k
-	if d := time.Since(t0); d > 8*time.Millisecond {
-		log.Printf("玻璃: 底图 %.1fms（%dx%d）", float64(d.Microseconds())/1000, w, h)
-	}
-	// 诊断：把这一帧烘好的底图导成 PNG（面板是 noRedirect 合成的，屏幕截图
-	// 会被别的窗口干扰，量弧的覆盖率只能看这份原始数据）。
-	//   BAOZI_BACKDUMP=<路径>  每次重烘覆盖一次
-	if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
-		if f, err := os.Create(p); err == nil {
-			_ = png.Encode(f, pix)
-			_ = f.Close()
-		}
-	}
+	// 面板这块玻璃和设置窗、文件互传窗走**同一个**实现（pane.go 的 bakeAt）：
+	// 形状键、增量平移、四条带重算、还原缓冲、节流全在那一份里。
+	// 面板只是把节流给成 backingThrottle，子窗那边给 0。
+	a.pane.bakeAt(cx, cy, force, backingThrottle)
 }
 
 // shiftPix 把底图里的内容整体挪 (dx,dy)：窗口往右下挪 dx,dy，底图里的内容
@@ -374,7 +285,7 @@ func shiftPix(img *image.RGBA, dx, dy int) {
 // 单独补。整张是 74 万像素，这里约 4~5 万，一次平移 2ms 上下。
 func (a *application) repaintBackingBands(cx, cy, cw, ch, r, band, dx, dy int) {
 	_ = band
-	a.backPix = a.repaintBandsInto(a.backPix, cx, cy, cw, ch, r, backingPad, dx, dy)
+	a.pane.pix = a.repaintBandsInto(a.pane.pix, cx, cy, cw, ch, r, backingPad, dx, dy)
 }
 
 // repaintBandsInto 同上，但把结果写回**指定**那张底图（子窗的 g.pix）。
@@ -417,10 +328,10 @@ func (a *application) repaintBandsInto(dst *image.RGBA, cx, cy, cw, ch, r, inset
 // composeBacking 返回客户区大小的位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
 // cw/ch 是**含内边距**的尺寸，inset 是四周多出来的物理像素数（backingPad），
 // 形状本身仍然铺在 [inset, inset+cw-2inset] 这一段，也就是客户的真实范围。
-// composeBacking 把底图合成到 a.backPix（主面板专用的复用缓冲）。
+// composeBacking 把底图合成到 a.pane.pix（主面板专用的复用缓冲）。
 func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.Rectangle) *image.RGBA {
-	pix := a.composeBackingInto(a.backPix, cx, cy, cw, ch, r, inset, region)
-	a.backPix = pix
+	pix := a.composeBackingInto(a.pane.pix, cx, cy, cw, ch, r, inset, region)
+	a.pane.pix = pix
 	return pix
 }
 

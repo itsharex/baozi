@@ -119,15 +119,15 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 		// 却点不动关闭"。
 		if f.glass != nil {
 			if wparam == 0 {
-				f.glass.hostShown = false
-				f.glass.visible = false
+				f.glass.pane.hostShown = false
+				f.glass.pane.visible = false
 				f.glass.hideShadow()
 				if f.glass.drag != nil {
 					f.glass.drag.cancel()
 				}
 				log.Printf("子窗: %s 已隐藏（投影/拖动状态一并收起）", f.glass.name)
 			} else {
-				f.glass.hostShown = true
+				f.glass.pane.hostShown = true
 			}
 		}
 	case wmEnterSizeMove:

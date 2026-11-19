@@ -177,21 +177,14 @@ type application struct {
 	// 半分辨率（2560×1440 → 1280×720，3.7 MB）够用：那块本身就在阴影下面，糊一点看不出来。
 	deskHalf                           *image.RGBA
 	deskHalfX, deskHalfY, deskHalfStep int
-	// back 是"整窗自绘底图"：客户区大小的一张不透明位图，桌面 + 玻璃 + 边框
-	// 按覆盖率相加而成，面板四角的抗锯齿就是它给的（见 backing.go）。
-	// 没有它就没有圆角 —— 铺满整个客户区，不裁、不留透明。
-	back       *ui.Bitmap
-	backPix    *image.RGBA // 复用的合成缓冲，避免每帧 New 一兆多
-	backPixW   int
-	backPixH   int
-	backKeySet bool
-	backKeyVal backKey
-	// backCx/backCy 是这张底图"取景"时客户区左上角的屏幕坐标。窗口只是挪了地方
-	// （拖动面板）时，底图不重烘，只把内容平移 (cx-backCx, cy-backCy) ——
-	// 磨砂图和桌面快照都是整屏固定的，平移之后每个像素照样落在正确的桌面上。
-	backCx, backCy int
-	// lastBackAt 是上一次合成底图的时刻（节流用，见 backingThrottle）。
-	lastBackAt time.Time
+	// pane 是面板这块玻璃的共享状态：底图（整窗自绘那张，桌面 + 玻璃 + 边框按
+	// 覆盖率相加，四角的抗锯齿就是它给的）、合成缓冲、形状键、取景原点、投影层。
+	//
+	// 它和设置窗、文件互传窗用的是**同一个类型**（pane.go 的 paneState）——
+	// 以前这三块各有一份状态、各写一套刷新，抽的时候漏一处就出一次观感问题。
+	// 现在底图与投影的算法只有一份，面板独有的东西（四角月牙、边框弧色、
+	// 整屏磨砂图、区域、动画）留在 application 上。
+	pane paneState
 	// screenGen 每次重新抓屏 +1：底图依赖快照内容，快照一换就必须重合成。
 	screenGen int
 	// cornerBitmaps 是四角那四张"月牙"位图，cornerPx 是它们的边长（物理像素）。
@@ -270,8 +263,7 @@ type application struct {
 	deskDark bool
 	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
 	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
-	// internal/win/shadow.go）。
-	shadow *win.Shadow
+	// internal/win/shadow.go）。投影层随玻璃状态走，已并入 a.pane.shadow。
 	// borderColor 是最后一帧用的面板边线色，四角月牙要把这条边一起画进去
 	// （mygo 画边框的圆角段没有抗锯齿，那正是四角台阶的第二个来源）。
 	borderColor ui.Color
@@ -699,7 +691,7 @@ func (a *application) view(c *ui.Context) {
 			if bakedPanel {
 				// 底图和客户区同尺寸，1:1 落在 (0,0)，不缩放、不偏移 —— 圆角位置
 				// 就是窗口位置，拖动/缩放时只要重新合成一张，弧永远贴着窗边。
-				if a.back != nil {
+				if a.pane.back != nil {
 					s := a.glassScale()
 					// **按像素 1:1 铺**，一个像素都不缩：底图是 963×771 张物理像素，
 					// 就用 963/scale DIP 去画 —— mygo 再乘回 scale 正好是 963 格，
@@ -711,20 +703,20 @@ func (a *application) view(c *ui.Context) {
 					// 用户说的"毛边/虚"有一半是这个。右边那条白改为：底图按客户区
 					// 的**整数物理像素**尺寸合成（composeBacking 用的是 ClientRectPixels），
 					// 画回去时又正好是同一批整数像素，右边/下边一格都不缺。
-					dip := float32(a.backPixW) / s
-					dipH := float32(a.backPixH) / s
+					dip := float32(a.pane.pw) / s
+					dipH := float32(a.pane.ph) / s
 					// 往外压一个物理像素：底图四周多烘了一圈（backingPad=1，见
 					// refreshBacking），形状本身还在客户区里。mygo 摆放这张图时会
 					// 带零点几像素的取整偏差 —— 客户区最上面那一行曾整行没被盖住，
 					// 露的是 mygo 清屏的纯白（BAOZI_ROWPROBE 探针实测）。多出来的
 					// 这一圈当余量，上下左右无论往哪边取整都盖得住。
 					pad := 1 / s
-					ui.Image(c, a.back).Absolute().Left(-pad).Top(-pad).
+					ui.Image(c, a.pane.back).Absolute().Left(-pad).Top(-pad).
 						Size(dip, dipH)
 					if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
 						pw, ph := a.panelSize()
 						log.Printf("玻璃: 底图铺开 %dx%d px → %.2fx%.2f DIP（面板 %dx%d DIP，scale %.2f）",
-							a.backPixW, a.backPixH, dip, dipH, pw, ph, s)
+							a.pane.pw, a.pane.ph, dip, dipH, pw, ph, s)
 					}
 				}
 			} else {
@@ -2583,9 +2575,13 @@ func (a *application) applyAppearanceNow() {
 
 func (a *application) ready() {
 	a.icons = map[string]*ui.Bitmap{}
+	// 面板这块玻璃的共享状态。name 留空：日志保持原来的 "玻璃: 底图 …" 字样
+	// （子窗那边是 "玻璃: 设置 底图 …"）。gate 是 nil —— 面板不靠 visible/hostShown
+	// 门控投影，它的开关是 panelUp 和 hidePanel 里的显式调用。
+	a.pane = paneState{ap: a, spec: a.panelShadowSpec}
 	// 阴影层先建好（隐藏状态）。放在最前面：后面的窗口初始化里不会用到它，
 	// 但唤出时一定要有，晚建的话第一帧就没影。
-	a.shadow = win.NewShadow()
+	a.pane.shadow = win.NewShadow()
 	// 显示器缩放只能在 mygo 起来之后问（App 初始化前调 Screen.Displays 会 panic），
 	// 所以放这里算一次缓存住，视图里不再现问。
 	a.scale = screenScale()
@@ -2618,6 +2614,8 @@ func (a *application) ready() {
 		MinHeight:    config.MinPanelHeight,
 		Content:      ui.View(a.view),
 	})
+	// 面板窗口交到玻璃状态手里：paneState 之后所有"客户区/窗口矩形"都从这里取。
+	a.pane.win = a.panel
 	// 用户拖着面板边缘改大小：停手 800ms 后把尺寸写进 config.json，
 	// 下次启动按这个尺寸建窗。不用 mygo 的 StateKey——那个只在窗口真正关闭时落盘，
 	// 而 Baozi 平时"关闭"只是隐藏（OnClose 里 PreventDefault），记不住。
