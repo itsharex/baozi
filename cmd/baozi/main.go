@@ -247,10 +247,14 @@ type application struct {
 	uiTick     atomic.Int64
 	dragUntil  atomic.Int64
 	hangDumped atomic.Bool
-	// dragFade 是"拖动中把玻璃糊化"的开关（见 glass.go 的 setDragFade）。
-	// 面板挪动和内容提交分属相邻两帧，那一帧的相对位移在快拖时十几像素；
-	// 糊成色块之后没有细节可比，错位就不见了，松手立刻恢复清晰。
+	// dragFade 是"拖动中把面板变成不透明白"的开关（见 glass.go 的 setDragFade
+	// 与 backing.go 的 dragWhiteBitmap）。面板挪动和内容提交分属相邻两帧，
+	// 那一帧的相对位移在快拖时有十几像素；面板里没有桌面细节可比就不见了。
 	dragFade bool
+	// dragWhite 是拖动时盖上去的那张白面板（缓存的纹理，尺寸/半径变了才重建）。
+	dragWhite              *ui.Bitmap
+	dragWhiteW, dragWhiteH int
+	dragWhiteR             float64
 	// redrawNext 是"拖动时自己推一帧上屏"的节流点（见 OnMove 里的 win.RedrawNow）。
 	// 拖动走系统模态循环，帧请求在那儿排队，光算完底图屏幕不会变。
 	redrawNext atomic.Int64
@@ -705,6 +709,14 @@ func (a *application) view(c *ui.Context) {
 					pad := 1 / s
 					ui.Image(c, a.back).Absolute().Left(-pad).Top(-pad).
 						Size(dip, dipH)
+					// 拖动中：同一位置、同一形状再压一张不透明白面板，把玻璃里的
+					// 桌面细节整个盖掉（见 dragWhiteBitmap 的说明）。
+					if a.dragFade {
+						if w := a.dragWhiteBitmap(); w != nil {
+							ui.Image(c, w).Absolute().Left(-pad).Top(-pad).
+								Size(float32(a.dragWhiteW)/s, float32(a.dragWhiteH)/s)
+						}
+					}
 					if p := os.Getenv("BAOZI_BACKDUMP"); p != "" {
 						pw, ph := a.panelSize()
 						log.Printf("玻璃: 底图铺开 %dx%d px → %.2fx%.2f DIP（面板 %dx%d DIP，scale %.2f）",

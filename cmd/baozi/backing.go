@@ -101,6 +101,51 @@ type roundRect struct {
 	hx, hy, r float64
 }
 
+// dragWhiteBitmap 是**拖动时**盖在玻璃上的那块白面板：形状和底图同一套圆角
+// 覆盖率（直边一致、弧上抗锯齿），内部纯白、外面全透明。
+//
+// 为什么要有它：面板挪动 (SetWindowPos) 和内容提交 (DComp commit) 分属相邻两帧，
+// 快速拖动时那一帧的相对位移有十几像素，眼睛靠"玻璃里的桌面细节"就能看出错位。
+// 拖动时把面板变成一块不透明的白，里面没有桌面可比，误差就看不见了 —— 这也是
+// Windows 自己拖动毛玻璃窗口时退化成纯色的同一个思路。
+func (a *application) dragWhiteBitmap() *ui.Bitmap {
+	if a.backPix == nil {
+		return nil
+	}
+	cw, ch := a.backPix.Rect.Dx(), a.backPix.Rect.Dy()
+	r := float64(int(math.Round(float64(glassRadius) * float64(a.glassScale()))))
+	if a.dragWhite != nil && a.dragWhiteW == cw && a.dragWhiteH == ch && a.dragWhiteR == r {
+		return a.dragWhite
+	}
+	rr := newRoundRect(cw, ch, backingPad, r)
+	img := image.NewRGBA(image.Rect(0, 0, cw, ch))
+	hx, hy := float64(cw)/2, float64(ch)/2
+	for y := 0; y < ch; y++ {
+		row := img.Pix[y*img.Stride:]
+		py := float64(y) + 0.5 - hy
+		for x := 0; x < cw; x++ {
+			// 一像素宽的覆盖率过渡带：和底图的弧用的是同一个 sd，切点不会错开。
+			c := 0.5 - rr.sd(float64(x)+0.5-hx, py)
+			if c <= 0 {
+				continue
+			}
+			if c > 1 {
+				c = 1
+			}
+			i := x * 4
+			row[i], row[i+1], row[i+2] = 247, 248, 252
+			row[i+3] = uint8(c * 255)
+		}
+	}
+	if a.dragWhite != nil && a.dragWhiteW == cw && a.dragWhiteH == ch {
+		a.dragWhite.Update(img)
+	} else {
+		a.dragWhite = ui.NewBitmap(img)
+	}
+	a.dragWhiteW, a.dragWhiteH, a.dragWhiteR = cw, ch, r
+	return a.dragWhite
+}
+
 func newRoundRect(cw, ch, inset int, radius float64) roundRect {
 	w := float64(cw) - 2*float64(inset)
 	h := float64(ch) - 2*float64(inset)

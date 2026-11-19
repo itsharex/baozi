@@ -899,20 +899,8 @@ func (a *application) frostImage() *image.RGBA {
 		return nil
 	}
 	work := dupRGBA(a.frostBase)
-	blur := glassBlurRadius
-	alpha := glassTintAlpha
-	if a.dragFade {
-		// 拖动中把玻璃糊化并压浓：面板挪动 (SetWindowPos) 和内容提交 (DComp
-		// commit) 分属相邻两帧，那一帧的相对位移在快速拖动时是十几像素，
-		// 眼睛对"框走了、框里的画没跟上"极敏感。糊成色块之后就没有细节可比，
-		// 错位在视觉上消失，而窗口本身仍然是零延迟跟手的。松手立刻恢复清晰。
-		blur = glassBlurRadius*2 + 8
-		if alpha < 190 {
-			alpha = 190
-		}
-	}
-	work = win.Blur(work, blur, 3)
-	return win.Tint(work, 247, 248, 252, alpha)
+	work = win.Blur(work, glassBlurRadius, 3)
+	return win.Tint(work, 247, 248, 252, glassTintAlpha)
 }
 
 // rebuildFrost 用现有的底片重做一张磨砂图（改透明度、或拖动前后切换糊化）。
@@ -933,15 +921,11 @@ func (a *application) rebuildFrost() {
 	a.frost = ui.NewBitmap(small)
 }
 
-// setDragFade 切换"拖动中的糊化玻璃"。切换时重做磨砂图并整张重烘底图，
-// 只在拖动开始/结束各做一次（十毫秒级），拖动过程中每帧仍是平移底图。
+// setDragFade 开关"拖动中的白面板"。白面板是单独一张图（dragWhiteBitmap），
+// 画在底图**上面**，所以这里不需要重烘底图 —— 拖动开始/结束都只是翻一个标志，
+// 由 view 那一帧把它画上/撤掉。拖动中本来就不该有桌面细节可比。
 func (a *application) setDragFade(on bool) {
-	if a.dragFade == on {
-		return
-	}
 	a.dragFade = on
-	a.rebuildFrost()
-	a.refreshBacking(true)
 }
 
 // dupRGBA 拷一份图像。win.Blur / win.Tint 都是原地改，所以底片必须留一份原件，
