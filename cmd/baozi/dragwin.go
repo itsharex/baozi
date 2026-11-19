@@ -135,12 +135,30 @@ func (a *application) installSelfDrag(host uintptr) {
 	if host == 0 {
 		return
 	}
-	if a.selfDrag != nil && a.selfDrag.host == host {
+	if a.selfDrag != nil && a.selfDrag.host == host && a.selfDrag.hwnd != 0 {
 		return
 	}
 	target := findMyGoSurface(host)
 	if target == 0 {
-		target = host
+		// 子窗口还没建出来。mygo 的 MyGoSurface 是 Show 之后才 createWindow 的，
+		// 时序偶尔差一拍（实测有过一次：日志只留一句"子类化没挂上"，用户那边
+		// 就是"又拖不动了"）。
+		//
+		// 这里**不能**退到顶层窗口上挂：顶层收不到鼠标消息（第一条就是栽在这上面），
+		// 挂了也拖不动，还会把"再来一次"的机会吃掉。改成隔 50ms 再试几拍。
+		if a.dragRetryLeft > 0 && a.panel != nil {
+			a.dragRetryLeft--
+			time.AfterFunc(50*time.Millisecond, func() {
+				a.panel.Update(func() {
+					if h := a.panel.NativeHandle(); h != 0 {
+						a.installSelfDrag(h)
+					}
+				})
+			})
+			return
+		}
+		log.Printf("拖动: 找不到 MyGoSurface（host=%d），自绘拖动没挂上", host)
+		return
 	}
 	if a.selfDrag != nil && a.selfDrag.hwnd != 0 {
 		a.selfDrag.detach()
@@ -148,9 +166,16 @@ func (a *application) installSelfDrag(host uintptr) {
 	d := &selfDrag{app: a, host: host, hwnd: target}
 	d.tramp = windows.NewCallback(d.subclassProc)
 	if r, _, err := procSetSubclass.Call(target, d.tramp, dragSubclassID, 0); r == 0 {
-		log.Printf("拖动: 子类化没挂上（%v），退回系统拖动", err)
+		log.Printf("拖动: 子类化没挂上（%v），下一拍再试", err)
+		if a.dragRetryLeft > 0 && a.panel != nil {
+			a.dragRetryLeft--
+			time.AfterFunc(50*time.Millisecond, func() {
+				a.panel.Update(func() { a.installSelfDrag(host) })
+			})
+		}
 		return
 	}
+	a.dragRetryLeft = 8
 	a.selfDrag = d
 	log.Printf("拖动: 已接管（host=%d surface=%d，位移超过 %d 像素才真正开始拖）",
 		host, target, dragThreshold)

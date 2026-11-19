@@ -261,6 +261,9 @@ type application struct {
 	// selfDrag 是面板的自绘拖动（见 dragwin.go）。系统拖动先挪窗口、我们追内容，
 	// 快拖时差半帧看得出来；自己接管以后"先算内容、再挪窗口、再提交"，同一帧。
 	selfDrag *selfDrag
+	// dragRetryLeft 是"还没摸到 MyGoSurface 时还能再试几拍"的余量：mygo 的子窗口
+	// 是 Show 之后才建出来的，偶尔差一拍。每成功挂上一次就补满。
+	dragRetryLeft int
 	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
 	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
 	// internal/win/shadow.go）。
@@ -3280,7 +3283,7 @@ func main() {
 	// 常驻后台的小工具，堆不该按 GOGC=100 涨到活数据的两倍。
 	// 索引是只读的（整表替换），存活量基本恒定，压低 GOGC 只是用一点 CPU 换几百 MB。
 	debug.SetGCPercent(40)
-	app := &application{icons: map[string]*ui.Bitmap{}}
+	app := &application{icons: map[string]*ui.Bitmap{}, dragRetryLeft: 8}
 	setupLog()
 
 	cfg, cfgPath, err := config.Load()
