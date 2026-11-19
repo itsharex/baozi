@@ -65,8 +65,8 @@ func TestFRNFileRoundTrip(t *testing.T) {
 // 同名 FRN 在增量里被重指到新下标后，必须返回新的那个。
 func TestMutableBaseLookup(t *testing.T) {
 	m := NewFRNMap(1 << 10)
-	m.Set(101, 7)   // 基座：FRN 101 → 下标 7
-	m.Set(102, 8)   // 基座：FRN 102 → 下标 8
+	m.Set(101, 7) // 基座：FRN 101 → 下标 7
+	m.Set(102, 8) // 基座：FRN 102 → 下标 8
 	dir := t.TempDir()
 	path, err := SaveFRNFile(filepath.Join(dir, "index.frn"), m)
 	if err != nil {
