@@ -174,6 +174,16 @@ func (g *subGlass) show() {
 func (g *subGlass) hide() {
 	g.visible = false
 	g.hideShadow()
+	// 再补两拍：第一次关窗口时，宿主还没真正隐藏，投影层可能刚好压在
+	// win.Hide() 后面又被打了一次 Show —— 用户看到的就是"关掉之后桌面上
+	// 还留着一个空框"（第二次打开再关就正常了）。
+	if g.win != nil {
+		time.AfterFunc(120*time.Millisecond, func() {
+			if !g.visible {
+				g.hideShadow()
+			}
+		})
+	}
 }
 
 // refreshShadow 让投影层按当前窗口位置尺寸重画一次并显示。
