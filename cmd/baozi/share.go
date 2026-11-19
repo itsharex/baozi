@@ -119,7 +119,7 @@ func newShareWindow(a *application) *shareWindow {
 		}
 		e.PreventDefault()
 		if s.glass != nil {
-			s.glass.hideShadow()
+			s.glass.hide()
 		}
 		s.win.Hide()
 	})
@@ -142,6 +142,9 @@ func (s *shareWindow) show() {
 	// 每次打开都重新枚举网卡（用户可能刚插网线/连了 WiFi）。
 	s.labels, s.values = bindOptions()
 	// 不再一打开就开服务：分享是一次性的，要用户自己点「生成链接」。
+	if s.glass != nil {
+		s.glass.show()
+	}
 	s.win.Show()
 	s.win.Focus()
 	if s.glass != nil {
@@ -292,7 +295,7 @@ func (s *shareWindow) body(c *ui.Context, t *ui.Theme) {
 		if ui.Button(c, "✕ 关闭").Clicked() {
 			s.win.Hide()
 			if s.glass != nil {
-				s.glass.hideShadow()
+				s.glass.hide()
 			}
 		}
 	})

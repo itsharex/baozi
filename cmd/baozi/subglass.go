@@ -36,6 +36,14 @@ type subGlass struct {
 	keySet bool
 
 	shadow *win.Shadow // 本窗的自绘投影层（layered 窗口，垫在窗口底下）
+
+	// visible 是"这个窗口现在该不该出现在屏幕上"。
+	//
+	// 不能问系统的 IsWindowVisible：noRedirect 窗口上它会撒谎（实测一直报 false）。
+	// 而这个标志决定投影层能不能上屏 —— 投影层是**独立的 layered 窗口**，宿主窗口
+	// 藏着的时候它照样能显示：没有这道门，启动时两个隐藏的子窗就会各闪出一个
+	// "只有边框和投影的空框"。由 show()/hide() 维护。
+	visible bool
 }
 
 // newSubGlass 给一个已建好的窗口配一份玻璃（含阴影层）。
@@ -139,10 +147,26 @@ func (g *subGlass) dipSize() (float32, float32) {
 	return float32(w) / s, float32(h) / s
 }
 
+// show 标记"这个窗口要上屏了"：投影层这时才允许显示。
+func (g *subGlass) show() {
+	g.visible = true
+}
+
+// hide 标记"窗口收起来了"：投影层必须一起收，否则它会自己留在屏幕上。
+func (g *subGlass) hide() {
+	g.visible = false
+	g.hideShadow()
+}
+
 // refreshShadow 让投影层按当前窗口位置尺寸重画一次并显示。
 func (g *subGlass) refreshShadow() {
 	a := g.app
 	if g.shadow == nil || g.win == nil {
+		return
+	}
+	// 窗口还没（或已经不再）在屏幕上：投影层不许露面。见 visible 的注释。
+	if !g.visible {
+		g.shadow.Hide()
 		return
 	}
 	hwnd := g.win.NativeHandle()

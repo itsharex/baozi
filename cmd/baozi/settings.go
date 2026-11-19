@@ -133,7 +133,7 @@ func newSettingsWindow(a *application) *settingsWindow {
 		}
 		e.PreventDefault()
 		if s.glass != nil {
-			s.glass.hideShadow()
+			s.glass.hide()
 		}
 		s.win.Hide()
 	})
@@ -201,6 +201,10 @@ func (s *settingsWindow) load() {
 
 func (s *settingsWindow) show() {
 	s.load()
+	// 先放行投影层：Show() 之后视图那一帧就会补投影（见 view 的兜底）。
+	if s.glass != nil {
+		s.glass.show()
+	}
 	s.win.Show()
 	s.win.Focus()
 	// 先 Show 再烘底图：句柄和客户区尺寸只有显示之后才准（藏着的窗口 DWM 不给尺寸）。
@@ -299,7 +303,7 @@ func (s *settingsWindow) body(c *ui.Context, t *ui.Theme) {
 		if ui.Button(c, "✕ 关闭").Clicked() {
 			s.win.Hide()
 			if s.glass != nil {
-				s.glass.hideShadow()
+				s.glass.hide()
 			}
 		}
 	})
