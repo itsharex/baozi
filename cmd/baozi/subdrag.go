@@ -37,8 +37,9 @@ const (
 	// 顶栏右侧「✕ 关闭」占的宽度，DIP。这块要让给按钮。
 	subCloseAreaDip = 120
 
-	// 拖动中重烘底图的节流间隔。
-	subBakeInterval = 25 * time.Millisecond
+	// 拖动中重烘底图的节流间隔。整张 1150x1025 约 8ms，60Hz 的鼠标移动也就是
+	// 16ms 一帧 —— 12ms 能让背景基本跟着手走，又不至于把 UI 线程占满。
+	subBakeInterval = 12 * time.Millisecond
 
 	wmCaptureChanged = 0x0215
 
@@ -66,6 +67,10 @@ func installSubDrag(w *mygo.Window, g *subGlass) {
 		return
 	}
 	if g.drag != nil {
+		// 已经挂上了。每次重新挂一次，把自己提到子类化链的**最前面**：
+		// SetWindowSubclass 是后进先出，mygo 在渲染/重设时可能又挂了自己的那层，
+		// 挡在我们前面把按下吃掉（表现就是"我们的拖动根本没收到消息"）。
+		g.drag.rearm()
 		return
 	}
 	host := w.NativeHandle()
@@ -105,6 +110,15 @@ func (g *subGlass) retrySubDrag(w *mygo.Window) {
 	})
 }
 
+// rearm 把我们的子类化重新挂一次，保证它在链首（后注册先收到）。
+func (d *subDrag) rearm() {
+	if d.hwnd == 0 || d.tramp == 0 {
+		return
+	}
+	procDelSubclass.Call(d.hwnd, d.tramp, subDragSubclassID, 0)
+	procSetSubclass.Call(d.hwnd, d.tramp, subDragSubclassID, 0)
+}
+
 func abs32(v int32) int32 {
 	if v < 0 {
 		return -v
@@ -125,6 +139,8 @@ func (d *subDrag) begin() {
 	d.pending = true
 	d.active = false
 	procSetCapture.Call(d.hwnd)
+	log.Printf("子窗拖动: %s begin（光标 %d,%d 窗口 %d,%d）",
+		d.glass.name, d.startCurX, d.startCurY, d.startWinX, d.startWinY)
 }
 
 // inTopBar 判断这次按下是不是落在"顶栏空白区"（能当拖动把手的地方）。
@@ -184,6 +200,7 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 			}
 			d.active = true
 			procSetCapture.Call(d.hwnd)
+			log.Printf("子窗拖动: %s 开始移动", d.glass.name)
 		}
 		// 每帧确认捕获还在自己手上：窗口一挪，系统/别的路径就可能把它拿走，
 		// 拿走了就再也收不到 mousemove，拖动看着就是"动一下就停住"。
@@ -197,6 +214,11 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 			d.lastBake = time.Now()
 			d.glass.refresh(true)
 		}
+		// 关键的一步：把这一帧**真的推上屏**。主面板的 dragTo() 里也是这么做的
+		// （panel.FrameNow()）。少了它，窗口被 SetWindowPos 搬走、我们这边也把
+		// 底图烘好了，画面却还停在上一帧上 —— 用户看到的就是"拖动时背景根本
+		// 不动，要松开鼠标才变"，而且搬走的那块还是矩形（四个直角）。
+		d.win.FrameNow()
 		// 拖动中不要交给 mygo：它的 hover/点击逻辑会把光标当成"在顶栏上"。
 		return 0
 

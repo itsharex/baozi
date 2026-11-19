@@ -95,9 +95,13 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 			r, _, _ := procDefSubclass.Call(hwnd, msg, wparam, lparam, id, data)
 			return r
 		}
-		// 不是拖动（程序自己摆窗口、恢复位置）：按新位置重烘一次并跟上投影。
+		// 不是拖动（程序自己摆窗口、恢复位置）：按新位置重烘一次、跟上投影，
+		// 并且立刻推一帧上屏（不然窗口已经挪了，画面还停在原地）。
 		f.glass.refresh(true)
 		f.glass.followShadow()
+		if f.win != nil {
+			f.win.FrameNow()
+		}
 	case wmExitSizeMove:
 		f.drag = false
 		// 停手：底图按最终位置重烘一次，投影按新位置重画并显示。

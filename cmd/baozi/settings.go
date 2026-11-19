@@ -307,7 +307,9 @@ func (s *settingsWindow) view(c *ui.Context) {
 // "铺满客户区、裁圆角"的容器当 child 用。
 func (s *settingsWindow) body(c *ui.Context, t *ui.Theme) {
 	// 顶栏（整条都能拖动窗口：这一版没有系统标题栏，没有它就拿不走窗口）
-	ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).DragWindow().Children(func() {
+	// 不带 DragWindow()：那会让 mygo/系统去拖窗口，DWM 直接搬运自绘 alpha 的
+	// 表面 —— 四角立刻变直、玻璃也丢。拖动由 subdrag.go 自己接管（顶栏空白区）。
+	ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
 			ui.Text(c, "Baozi 设置").FontSize(20).Bold()
 			ui.Text(c, "改动保存后立即生效；配置文件在 "+s.app.cfgPath).FontSize(11).TextColor(t.TextMuted)

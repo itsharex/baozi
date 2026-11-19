@@ -289,7 +289,8 @@ func (s *shareWindow) view(c *ui.Context) {
 
 // body 是窗口的全部内容（顶栏 + 页签 + 内容 + 底栏）。
 func (s *shareWindow) body(c *ui.Context, t *ui.Theme) {
-	ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).DragWindow().Children(func() {
+	// 不带 DragWindow()：见 settings.go 同处的说明，拖动交给 subdrag.go。
+	ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Column(c).Grow(1).Gap(2).Children(func() {
 			ui.Text(c, "文件互传").FontSize(20).Bold()
 			if s.tab == 1 {
