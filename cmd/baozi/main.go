@@ -143,6 +143,10 @@ type application struct {
 	// 留着它只是为了在阴影层里取"玻璃本体颜色"：弧那一圈要用玻璃色和桌面色
 	// 做面积混合，两侧颜色都必须和邻居同源。
 	frostSmall *image.RGBA
+	// frostBase 是唤出时抓的那张"未模糊、未压白"的桌面底片。设置页改完透明度/
+	// 模糊要当场重做磨砂图，就得有这张干净的原件（Blur/Tint 都是原地改图）。
+	// 面板收起时随 frostSmall 一起放掉，省 230KB。
+	frostBase *image.RGBA
 	// screenW/H/X/Y 是整屏快照的尺寸与屏幕原点（物理像素），算取景偏移时要用。
 	screenW int
 	screenH int
@@ -2159,8 +2163,10 @@ func (a *application) hidePanel() {
 	a.hideShadow()
 	a.panel.Hide()
 	// 半分辨率整屏快照只在"面板开着"这段时间有用（四角弧外要按当前位置裁），
-	// 面板收起就放掉，3.7 MB 不占着常驻。
+	// 面板收起就放掉，3.7 MB 不占着常驻。磨砂底片同理（它只是缩略图，230KB，
+	// 但既然下一次唤出一定会重抓，就没必要留着）。
 	a.deskHalf = nil
+	a.frostBase = nil
 }
 
 // finishResize 是缩放停手后的一次收尾：重设圆角区域、重画四角月牙，最后把阴影
@@ -2455,12 +2461,12 @@ func (a *application) toggle() {
 }
 
 // applyAppearance 把配置里的外观项落到绘制时读的包级变量上：
-// 圆角决定底图/内容层弧/阴影层的形状，不透明度决定磨砂图上那层白有多浓，
+// 圆角决定底图/内容层弧/阴影层的形状，透明度决定磨砂图上那层白有多浓、糊得多厉害，
 // 投影强度决定阴影最深有多黑。
 //
-// 这些都是绘制时现读的量，所以改完不用重建窗口 —— 重烘一次底图、重画一次
-// 阴影层就够（见 settings.go 的保存流程）。磨砂图是"唤出那一刻抓屏做的"，
-// 不透明度要下一次唤出才看得见：重新抓屏那一刻才有桌面可抓，这是设计如此。
+// 这些都是绘制时现读的量，所以改完不用重建窗口 —— 重烘一次底图、重做一次磨砂图、
+// 重画一次阴影层就够（见 applyAppearanceNow）。唯一没法就地重做的是"抓屏"本身，
+// 所以调这些值不会让面板里的桌面内容变成新截取的那一刻。
 func applyAppearance(cfg *config.Config) {
 	if cfg == nil {
 		return
@@ -2472,25 +2478,48 @@ func applyAppearance(cfg *config.Config) {
 		// 直角时内容层不裁（Radius(0) 就是不要圆角）；让 1 DIP 的约定在 0 处失效。
 		glassClipRadius = 0
 	}
-	pct := cfg.GlassOpacityPct()
-	glassTintAlpha = uint8((pct*255 + 50) / 100) // 四舍五入，59% → 150
+	// 透明度 → 压白 alpha：0% 是实心 255（完全看不见桌面），59% ≈ 158（原来那套观感），
+	// 100% 到 90 为止 —— 这就是"禁止完全透明"：再薄面板就没有玻璃感、字也压不住。
+	pct := cfg.GlassTransparencyPct()
+	alpha := 255 - pct*165/100
+	if alpha < 90 {
+		alpha = 90
+	}
+	glassTintAlpha = uint8(alpha)
+	// 模糊跟着透明度走：越透糊得越轻（想看见桌面就该少糊一点）。59% 时还是 5，
+	// 0% 到 8，100% 到 3（2 是 Blur 的下限，再小就等于没模糊）。
+	blur := 5 + (config.DefaultGlassTransparency-pct)*5/100
+	if blur < 2 {
+		blur = 2
+	}
+	if blur > 8 {
+		blur = 8
+	}
+	glassBlurRadius = blur
 	// 投影强度百分比 → 黑度：100% 对应 0.6（再深就显脏，见 internal/win/shadow.go）。
 	win.SetShadowAlpha(float64(cfg.ShadowPct()) / 100 * 0.6)
+	// 一行把所有折算结果写出来：调外观时"到底生效了没有"不用猜，看日志就行。
+	log.Printf("外观: 圆角 %d DIP、透明度 %d%%（压白 alpha %d、模糊 %d）、投影 %d%%",
+		r, pct, glassTintAlpha, glassBlurRadius, cfg.ShadowPct())
 }
 
 // applyAppearanceNow 让设置页刚改的外观立刻在屏幕上成立：底图的弧/覆盖率按新
-// 半径重烘，内容层那条弧跟着重画，投影层按新强度重画。
+// 半径重烘，磨砂图按新透明度/模糊重做一张，内容层那条弧跟着重画，投影层按新强度重画。
 //
-// 磨砂图不重建：它得用"唤出那一刻的整屏快照"，而面板藏着的时候手边没有
-// （deskHalf 在 hidePanel 里就放掉了），下一次唤出自然按新不透明度做。
+// 磨砂图能就地重做，是因为唤出时留了一张没动过的桌面底片（a.frostBase）——
+// 老实现把它原地糊掉+压白了，所以只能等下次唤出重新抓屏，用户会觉得"点了保存
+// 却没反应"。面板藏着时（没有底片）就什么都不用做，下次唤出自然按新设置来。
 func (a *application) applyAppearanceNow() {
 	if a.panel == nil || !a.panelUp.Load() {
 		return
 	}
-	// 走主线程：refreshBacking 要造 GPU 纹理，和渲染线程同时碰 D3D 没保证。
+	// 走主线程：refreshBacking / Bitmap.Update 都要碰 GPU，和渲染线程同时搞 D3D 没保证。
 	mygo.RunOnMain(func() {
 		a.applyRoundRegion()
 		a.refreshBacking(true)
+		if img := a.frostImage(); img != nil && a.frost != nil {
+			a.frost.Update(img)
+		}
 		a.panel.Update(func() {})
 		a.refreshShadow()
 	})

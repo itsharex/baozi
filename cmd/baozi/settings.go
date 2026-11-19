@@ -138,7 +138,7 @@ func (s *settingsWindow) load() {
 	s.radiusOn = cfg.Appearance.Radius.On(true)
 	s.radiusVal = float64(cfg.Appearance.Radius.Int(config.DefaultPanelRadius, 0, config.MaxPanelRadius))
 	s.opacityOn = cfg.Appearance.Opacity.On(true)
-	s.opacityVal = float64(cfg.Appearance.Opacity.Int(config.DefaultGlassOpacity, 0, 100))
+	s.opacityVal = float64(cfg.Appearance.Opacity.Int(config.DefaultGlassTransparency, 0, 100))
 	s.shadowOn = cfg.Appearance.Shadow.On(true)
 	s.shadowVal = float64(cfg.Appearance.Shadow.Int(config.DefaultShadowPct, 0, 100))
 
@@ -711,22 +711,35 @@ func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
 // 只影响主面板，不影响设置窗和文件互传窗：那两个是 mygo 的系统玻璃窗口，
 // 形状由系统管；面板是整窗自绘的（见 glass.go / backing.go），因此这三项都能自己调。
 func (s *settingsWindow) appearanceSection(c *ui.Context, t *ui.Theme) {
+	scale := s.app.scale
+	if scale <= 0 {
+		scale = 1
+	}
 	ui.Column(c).Gap(14).Children(func() {
 		sectionTitle(c, t, "界面外观",
-			"圆角和投影保存后立刻生效；玻璃不透明度要等下一次唤出面板（磨砂图是唤出那一刻抓屏做的）")
-		toggleSliderRow(c, t, &s.radiusOn, &s.radiusVal, "圆角", 0, config.MaxPanelRadius, "DIP",
-			"关掉 = 直角。24 是现在这个半径")
-		toggleSliderRow(c, t, &s.opacityOn, &s.opacityVal, "玻璃不透明度", 0, 100, "%",
-			"越大越白越不透明；越小越透，0% 只剩模糊，桌面颜色全透上来")
-		toggleSliderRow(c, t, &s.shadowOn, &s.shadowVal, "投影", 0, 100, "%",
-			"面板外那圈影子；关掉 = 完全不投影")
+			"三项都是保存后立刻生效；数值按屏幕缩放换算成实际像素/百分比")
+		toggleSliderRow(c, t, &s.radiusOn, &s.radiusVal, "圆角", 0, config.MaxPanelRadius,
+			"关掉 = 直角。数值是这个角在屏幕上的半径（像素）",
+			func(v float64) string { return fmt.Sprintf("%.0f px", math.Round(v*float64(scale))) })
+		toggleSliderRow(c, t, &s.opacityOn, &s.opacityVal, "透明度", 0, 100,
+			"0% = 完全不透明（看不见桌面）；越大越透，模糊也跟着变轻；100% 仍留一层白",
+			func(v float64) string { return fmt.Sprintf("透 %.0f%%", v) })
+		toggleSliderRow(c, t, &s.shadowOn, &s.shadowVal, "投影", 0, 100,
+			"面板外那圈影子；关掉 = 完全不投影，数值越大影子越深",
+			func(v float64) string { return fmt.Sprintf("深浅 %.0f%%", v) })
 	})
 }
 
 // toggleSliderRow 是"一个勾选 + 一条滑杆 + 一个数"的一行：勾选管要不要，
 // 滑杆管程度。滑杆和数值在第二行，第一行留给说明文字，读起来不挤。
+//
+// show 把滑杆里的值换成给用户看的文字（像素、百分比……）—— 配置里存的是 DIP，
+// 屏幕上看到的是像素，两者差一个 DPI 缩放，不换算用户根本对不上。
 func toggleSliderRow(c *ui.Context, t *ui.Theme, on *bool, val *float64,
-	label string, lo, hi float64, unit, hint string) {
+	label string, lo, hi float64, hint string, show func(float64) string) {
+	if show == nil {
+		show = func(v float64) string { return fmt.Sprintf("%.0f", v) }
+	}
 	ui.Column(c).Gap(6).Children(func() {
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Checkbox(c, on, label)
@@ -734,7 +747,7 @@ func toggleSliderRow(c *ui.Context, t *ui.Theme, on *bool, val *float64,
 		})
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Slider(c, val, lo, hi).Grow(1)
-			ui.Text(c, fmt.Sprintf("%.0f%s", *val, unit)).FontSize(12).Width(64)
+			ui.Text(c, show(*val)).FontSize(12).Width(84)
 		})
 	})
 }

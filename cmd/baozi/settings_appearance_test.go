@@ -32,7 +32,7 @@ func TestSettingsAppearanceSection(t *testing.T) {
 	if s.navSel != secAppearance {
 		t.Fatalf("没选中「界面外观」，navSel=%d", s.navSel)
 	}
-	for _, want := range []string{"界面外观", "圆角", "玻璃不透明度", "投影"} {
+	for _, want := range []string{"界面外观", "圆角", "透明度", "投影"} {
 		if !tr.HasText(want) {
 			t.Fatalf("外观段里没找到「%s」", want)
 		}

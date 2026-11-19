@@ -39,8 +39,10 @@ type Config struct {
 type Appearance struct {
 	// Radius 是圆角半径（DIP，0~40，缺省 24）。关掉 = 直角。
 	Radius Toggle `json:"radius"`
-	// Opacity 是玻璃"压白"的不透明度（百分比，缺省 59）：越大越白越不透明，
-	// 越小越透 —— 调到 0 就只剩模糊，背后桌面的颜色和明暗全透上来。
+	// Opacity 是玻璃的**透明度**（百分比，缺省 59）：越大越透 —— 桌面越清楚，
+	// 磨砂的模糊也跟着变轻；0 = 完全不透明（看不见桌面，只有磨砂白）。
+	// 即使拉到 100 也留着一层白打底（见 main.go 的 applyAppearance），
+	// 否则面板糊成"直接看桌面"，字压不住、面板也没了边界。
 	Opacity Toggle `json:"opacity"`
 	// Shadow 是面板外那圈投影的强度（百分比，缺省 57）：0 等于没有投影。
 	Shadow Toggle `json:"shadow"`
@@ -84,8 +86,9 @@ const (
 	DefaultPanelRadius = 24
 	// MaxPanelRadius 是半径上限：再大面板就成胶囊了。
 	MaxPanelRadius = 40
-	// DefaultGlassOpacity 是缺省的玻璃不透明度（百分比），对应压白 alpha ≈ 150。
-	DefaultGlassOpacity = 59
+	// DefaultGlassTransparency 是缺省的玻璃透明度（百分比）：压白 alpha ≈ 158、
+	// 模糊半径 5 —— 就是之前那套"牛奶白磨砂"的观感。
+	DefaultGlassTransparency = 59
 	// DefaultShadowPct 是缺省的投影强度（百分比），对应黑度 ≈ 0.34。
 	DefaultShadowPct = 57
 )
@@ -98,12 +101,14 @@ func (c *Config) PanelRadius() int {
 	return c.Appearance.Radius.Int(DefaultPanelRadius, 0, MaxPanelRadius)
 }
 
-// GlassOpacityPct 返回生效的玻璃不透明度（百分比 0~100）。
-func (c *Config) GlassOpacityPct() int {
+// GlassTransparencyPct 返回生效的玻璃透明度（百分比 0~100）。
+// 0 = 完全不透明；100 = 最透（实现里还有下限保护，不会真成全透明）。
+// 把这一项的开关关掉，等于"不要玻璃看起来能看穿" —— 按 0（完全不透明）算。
+func (c *Config) GlassTransparencyPct() int {
 	if !c.Appearance.Opacity.On(true) {
 		return 0
 	}
-	return c.Appearance.Opacity.Int(DefaultGlassOpacity, 0, 100)
+	return c.Appearance.Opacity.Int(DefaultGlassTransparency, 0, 100)
 }
 
 // ShadowPct 返回生效的投影强度（百分比 0~100）；0 表示不要投影。
@@ -384,7 +389,7 @@ func (c Command) Keywords() []string {
 // Default 给出一份能直接跑的配置：索引所有固定磁盘，排除系统噪声目录。
 func Default() *Config {
 	// 外观三项的缺省值写成具体数，让 config.json 里一眼能看到"现在是多少"。
-	radius, opacity, shadow := DefaultPanelRadius, DefaultGlassOpacity, DefaultShadowPct
+	radius, opacity, shadow := DefaultPanelRadius, DefaultGlassTransparency, DefaultShadowPct
 	return &Config{
 		Appearance: Appearance{
 			Radius:  Toggle{Value: &radius},

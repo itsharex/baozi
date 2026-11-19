@@ -9,8 +9,8 @@ func TestAppearanceDefaults(t *testing.T) {
 	if r := c.PanelRadius(); r != DefaultPanelRadius {
 		t.Fatalf("圆角缺省应为 %d，实际 %d", DefaultPanelRadius, r)
 	}
-	if p := c.GlassOpacityPct(); p != DefaultGlassOpacity {
-		t.Fatalf("不透明度缺省应为 %d，实际 %d", DefaultGlassOpacity, p)
+	if p := c.GlassTransparencyPct(); p != DefaultGlassTransparency {
+		t.Fatalf("透明度缺省应为 %d，实际 %d", DefaultGlassTransparency, p)
 	}
 	if p := c.ShadowPct(); p != DefaultShadowPct {
 		t.Fatalf("投影缺省应为 %d，实际 %d", DefaultShadowPct, p)
@@ -38,9 +38,9 @@ func TestAppearanceDisabled(t *testing.T) {
 	c.Appearance.Radius.Enabled = &off
 	c.Appearance.Opacity.Enabled = &off
 	c.Appearance.Shadow.Enabled = &off
-	if c.PanelRadius() != 0 || c.GlassOpacityPct() != 0 || c.ShadowPct() != 0 {
+	if c.PanelRadius() != 0 || c.GlassTransparencyPct() != 0 || c.ShadowPct() != 0 {
 		t.Fatalf("全关之后应全为 0，实际 %d/%d/%d",
-			c.PanelRadius(), c.GlassOpacityPct(), c.ShadowPct())
+			c.PanelRadius(), c.GlassTransparencyPct(), c.ShadowPct())
 	}
 	// 关掉不影响存着的程度值：用户再打开时应回到原来的数。
 	if got := c.Appearance.Radius.Int(DefaultPanelRadius, 0, MaxPanelRadius); got != DefaultPanelRadius {
@@ -58,7 +58,7 @@ func TestAppearanceClamp(t *testing.T) {
 	if r := c.PanelRadius(); r != 0 {
 		t.Fatalf("负半径应夹到 0，实际 %d", r)
 	}
-	if p := c.GlassOpacityPct(); p != 100 {
+	if p := c.GlassTransparencyPct(); p != 100 {
 		t.Fatalf("超上限应夹到 100，实际 %d", p)
 	}
 	if p := c.ShadowPct(); p != 0 {

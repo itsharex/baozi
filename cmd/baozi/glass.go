@@ -66,10 +66,14 @@ var glassRadius = config.DefaultPanelRadius
 // 最小 0）。
 var glassClipRadius = glassRadius - 1
 
-// glassTintAlpha 是磨砂图上那层近似白的不透明度（0~255）。设置页的"玻璃不透明度"
-// 百分比折算到它：100% ≈ 255（几乎不透），0% ≈ 0（只剩模糊，桌面颜色全透上来）。
-// 缺省 150 ≈ 59%。
-var glassTintAlpha uint8 = 150
+// glassTintAlpha 是磨砂图上那层近似白的不透明度（0~255）。设置页的"透明度"
+// 折算到它：透明度 0% → 255（实心，看不见桌面），59% → 158（缺省那套观感），
+// 100% → 90（下限：再低就成了"直接看桌面"，字压不住）。
+var glassTintAlpha uint8 = 158
+
+// glassBlurRadius 是磨砂图的模糊半径（缩略图上，原先是 5）。透明度和它联动：
+// 越透越轻 —— 想看见桌面就该少糊一点。缺省 59% 时正好 5。
+var glassBlurRadius = 5
 
 // snapshotScreen 抓一次全屏、做成磨砂图。
 // 必须在 Show 之前调用，否则抓到的是面板自己。
@@ -858,11 +862,14 @@ func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	if small == nil {
 		return nil
 	}
-	// 缩略图上模糊半径按同一比例小（放大了看是一片均匀的糊）。
-	small = win.Blur(small, 5, 3)
-	// 压一层近似白（247,248,252）：牛奶白磨砂，背后透得出颜色和明暗。
-	// 那一层白有多不透明由设置页的"玻璃不透明度"决定（glassTintAlpha）。
-	small = win.Tint(small, 247, 248, 252, glassTintAlpha)
+	// 留一张没动过的底片：设置页改完透明度要当场重做一张（见 frostImage），
+	// 不用等下次唤出重新抓屏。必须单独存一份 —— win.Blur 和 win.Tint 都是原地
+	// 改这张图，直接留引用的话底片自己就变成模糊+压白的结果了。
+	a.frostBase = dupRGBA(small)
+	small = a.frostImage()
+	if small == nil {
+		return nil
+	}
 	// 阴影层取"玻璃色"用：磨砂图上任意一点就是面板玻璃在那里的颜色。
 	a.frostSmall = small
 	// 图在界面上的尺寸 = 整个虚拟屏的 DIP 尺寸，窗口在里面取景。
@@ -877,6 +884,31 @@ func (a *application) frostFromScaled(small *image.RGBA) *ui.Bitmap {
 	}
 	a.frostPixW, a.frostPixH = small.Rect.Dx(), small.Rect.Dy()
 	return ui.NewBitmap(small)
+}
+
+// frostImage 用当前的外观设置把"唤出时留下的那张底片"做成磨砂图：先模糊，再压白。
+//
+// 和透明度的关系：越透（越想看见桌面）→ 白层越薄、模糊半径也越小，糊得少才看得清。
+// alpha 有 90 的下限（见 main.go 的 applyAppearance）：再薄就等于隔着空气看桌面，
+// 面板既没有玻璃感、字也压不住。
+func (a *application) frostImage() *image.RGBA {
+	if a.frostBase == nil {
+		return nil
+	}
+	work := dupRGBA(a.frostBase)
+	work = win.Blur(work, glassBlurRadius, 3)
+	return win.Tint(work, 247, 248, 252, glassTintAlpha)
+}
+
+// dupRGBA 拷一份图像。win.Blur / win.Tint 都是原地改，所以底片必须留一份原件，
+// 否则"改完透明度重做一次"第二次就找不到干净的桌面底片了。
+func dupRGBA(src *image.RGBA) *image.RGBA {
+	if src == nil {
+		return nil
+	}
+	dst := image.NewRGBA(src.Rect)
+	copy(dst.Pix, src.Pix)
+	return dst
 }
 
 // glassOffset 返回整屏磨砂图相对窗口客户区左上角的 DIP 偏移（总是 ≤ 0）。
