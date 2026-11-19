@@ -81,12 +81,17 @@ var ringMode = func() int {
 	return 0
 }()
 
-// backKey 是底图的全部输入。位置/尺寸/半径/桌面快照任何一个变了才重算。
+// backKey 是底图"形状"的全部输入：尺寸/半径/桌面快照。**位置不算在内** ——
+// 窗口只是挪了个地方的话走增量平移（见 refreshBacking），不重烘。
 type backKey struct {
-	cx, cy, cw, ch int
-	r              int
-	screenGen      int
+	cw, ch    int
+	r         int
+	screenGen int
 }
+
+// backingPad 是底图四周比客户区多烘出来的物理像素数（见 refreshBacking 里的
+// 注释：盖住 mygo 摆放位图时零点几像素的取整偏差）。
+const backingPad = 1
 
 // signed distance 用的圆角矩形参数：中心 + 半宽高（去半径后）+ 半径。
 type roundRect struct {
@@ -133,9 +138,35 @@ func (a *application) refreshBacking(force bool) {
 	}
 	s := a.glassScale()
 	r := int(math.Round(float64(glassRadius) * float64(s)))
-	k := backKey{cx: cx, cy: cy, cw: w, ch: h, r: r, screenGen: a.screenGen}
-	if a.back != nil && a.backKeySet && a.backKeyVal == k {
-		return
+	k := backKey{cw: w, ch: h, r: r, screenGen: a.screenGen}
+
+	// 形状没变、只是窗口挪了地方：**不整张重烘**，把内容整体平移到位就行。
+	//
+	// 这是拖动跟手的关键。磨砂图和桌面快照都是"整屏固定"的图，底图里每个像素
+	// 记的是它对应的屏幕位置；窗口挪 (dx,dy)，就把旧图的像素按 (dx,dy) 搬一遍，
+	// 每个像素照样落在正确的桌面位置上 —— 除了贴着窗边的那一圈：形状边界的
+	// 覆盖率、弧外那段 alpha=0、边框环，都要按新坐标重算。
+	// 所以每帧只重算四条带（约 11 万像素，整张是 74 万），1~2ms；整张重烘要 8~10ms。
+	if a.back != nil && a.backKeySet && a.backKeyVal == k && a.backPix != nil {
+		dx, dy := cx-a.backCx, cy-a.backCy
+		if dx == 0 && dy == 0 {
+			return
+		}
+		pw0, ph0 := a.backPix.Rect.Dx(), a.backPix.Rect.Dy()
+		band := r + 4
+		// 位移超过四成尺寸时，重算面积跟整张差不多，直接走整张。
+		if dx > -(pw0*2/5) && dx < pw0*2/5 && dy > -(ph0*2/5) && dy < ph0*2/5 {
+			t0 := time.Now()
+			shiftPix(a.backPix, dx, dy)
+			a.repaintBackingBands(cx, cy, pw0, ph0, r, band, dx, dy)
+			a.backCx, a.backCy = cx, cy
+			a.back.Update(a.backPix)
+			if d := time.Since(t0); d > 8*time.Millisecond {
+				log.Printf("玻璃: 底图平移 %.1fms（%+d,%+d）",
+					float64(d.Microseconds())/1000, dx, dy)
+			}
+			return
+		}
 	}
 	if !force {
 		now := time.Now()
@@ -150,10 +181,11 @@ func (a *application) refreshBacking(force bool) {
 	// 曾经就整行没被盖住，露的是 mygo 清屏的纯白（BAOZI_ROWPROBE=1 的探针实测：
 	// 图往外铺一像素后，屏幕第 0 行才轮到图自己的第 1 行）。多烘一圈、外面再
 	// 压一像素，无论它往上还是往下取整，客户区都被图盖满，不会再露白。
-	const backingPad = 1
+	// 四个角只有一个来源：这张图。弧外的 alpha=0 由 DWM 透出真背景，
+	// 弧上是覆盖率相加，没有第二层来跟它打架。
 	pw, ph := w+2*backingPad, h+2*backingPad
 	t0 := time.Now()
-	pix := a.composeBacking(cx, cy, pw, ph, r, backingPad)
+	pix := a.composeBacking(cx, cy, pw, ph, r, backingPad, image.Rectangle{})
 	if pix == nil {
 		return
 	}
@@ -163,6 +195,7 @@ func (a *application) refreshBacking(force bool) {
 		a.back = ui.NewBitmap(pix)
 		a.backPixW, a.backPixH = pw, ph
 	}
+	a.backCx, a.backCy = cx, cy
 	a.backKeySet = true
 	a.backKeyVal = k
 	if d := time.Since(t0); d > 8*time.Millisecond {
@@ -179,12 +212,84 @@ func (a *application) refreshBacking(force bool) {
 	}
 }
 
+// shiftPix 把底图里的内容整体挪 (dx,dy)：窗口往右下挪 dx,dy，底图里的内容
+// 就要在窗口坐标系里往左上挪同样的量，所以新图的 (x,y) 取旧图的 (x+dx,y+dy)。
+// 搬不进来的那一条（新露出来的桌面）是旧数据，调用方随后会把它重算掉。
+// 逐行 memcpy，读取的行/列还没被写过，所以不需要临时缓冲。
+func shiftPix(img *image.RGBA, dx, dy int) {
+	w, h := img.Rect.Dx(), img.Rect.Dy()
+	if w == 0 || h == 0 || (dx == 0 && dy == 0) {
+		return
+	}
+	if dx <= -w || dx >= w || dy <= -h || dy >= h {
+		return
+	}
+	row := w * 4
+	switch {
+	case dy > 0:
+		for y := 0; y < h-dy; y++ {
+			copy(img.Pix[y*row:(y+1)*row], img.Pix[(y+dy)*row:(y+dy+1)*row])
+		}
+	case dy < 0:
+		for y := h - 1; y >= -dy; y-- {
+			copy(img.Pix[y*row:(y+1)*row], img.Pix[(y+dy)*row:(y+dy+1)*row])
+		}
+	}
+	switch {
+	case dx > 0:
+		for y := 0; y < h; y++ {
+			r := img.Pix[y*row : (y+1)*row]
+			copy(r[:row-dx*4], r[dx*4:])
+		}
+	case dx < 0:
+		for y := 0; y < h; y++ {
+			r := img.Pix[y*row : (y+1)*row]
+			copy(r[-dx*4:], r[:row+dx*4])
+		}
+	}
+}
+
+// repaintBackingBands 只重算底图里"必须按新坐标画"的那几块：
+// 四条贴边带（形状边界的抗锯齿过渡、弧外那段 alpha=0、边框环）。
+//
+// 带宽必须同时盖住两件事，所以是 band + |d| 而不是 band：
+//
+//	· 平移之后**新露出一条**桌面（宽度 |dx|、|dy|）；
+//	· 老图那条贴边带被整体搬进了内部 —— 它是按形状覆盖率算出来的（边上是
+//	  alpha=0、弧外铺的是桌面），搬到内部就成脏像素，必须一起重算。
+func (a *application) repaintBackingBands(cx, cy, cw, ch, r, band, dx, dy int) {
+	left, right, top, bottom := band, band, band, band
+	if dx > 0 {
+		right += dx
+	} else if dx < 0 {
+		left -= dx
+	}
+	if dy > 0 {
+		bottom += dy
+	} else if dy < 0 {
+		top -= dy
+	}
+	if left+right >= cw || top+bottom >= ch {
+		a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rectangle{})
+		return
+	}
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, 0, cw, top))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ch-bottom, cw, ch))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, top, left, ch-bottom))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-right, top, cw, ch-bottom))
+}
+
 // composeBacking 返回客户区大小的位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
 // cw/ch 是**含内边距**的尺寸，inset 是四周多出来的物理像素数（backingPad），
 // 形状本身仍然铺在 [inset, inset+cw-2inset] 这一段，也就是客户的真实范围。
-func (a *application) composeBacking(cx, cy, cw, ch, r, inset int) *image.RGBA {
+func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.Rectangle) *image.RGBA {
 	if a.backPix == nil || a.backPix.Rect.Dx() != cw || a.backPix.Rect.Dy() != ch {
 		a.backPix = image.NewRGBA(image.Rect(0, 0, cw, ch))
+	}
+	if region.Empty() {
+		region = image.Rect(0, 0, cw, ch)
+	} else {
+		region = region.Intersect(image.Rect(0, 0, cw, ch))
 	}
 	out := a.backPix
 	// 所有像素都会被写到（形状外铺桌面），不用清零。
@@ -279,7 +384,7 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int) *image.RGBA {
 		}
 	}
 
-	for y := 0; y < ch; y++ {
+	for y := region.Min.Y; y < region.Max.Y; y++ {
 		py := float64(y) + 0.5 - halfH
 		// 这一行的纵向采样（磨砂图的源行号 + 权重）
 		var gRow0, gRow1 []uint8
@@ -323,7 +428,7 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int) *image.RGBA {
 		// 上下两条 r 像素的横带之外、左右两条 r 像素的竖带之内 —— 这一整段都在
 		// 圆角矩形的"直线部分"包围盒里，离弧远，覆盖率必为 1：直接铺玻璃。
 		midRow := y >= r && y < ch-r
-		for x := 0; x < cw; x++ {
+		for x := region.Min.X; x < region.Max.X; x++ {
 			o := out.PixOffset(x, y)
 			px := float64(x) + 0.5 - halfW
 
@@ -487,13 +592,13 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int) *image.RGBA {
 			out.Pix[o+3] = 255
 		}
 	}
-	if rowProbe {
+	if rowProbe && region.Min.X == 0 && region.Min.Y == 0 {
 		// 最上面四行涂成洋红/青/黄/绿：屏幕上看到哪一行，就说明这张图的第几行
 		// 落在了客户区第 0 行（判断 mygo 摆放位图时到底偏了几个像素）。
 		probe := [4][3]uint8{{255, 0, 255}, {0, 255, 255}, {255, 255, 0}, {0, 255, 0}}
 		for row := 0; row < 4 && row < ch; row++ {
 			for x := 0; x < cw; x++ {
-				o := row*cw*4 + x*4
+				o := out.PixOffset(x, row)
 				out.Pix[o+0] = probe[row][0]
 				out.Pix[o+1] = probe[row][1]
 				out.Pix[o+2] = probe[row][2]

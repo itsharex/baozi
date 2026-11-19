@@ -182,6 +182,10 @@ type application struct {
 	backPixH   int
 	backKeySet bool
 	backKeyVal backKey
+	// backCx/backCy 是这张底图"取景"时客户区左上角的屏幕坐标。窗口只是挪了地方
+	// （拖动面板）时，底图不重烘，只把内容平移 (cx-backCx, cy-backCy) ——
+	// 磨砂图和桌面快照都是整屏固定的，平移之后每个像素照样落在正确的桌面上。
+	backCx, backCy int
 	// lastBackAt 是上一次合成底图的时刻（节流用，见 backingThrottle）。
 	lastBackAt time.Time
 	// screenGen 每次重新抓屏 +1：底图依赖快照内容，快照一换就必须重合成。
@@ -2556,15 +2560,18 @@ func (a *application) ready() {
 		// 但**不能每帧都重建**：panel.Update 是"整棵内容树重新布局 + 重新栅格化
 		// + 上传纹理"，1100×724 的面板一次就是几毫秒到十几毫秒，全砸在 UI 线程上；
 		// 鼠标每秒能报几百次位移，那就等于把 UI 线程占满 —— 用户说的"快速拖动
-		// 卡死"就出在这里。磨砂图的取景偏移差个几像素肉眼看不出来，所以按 50ms
-		// 节流，松手后再补一帧把位置对齐。
+		// 卡死"就出在这里。
+		//
+		// 磨砂底图现在**不再整张重烘**（见 backing.go 的增量平移），一次一两毫秒，
+		// 所以节流从 50ms 收到 16ms：面板挪到哪，底图同一帧就跟到哪，不再"每 50ms
+		// 跳一下"——那正是用户说的"模糊背景的移动有滞后"。
 		now := time.Now()
 		a.panelMu.Lock()
 		// 一次只排一个：拖面板走的是系统的模态拖动循环（mygo 的 DragWindow 就是
 		// SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)），那段循环里队列跑得比平时慢，
 		// 每帧无条件 post 一个"整树重建"只会在队列里堆起来。排队了就不再排。
 		queued := false
-		if !a.moveUpdateQueued && now.Sub(a.lastMoveAt) >= 50*time.Millisecond {
+		if !a.moveUpdateQueued && now.Sub(a.lastMoveAt) >= 16*time.Millisecond {
 			a.lastMoveAt = now
 			a.moveUpdateQueued = true
 			queued = true
