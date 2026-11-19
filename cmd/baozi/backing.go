@@ -159,7 +159,24 @@ func (a *application) refreshBacking(force bool) {
 	if hwnd == 0 {
 		return
 	}
-	cx, cy, w, h := win.ClientRectPixels(hwnd)
+	cx, cy, _, _ := win.ClientRectPixels(hwnd)
+	a.refreshBackingFor(cx, cy, force)
+}
+
+// refreshBackingFor 按**指定**的客户区原点（物理像素）烘底图。
+//
+// 自绘拖动（dragwin.go 的 dragTo）要在窗口挪动**之前**就把内容按目标位置算好：
+// 先更新纹理、再 SetWindowPos、再 Present，DWM 才会把"新位置"和"新内容"当同一帧。
+// 所以这里必须能把坐标从外面传进来，而不是像 refreshBacking 那样现取窗口位置。
+func (a *application) refreshBackingFor(cx, cy int, force bool) {
+	if !bakedPanel || a.frost == nil || a.panel == nil {
+		return
+	}
+	hwnd := a.panel.NativeHandle()
+	if hwnd == 0 {
+		return
+	}
+	_, _, w, h := win.ClientRectPixels(hwnd)
 	if w <= 0 || h <= 0 {
 		return
 	}

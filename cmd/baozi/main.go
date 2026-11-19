@@ -250,6 +250,9 @@ type application struct {
 	// redrawNext 是"拖动时自己推一帧上屏"的节流点（见 OnMove 里的 win.RedrawNow）。
 	// 拖动走系统模态循环，帧请求在那儿排队，光算完底图屏幕不会变。
 	redrawNext atomic.Int64
+	// selfDrag 是面板的自绘拖动（见 dragwin.go）。系统拖动先挪窗口、我们追内容，
+	// 快拖时差半帧看得出来；自己接管以后"先算内容、再挪窗口、再提交"，同一帧。
+	selfDrag *selfDrag
 	// shadow 是垫在面板底下的自绘阴影层（一个 layered 窗口）。DWM 在 Win10 上
 	// 不给"设了窗口区域"的窗口画阴影，而圆角只能靠区域，所以自己画（见
 	// internal/win/shadow.go）。
@@ -672,7 +675,7 @@ func (a *application) view(c *ui.Context) {
 		// 裁掉的像素填成纯白（实测上边缘连续 5 行 #FFFFFF）—— 用户反复说的"漏光"
 		// 就是这条白边。四角的形状现在整个烘在底图里（覆盖率抗锯齿），这一层只要
 		// 把底图铺满、不裁即可。
-		ui.Column(c).Fill().DragWindow().Children(func() {
+		ui.Column(c).Fill().Children(func() {
 			if bakedPanel {
 				// 底图和客户区同尺寸，1:1 落在 (0,0)，不缩放、不偏移 —— 圆角位置
 				// 就是窗口位置，拖动/缩放时只要重新合成一张，弧永远贴着窗边。
@@ -731,7 +734,7 @@ func (a *application) view(c *ui.Context) {
 				ui.Column(c).Absolute().Left(0).Top(0).
 					Size(float32(pw), float32(ph)).
 					Radius(float32(glassClipRadius)).Clip().
-					DragWindow().Children(body)
+					Children(body)
 				// 四条直边。直边段和弧上的边线同色同宽，拼成一整圈框。
 				//
 				// 起点不能精确取弧半径（r0 = glassRadius）。精确相接时，直边线的
@@ -832,7 +835,7 @@ func (a *application) view(c *ui.Context) {
 		})
 		return
 	}
-	ui.Column(c).Fill().DragWindow().Children(body)
+	ui.Column(c).Fill().Children(body)
 }
 
 // regexButton 是搜索框右边那个 ".*" 切换按钮：点一下进正则模式，再点回普通搜索。
@@ -2420,6 +2423,11 @@ func (a *application) show() {
 	// 底图必须在 Show 之前/之后最早的时刻烘好：面板第一帧铺的就是它，
 	// 底图还没生成的那一帧是矩形（用户报的"偶尔出现四个直角"）。
 	a.refreshBacking(true)
+	// 面板的自绘拖动（dragwin.go）：窗口建好、位置定下之后在它的 hwnd 上换一份
+	// 自己的 WndProc。幂等，多次唤出只装一次。
+	if hwnd := a.panel.NativeHandle(); hwnd != 0 {
+		a.installSelfDrag(hwnd)
+	}
 	// 阴影层放在最后：它是从面板外侧取样的，得等四角的桌面色取完再显示，
 	// 否则那几像素的取样会被自己的阴影压暗。
 	a.refreshShadow()
@@ -2648,6 +2656,11 @@ func (a *application) ready() {
 	a.panel.OnMove(func() {
 		a.uiTick.Store(time.Now().UnixNano())
 		a.dragUntil.Store(time.Now().Add(600 * time.Millisecond).UnixNano())
+		// 自绘拖动（dragwin.go）自己会按目标位置烘图、挪窗口、提交一帧，位置和
+		// 内容是同一帧交出去的 —— 这里不能再插一脚，否则一次移动画两遍。
+		if a.selfDrag != nil && a.selfDrag.active {
+			return
+		}
 		// 底图平移必须**当帧**做。以前这里只排一次 panel.Update，等那一帧布局跑完
 		// 才在 view 里重算 —— 窗口已经被系统挪到新位置、图还是旧的，屏幕上就是
 		// "拖动开始的一瞬间背景慢一拍"。增量平移只需要 1~2ms（整张重烘仍然受下面的
