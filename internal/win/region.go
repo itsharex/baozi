@@ -50,22 +50,36 @@ const (
 	dwmNCRPDisabled        = 1
 )
 
-// DisableWindowFrame 关掉 DWM 给窗口画的那一圈非客户区 —— Win10 上它就是窗口
-// **最上面那 1 个像素**的白线（浅色主题下是纯白）。
+// DisableViewFrame 关掉 DWM 给这个窗口画的非客户区边框，**保留**边框扩展。
 //
-// 这一格白才是"四角一直有一条白线 / 弧外面多一个透明直角"的真凶：DWM 的边框画在
-// 窗口自己的像素**底下**，我们的像素不透明时看不见；一旦圆角那一块被裁成 alpha=0，
-// 它就从缺口里透出来。所以它只在顶边出现、只在圆角那一小段看得见，怎么调底图都
-// 去不掉（BAOZI_ROWPROBE 探针实测：面板自己第 0 行的像素是对的，白线是别人画的）。
+// 要的是"不要 DWM 那条边框"，但窗口仍然算"有非客户区"——这样 DWM 的窗口影
+// 尽量留着（关掉非客户区渲染会把影一起关掉，实测外侧由 #C800C8 弱到 #EF00EF，
+// 那一版用户看到"角上干净了，可面板发飘"）。
 //
-// 面板的阴影是自己画的（见 shadow.go），不需要 DWM 这一圈，关掉不会有损失。
+// 边框扩展的 1px 由我们自己的像素盖住，看不见；真正露出来的是圆角缺口里那一格
+// 白线 —— 关掉非客户区边框之后那一格才变回真透明。
+func DisableViewFrame(hwnd uintptr) bool {
+	if hwnd == 0 {
+		return false
+	}
+	off := uint32(dwmNCRPDisabled)
+	r, _, _ := procDwmSetWindowAttr.Call(hwnd, dwmwaNCRenderingPolicy, uintptr(unsafe.Pointer(&off)), unsafe.Sizeof(off))
+	// 边框扩展保留 1px：DWM 仍把它当"有边框的窗口"，影才有地方长。
+	m := margins{Left: 1, Right: 1, Top: 1, Bottom: 1}
+	rf, _, _ := procDwmExtendFrame.Call(hwnd, uintptr(unsafe.Pointer(&m)))
+	return r == 0 || rf == 0
+}
+
+// DisableWindowFrame 把非客户区彻底关掉：边框不画，扩展也收回 0。
 func DisableWindowFrame(hwnd uintptr) bool {
 	if hwnd == 0 {
 		return false
 	}
 	off := uint32(dwmNCRPDisabled)
 	r, _, _ := procDwmSetWindowAttr.Call(hwnd, dwmwaNCRenderingPolicy, uintptr(unsafe.Pointer(&off)), unsafe.Sizeof(off))
-	return r == 0
+	var m margins
+	rf, _, _ := procDwmExtendFrame.Call(hwnd, uintptr(unsafe.Pointer(&m)))
+	return r == 0 || rf == 0
 }
 
 // EnableWindowFrameShadow 让 DWM 给这个窗口画阴影：先开非客户区绘制，再把

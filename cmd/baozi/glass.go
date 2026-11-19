@@ -1064,6 +1064,24 @@ func (a *application) dragging() bool {
 	return until != 0 && time.Now().UnixNano() < until
 }
 
+// disableDwmFrame 关掉 DWM 给面板窗口画的那一圈非客户区。
+//
+// 这就是"四角一直有一条白线 / 角上一块发白"的真凶：Win10 的 DWM 会在窗口最上面
+// 画 1 像素边框，画在窗口像素**底下** —— 我们的像素不透明时被盖住看不见，一到圆角
+// 被裁成 alpha=0 的缺口里就透出来。而且它只在窗口是**前台活动窗口**时才画（抓屏
+// 时焦点不在面板上就测不到，所以之前反复"量不到却看得见"）。
+//
+// 代价：DWM 那圈窗口影也会一起没有（实测外侧由 #C800C8 弱到 #EF00EF），所以
+// 自绘阴影那边要补强度，见 internal/win/shadow.go 的 constMaxAlpha。
+//
+// BAOZI_NOFRAME=0 退回旧行为，方便 A/B。
+func (a *application) disableDwmFrame() {
+	if os.Getenv("BAOZI_NOFRAME") == "0" {
+		return
+	}
+	win.DisableViewFrame(a.panel.NativeHandle())
+}
+
 // ensureShell 检查"圆角区域 + 阴影层"这两件外观状态还在不在，缺了立刻补。
 //
 // 要这么一个兜底，是因为它们都是**别人手里**的状态：
@@ -1090,6 +1108,10 @@ func (a *application) ensureShell(reason string) {
 		return
 	}
 	hasRegion := win.HasRegion(hwnd)
+	// DWM 的非客户区边框：Win10 上它就是窗口顶边上那 1 像素白线，只在 alpha=0
+	// 的圆角缺口里透出来，而且只在面板是前台活动窗口时才画。mygo 在 Show/Hide
+	// 之间会把窗口样式动一遍，所以每次复查都关一次（两次 Win32 调用，可以忽略）。
+	a.disableDwmFrame()
 	shadowShown := a.shadow.Shown()
 	// 每次唤出后的前三次复查各记一行：这样"圆角/阴影什么时候丢、过了多久补上"
 	// 在日志里是可见的，不用等用户报现象再猜。三次之后只在真的补的时候记。
