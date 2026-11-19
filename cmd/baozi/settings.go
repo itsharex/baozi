@@ -306,7 +306,7 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 		})
 		ui.Checkbox(c, &s.fullscreen, "全屏应用（游戏、全屏视频）前台时不响应")
 		ui.Checkbox(c, &s.openAtLogin, "开机自动启动（登录后静默待在托盘，不弹面板）")
-		ui.Checkbox(c, &s.hideOnStart, "启动时不弹面板（手动启动也一样，只在托盘里等着，双击 Ctrl 随时唤出）")
+		ui.Checkbox(c, &s.hideOnStart, "启动时不弹面板")
 	})
 }
 
@@ -315,7 +315,7 @@ func (s *settingsWindow) hotkeySection(c *ui.Context, t *ui.Theme) {
 func (s *settingsWindow) followSection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(10).Children(func() {
 		sectionTitle(c, t, "文件对话框跟随", "")
-		ui.Checkbox(c, &s.followOn, "启用跟随（关掉后 Baozi 完全不读别的程序的窗口）")
+		ui.Checkbox(c, &s.followOn, "启用跟随")
 
 		ui.Row(c).Gap(18).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "目录来源").FontSize(12).TextColor(t.TextMuted).Width(70)
@@ -683,15 +683,16 @@ func iconScaleOf(cfg *config.Config, sysScale float32) float64 {
 	return 1
 }
 
-// iconPreview 在"图标大小"旁边说清现在到底会画多大：给出倍数、系统缩放，
-// 以及换算出来的实际像素。用的是编辑中的值，所以改一下这行字就跟着变。
+// iconPreview 在"图标大小"旁边说清现在到底会画多大：只给实际像素。
+// 不再带箭头、也不再报系统缩放比例 —— 那是环境参数，用户改不了它，
+// 摆在设置页里只会让人以为它是个可调的东西。
 func (s *settingsWindow) iconPreview() string {
 	scale := s.app.scale
 	if scale <= 0 {
 		scale = 1
 	}
 	base := float64(config.BaseIconSize) * float64(scale)
-	return fmt.Sprintf("→ %.1f 像素（系统缩放 %g%%）", base*config.ClampIconScale(s.iconScale), scale*100)
+	return fmt.Sprintf("%.1f 像素", base*config.ClampIconScale(s.iconScale))
 }
 
 func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
@@ -709,9 +710,12 @@ func sliderRow(c *ui.Context, t *ui.Theme, label string, value *float64) {
 func (s *settingsWindow) appearanceSection(c *ui.Context, t *ui.Theme) {
 	ui.Column(c).Gap(14).Children(func() {
 		sectionTitle(c, t, "界面外观", "")
-		toggleRow(c, t, &s.radiusOn, "圆角")
-		toggleRow(c, t, &s.opacityOn, "透明度")
-		toggleRow(c, t, &s.shadowOn, "投影")
+		// 三项横向并排：它们互不相干、各自只有一句标签，竖着排会白占两行。
+		ui.Row(c).Gap(24).AlignItems(ui.Center).Children(func() {
+			toggleRow(c, t, &s.radiusOn, "圆角")
+			toggleRow(c, t, &s.opacityOn, "透明度")
+			toggleRow(c, t, &s.shadowOn, "投影")
+		})
 	})
 }
 
