@@ -331,6 +331,10 @@ type application struct {
 	// 而设置窗口的视图在 ui.Tester 下渲染（没有主循环），每次 load 去问会永久阻塞。
 	openAtLogin atomic.Bool
 
+	// 更新检查的结果（"关于"页显示它）。检查本身跑在后台 goroutine 里，
+	// 任何时刻都不许碰 UI 线程 —— 见 updatecheck.go。
+	upd updateState
+
 	// 右键菜单里选的动作不能在菜单回调里直接改 a.results：
 	// 那一帧正在渲染这条列表，边遍历边重建会越界。先记下来，视图开头统一处理。
 	pendingOp  string // "" | "delete" | "pin" | "unpin"
@@ -1193,6 +1197,14 @@ func (a *application) footerText() string {
 			return "已固定 · " + r.Name
 		}
 		return "打开 " + r.Name
+	}
+	// 有新版本就顺嘴提一句，位置在本来就要显示状态的那一格 —— 不新增控件、
+	// 不抢焦点、也不弹任何东西（检查是后台做的，这里只是把结果念出来）。
+	if tag := a.latestTag(); tag != "" {
+		if a.status == "" {
+			return "有新版本 " + tag + " · 设置 → 关于"
+		}
+		return a.status + " · 有新版本 " + tag
 	}
 	return a.status
 }
@@ -2828,6 +2840,10 @@ func (a *application) ready() {
 	a.setUpTray()
 	a.settings = newSettingsWindow(a)
 	a.share = newShareWindow(a)
+
+	// 更新检查：起一个 goroutine 就返回。它自己先睡 3 秒再发请求，
+	// 所以"启动"这条路上没有任何一行代码在等网络（见 updatecheck.go）。
+	a.startUpdateCheck()
 
 	// 文件对话框跟随：记住文件管理器最近待过的目录，那个「打开 / 另存为」框再回到前台时
 	// 自动把路径送过去（Lertaro 的 IActivePathCollector + FileDialogNavigationTracker）。

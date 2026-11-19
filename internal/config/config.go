@@ -32,6 +32,8 @@ type Config struct {
 	Appearance Appearance `json:"appearance"`
 	// Startup 是启动时的行为（手动启动后要不要直接把面板弹出来）。
 	Startup Startup `json:"startup"`
+	// Updates 管"关于"页里的自动检查更新（缺省开）。
+	Updates Updates `json:"updates"`
 }
 
 // Appearance 是面板外观：圆角、玻璃不透明度、投影强度。
@@ -129,6 +131,22 @@ type Startup struct {
 // HideOnStart 报启动时要不要保持隐藏。
 func (c *Config) HideOnStart() bool {
 	return c.Startup.HideOnStart != nil && *c.Startup.HideOnStart
+}
+
+// Updates 是"关于/更新"这块的偏好。真正的检查结果不落盘（每次启动都重新查），
+// 这里只存"要不要自动查"。
+type Updates struct {
+	// AutoCheck 为真时，每次启动在后台查一次 GitHub Releases（缺省开）。
+	// 检查永远是后台 goroutine + 超时，任何情况下都不许挡启动。
+	AutoCheck *bool `json:"autoCheck,omitempty"`
+}
+
+// UpdateAutoCheck 报启动后要不要自动查新版本；没配过就是查。
+func (c *Config) UpdateAutoCheck() bool {
+	if c.Updates.AutoCheck == nil {
+		return true
+	}
+	return *c.Updates.AutoCheck
 }
 
 // PathSources 是"文件对话框跟随"的目录来源开关，和 internal/win 的 Source* 常量一一对应。

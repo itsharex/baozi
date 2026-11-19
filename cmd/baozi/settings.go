@@ -9,6 +9,8 @@ import (
 	"unicode"
 
 	"baozi/internal/config"
+	"baozi/internal/update"
+	"baozi/internal/version"
 	"baozi/internal/win"
 
 	"github.com/egoist/mygo"
@@ -71,6 +73,10 @@ type settingsWindow struct {
 	srcXyplorer bool
 	srcXplorer2 bool
 	srcTessoa   bool
+
+	// 关于页：启动时要不要在后台查一次新版本。
+	// 检查结果不在这里存 —— 它属于运行时状态，挂在 application.upd 上。
+	autoUpdate bool
 
 	// 自定义命令：结构化编辑（左列选中哪条，右列就改哪条）。
 	cmds     []config.Command
@@ -187,6 +193,7 @@ func (s *settingsWindow) load() {
 	s.srcXyplorer = cfg.PathSourceEnabled(win.SourceXyplorer)
 	s.srcXplorer2 = cfg.PathSourceEnabled(win.SourceXplorer2)
 	s.srcTessoa = cfg.PathSourceEnabled(win.SourceTessoa)
+	s.autoUpdate = cfg.UpdateAutoCheck()
 
 	// 自定义命令：编辑器直接改结构化的清单，不再让用户拼竖线。
 	s.cmds = append([]config.Command(nil), cfg.Commands...)
@@ -230,7 +237,7 @@ func (s *settingsWindow) show() {
 // settingsNavItems 是左栏的设置项，顺序和右栏的段落一一对应。
 // 「自定义命令」要一整屏（左清单 + 右表单），所以它是单独一页；其余四项同在一页，
 // 点哪一项就把右栏滚到哪一段——不切页，别的段还在原地，想接着往下看不用点回来。
-var settingsNavItems = []string{"唤出", "界面外观", "文件对话框跟随", "排序", "索引", "自定义命令"}
+var settingsNavItems = []string{"唤出", "界面外观", "文件对话框跟随", "排序", "索引", "自定义命令", "关于"}
 
 const (
 	secHotkey = iota
@@ -239,6 +246,7 @@ const (
 	secRank
 	secIndex
 	secCommands
+	secAbout
 )
 
 func (s *settingsWindow) view(c *ui.Context) {
@@ -374,6 +382,8 @@ func (s *settingsWindow) sectionsColumn(c *ui.Context, t *ui.Theme) {
 			s.section(c, secRank, func() { s.rankSection(c, t) })
 			ui.Divider(c)
 			s.section(c, secIndex, func() { s.indexSection(c, t) })
+			ui.Divider(c)
+			s.section(c, secAbout, func() { s.aboutSection(c, t) })
 			ui.Divider(c)
 		})
 	})
@@ -521,6 +531,89 @@ func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
 			}
 		})
 	})
+}
+
+// aboutSection 是「关于」页：版本、GitHub 地址、更新状态。
+//
+// 这里**不下载、不替换文件**，只把"有新版本"这件事说清楚并给出下载页：
+// 更新一旦会动用户的安装目录，就得有人点一下。检查本身跑在后台，
+// 页面上的状态只是读一份快照（application.upd.snapshot），所以打开设置、
+// 滚动、点按钮都不会被网络挡住。
+func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
+	snap := s.app.upd.snapshot()
+	ui.Column(c).Gap(10).Children(func() {
+		sectionTitle(c, t, "关于", "自绘玻璃的 Windows 启动器：双击 Ctrl 唤出，搜索文件、应用和历史。")
+
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "版本").FontSize(12).TextColor(t.TextMuted).Width(70)
+			ui.Text(c, version.Display()).FontSize(12).Bold()
+			if version.IsDev() {
+				ui.Text(c, "本地编译，不参与更新比较").FontSize(11).TextColor(t.TextMuted)
+			}
+		})
+
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "GitHub").FontSize(12).TextColor(t.TextMuted).Width(70)
+			if ui.Button(c, "github.com/"+update.Repo).Clicked() {
+				openExternal(update.RepoPage)
+			}
+			ui.Text(c, "源码、Release 和安装包都在这里").FontSize(11).TextColor(t.TextMuted)
+		})
+
+		ui.Divider(c)
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "更新").FontSize(12).TextColor(t.TextMuted).Width(70)
+			ui.Text(c, updateStatusText(snap)).FontSize(12).Grow(1).SingleLine()
+			if snap.Newer {
+				if ui.PrimaryButton(c, "打开下载页").Clicked() {
+					page := snap.PageURL
+					if page == "" {
+						page = update.ReleasePage
+					}
+					openExternal(page)
+				}
+			}
+			busy := snap.Busy
+			if ui.Button(c, "立即检查").Clicked() {
+				if !busy {
+					s.app.checkUpdatesNow(func() {
+						// 查完排一帧，让这一行文字换成新结果。
+						s.win.Update(func() {})
+					})
+					s.message = "正在后台检查更新…"
+				}
+			}
+		})
+		ui.Checkbox(c, &s.autoUpdate, "启动时自动检查更新（后台进行，不阻塞启动）")
+		ui.Text(c, "只发一次 GitHub 请求，8 秒超时；连不上就当作没查过，不影响任何功能。").
+			FontSize(11).TextColor(t.TextMuted)
+	})
+}
+
+// updateStatusText 把一份更新快照翻译成一句话。
+func updateStatusText(s updateSnapshot) string {
+	switch {
+	case s.Busy:
+		return "正在检查…"
+	case s.Err != "":
+		// 错误原样带出来，但截短：API 的报错偶尔很啰嗦，撑不下这一行。
+		msg := s.Err
+		if r := []rune(msg); len(r) > 90 {
+			msg = string(r[:90]) + "…"
+		}
+		return "检查失败：" + msg
+	case s.Newer:
+		return "发现新版本 " + s.Tag + "（当前 " + version.Display() + "）"
+	case s.Tag != "" && version.IsDev():
+		// 本地编的版本没有可比的身份，别硬说"已是最新"——那只让人以为自己落后。
+		return "开发版（不参与比较）· 线上最新 " + s.Tag
+	case s.Tag != "":
+		return "已是最新（" + s.Tag + "）"
+	case version.IsDev():
+		return "还没查过"
+	default:
+		return "还没查过"
+	}
 }
 
 // commandsPage 是「自定义命令」页：左列一排名单，右列编辑选中的那条。
@@ -934,6 +1027,9 @@ func (s *settingsWindow) save() {
 		Xplorer2: boolPtr(s.srcXplorer2),
 		Tessoa:   boolPtr(s.srcTessoa),
 	}
+	// 关于页：自动检查更新写具体值，缺省是开。
+	auto := s.autoUpdate
+	cfg.Updates = config.Updates{AutoCheck: &auto}
 
 	if err := config.Save(&cfg, s.app.cfgPath); err != nil {
 		s.message = "保存失败：" + err.Error()

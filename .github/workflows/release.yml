@@ -23,10 +23,14 @@ jobs:
       - name: build
         shell: pwsh
         run: |
+          # 版本号就是这次推的 tag —— 关于页显示的"当前版本"和更新比较都以它为准，
+          # 别在源码里另养一个常量（两处迟早对不上）。
+          $ver = "${{ github.ref_name }}"
           New-Item -ItemType Directory -Force dist | Out-Null
-          go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist/baozi.exe ./cmd/baozi
+          go build -trimpath -ldflags "-H=windowsgui -s -w -X baozi/internal/version.Version=$ver" -o dist/baozi.exe ./cmd/baozi
           go build -trimpath -ldflags "-s -w" -o dist/baozi-hook.exe ./cmd/baozi-hook
           go build -trimpath -ldflags "-s -w" -o dist/baozi-index.exe ./cmd/baozi-index
+          Write-Host "版本号：$ver"
           Get-ChildItem dist/*.exe | Select-Object Name, Length
 
       - name: pack

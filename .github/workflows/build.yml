@@ -42,8 +42,11 @@ jobs:
             throw "gofmt check failed"
           }
 
+      # tools/ 下是"一次性的探针程序"（抓屏、FRN、层窗口各一个），里面有必须的
+      # unsafe 指针转换（把 syscall 返回的 uintptr 当地址用），vet 会一路报 unsafeptr。
+      # 那些程序不进安装包，所以 vet 只看真正发布的两个目录，和上面的 gofmt 同口径。
       - name: go vet
-        run: go vet ./...
+        run: go vet ./cmd/... ./internal/...
 
       # 只跑不依赖桌面的包：搜索、拼音、历史、索引、互传（局域网）、P2P 协议。
       - name: go test（纯逻辑包）
@@ -60,10 +63,15 @@ jobs:
       - name: build
         shell: pwsh
         run: |
+          # 版本号从 tag 来；CI 上没有 tag（浅克隆），就用 sha 兜底。
+          $ver = (git describe --tags --exact-match 2>$null)
+          if (-not $ver) { $ver = "v0.0.0-dev.$($env:GITHUB_SHA.Substring(0,7))" }
+          $ld = "-H=windowsgui -s -w -X baozi/internal/version.Version=$ver"
           New-Item -ItemType Directory -Force dist | Out-Null
-          go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist/baozi.exe ./cmd/baozi
+          go build -trimpath -ldflags "$ld" -o dist/baozi.exe ./cmd/baozi
           go build -trimpath -ldflags "-s -w" -o dist/baozi-hook.exe ./cmd/baozi-hook
           go build -trimpath -ldflags "-s -w" -o dist/baozi-index.exe ./cmd/baozi-index
+          Write-Host "版本号：$ver"
           Get-ChildItem dist/*.exe | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4

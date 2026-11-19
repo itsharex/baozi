@@ -21,9 +21,9 @@ func TestSettingsAppearanceSection(t *testing.T) {
 	tr := ui.NewTester(s.view, 900, 820)
 	tr.Frame()
 
-	if len(settingsNavItems) != secCommands+1 {
-		t.Fatalf("左栏项数（%d）和 sec* 常量对不上（secCommands=%d）",
-			len(settingsNavItems), secCommands)
+	if len(settingsNavItems) != secAbout+1 {
+		t.Fatalf("左栏项数（%d）和 sec* 常量对不上（secAbout=%d）",
+			len(settingsNavItems), secAbout)
 	}
 	if err := tr.Click(settingsNavItems[secAppearance]); err != nil {
 		t.Fatalf("点左栏「%s」失败：%v", settingsNavItems[secAppearance], err)
