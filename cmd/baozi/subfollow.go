@@ -18,6 +18,8 @@ import (
 
 	"github.com/egoist/mygo"
 	"golang.org/x/sys/windows"
+
+	"baozi/internal/win"
 )
 
 const (
@@ -91,10 +93,9 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 		}
 	case wmMove:
 		if f.drag {
-			// 系统拖动中：投影跟着走、底图按节流重烘、每帧推上屏。
-			if time.Since(f.lastBake) >= 12*time.Millisecond {
-				f.lastBake = time.Now()
-				f.glass.refresh(true)
+			// 系统拖动中：投影跟着走、底图按位移整体平移、每帧推上屏。
+			if cx, cy, _, _ := win.WindowRectPixels(f.host); cx != 0 || cy != 0 {
+				f.glass.shiftTo(cx, cy)
 			}
 			f.glass.followShadow()
 			if f.win != nil {

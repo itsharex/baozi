@@ -54,6 +54,11 @@ type subGlass struct {
 
 	// dragRetry 是"还没挂上，隔一拍再试"的剩余次数（surface 建得比 Show 晚）。
 	dragRetry int
+
+	// dragCx/dragCy 是这张底图对应的窗口屏幕位置（左上角）。拖动时只按差值
+	// 把内容整体平移，不整张重烘 —— 主面板就是靠这一手做到跟手的（见
+	// backing.go 的 refreshBackingFor：shiftPix + 只重算四条带，1~2ms）。
+	dragCx, dragCy int
 }
 
 // newSubGlass 给一个已建好的窗口配一份玻璃（含阴影层）。
@@ -123,9 +128,35 @@ func (g *subGlass) refresh(force bool) {
 	g.pw, g.ph = pw, ph
 	g.key = k
 	g.keySet = true
+	g.dragCx, g.dragCy = cx, cy
 	if d := time.Since(t0); d > 8*time.Millisecond {
 		log.Printf("玻璃: %s 底图 %.1fms（%dx%d）", g.name, float64(d.Microseconds())/1000, w, h)
 	}
+}
+
+// shiftTo 把底图按 (cx,cy) 相对上次的位置整体平移。
+//
+// 这是主面板拖动跟手的关键手法：底图里每个像素记的是它对应的屏幕位置，窗口
+// 挪 (dx,dy)，就把像素按 (dx,dy) 搬一遍 —— 1~2ms，比整张重烘（8~10ms）便宜
+// 一个量级。拖动中玻璃是糊透的，贴边那一条没补也看不出来；松手时再整张重烘
+// 一次就精确了。
+func (g *subGlass) shiftTo(cx, cy int) {
+	if g.pix == nil || g.back == nil {
+		return
+	}
+	dx, dy := cx-g.dragCx, cy-g.dragCy
+	if dx == 0 && dy == 0 {
+		return
+	}
+	pw, ph := g.pix.Rect.Dx(), g.pix.Rect.Dy()
+	// 一次挪太多（比如窗口被程序直接摆到别处）就别省了，整张重烘。
+	if dx < -(pw*2/5) || dx > pw*2/5 || dy < -(ph*2/5) || dy > ph*2/5 {
+		g.refresh(true)
+		return
+	}
+	shiftPix(g.pix, dx, dy)
+	g.dragCx, g.dragCy = cx, cy
+	g.back.Update(g.pix)
 }
 
 // drawBitmap 把底图铺满客户区（按物理像素 1:1，和面板同一套摆法）。

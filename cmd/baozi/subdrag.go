@@ -228,15 +228,20 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 		procSetWinPos.Call(d.host, 0, uintptr(nx), uintptr(ny), 0, 0,
 			swpNoSize|swpNoZOrder|swpNoActivate)
 		d.glass.followShadow()
-		if time.Since(d.lastBake) >= subBakeInterval {
-			d.lastBake = time.Now()
-			d.glass.refresh(true)
-		}
+		// 拖动跟手的关键：不整张重烘，只把底图按位移整体平移（1~2ms），
+		// 和主面板 refreshBackingFor 的平移快路径是同一手。
+		d.glass.shiftTo(int(nx), int(ny))
 		// 关键的一步：把这一帧**真的推上屏**。主面板的 dragTo() 里也是这么做的
 		// （panel.FrameNow()）。少了它，窗口被 SetWindowPos 搬走、我们这边也把
 		// 底图烘好了，画面却还停在上一帧上 —— 用户看到的就是"拖动时背景根本
 		// 不动，要松开鼠标才变"，而且搬走的那块还是矩形（四个直角）。
 		d.win.FrameNow()
+		// 关键的一步：把这一帧**真的推上屏**。主面板的 dragTo() 里也是这么做的
+		// （panel.FrameNow()）。少了它，窗口被 SetWindowPos 搬走、底图也平移好了，
+		// 画面却还停在上一帧 —— 用户看到的就是"拖动时背景根本不动"。
+		if d.win != nil {
+			d.win.FrameNow()
+		}
 		// 拖动中不要交给 mygo：它的 hover/点击逻辑会把光标当成"在顶栏上"。
 		return 0
 
