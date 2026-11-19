@@ -2567,11 +2567,16 @@ func (a *application) ready() {
 		// 跳一下"——那正是用户说的"模糊背景的移动有滞后"。
 		now := time.Now()
 		a.panelMu.Lock()
+		// 正好在缩放（拖边）时，位置也在变：那一路的 mygo surface 收到 WM_SIZE
+		// 就自己 drawNow 了，这里再排一次 Update 等于一帧画两遍 —— 之前"快速
+		// 缩放卡死"就是这么来的。缩放的帧由 resize 回调管（见上面那段），
+		// 这里只在**纯移动**时补帧。
+		resizing := !a.resizePrev.IsZero() && now.Sub(a.resizePrev) < 200*time.Millisecond
 		// 一次只排一个：拖面板走的是系统的模态拖动循环（mygo 的 DragWindow 就是
 		// SendMessage(WM_NCLBUTTONDOWN, HTCAPTION)），那段循环里队列跑得比平时慢，
 		// 每帧无条件 post 一个"整树重建"只会在队列里堆起来。排队了就不再排。
 		queued := false
-		if !a.moveUpdateQueued && now.Sub(a.lastMoveAt) >= 16*time.Millisecond {
+		if !resizing && !a.moveUpdateQueued && now.Sub(a.lastMoveAt) >= 16*time.Millisecond {
 			a.lastMoveAt = now
 			a.moveUpdateQueued = true
 			queued = true

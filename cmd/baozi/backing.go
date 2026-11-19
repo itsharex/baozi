@@ -61,6 +61,9 @@ var alphaBacking = func() bool {
 // 用来判断"屏幕最上面那一行到底是图没铺到，还是有别的东西盖在上面"。
 var rowProbe = os.Getenv("BAOZI_ROWPROBE") == "1"
 
+// backTime 打开后，每次拖动平移都把分段耗时打进日志（BAOZI_BACKTIME=1）。
+var backTime = os.Getenv("BAOZI_BACKTIME") == "1"
+
 // ringMode 决定四角和四条边那条 1px 线怎么画 —— 用户"能看出来"的那道白弧
 // 就是它。三种：
 //
@@ -113,12 +116,36 @@ func newRoundRect(cw, ch, inset int, radius float64) roundRect {
 
 // sd 返回点到圆角矩形边界的有符号距离（负=内部），坐标原点是矩形外框的中心。
 func (rr roundRect) sd(x, y float64) float64 {
-	qx := math.Abs(x) - rr.hx
-	qy := math.Abs(y) - rr.hy
-	in := math.Min(math.Max(qx, qy), 0)
-	ox := math.Max(qx, 0)
-	oy := math.Max(qy, 0)
-	return in + math.Hypot(ox, oy) - rr.r
+	// 手写 min/max 而不是 math.Min/math.Max：后者要照 NaN 语义走一遍
+	// 比较+分支（profile 里 archMin/archMax 占了一半的时间），而这里的
+	// 参数都是有限数，不会出现 NaN。一行像素里 sd 要算几十万次（4×4 超
+	// 采样更是 16 次/像素），省下来的是每帧几毫秒。
+	qx := x
+	if qx < 0 {
+		qx = -qx
+	}
+	qx -= rr.hx
+	qy := y
+	if qy < 0 {
+		qy = -qy
+	}
+	qy -= rr.hy
+	in := qx
+	if qy > in {
+		in = qy
+	}
+	if in > 0 {
+		in = 0
+	}
+	ox := qx
+	if ox < 0 {
+		ox = 0
+	}
+	oy := qy
+	if oy < 0 {
+		oy = 0
+	}
+	return in + math.Sqrt(ox*ox+oy*oy) - rr.r
 }
 
 // refreshBacking 重算底图。force 为 true 时不理会节流间隔。
@@ -158,9 +185,18 @@ func (a *application) refreshBacking(force bool) {
 		if dx > -(pw0*2/5) && dx < pw0*2/5 && dy > -(ph0*2/5) && dy < ph0*2/5 {
 			t0 := time.Now()
 			shiftPix(a.backPix, dx, dy)
+			t1 := time.Now()
 			a.repaintBackingBands(cx, cy, pw0, ph0, r, band, dx, dy)
+			t2 := time.Now()
 			a.backCx, a.backCy = cx, cy
 			a.back.Update(a.backPix)
+			t3 := time.Now()
+			if backTime {
+				log.Printf("玻璃: 平移 shift %.2fms rebake %.2fms update %.2fms（%+d,%+d）",
+					float64(t1.Sub(t0).Microseconds())/1000,
+					float64(t2.Sub(t1).Microseconds())/1000,
+					float64(t3.Sub(t2).Microseconds())/1000, dx, dy)
+			}
 			if d := time.Since(t0); d > 8*time.Millisecond {
 				log.Printf("玻璃: 底图平移 %.1fms（%+d,%+d）",
 					float64(d.Microseconds())/1000, dx, dy)
@@ -249,34 +285,47 @@ func shiftPix(img *image.RGBA, dx, dy int) {
 	}
 }
 
-// repaintBackingBands 只重算底图里"必须按新坐标画"的那几块：
-// 四条贴边带（形状边界的抗锯齿过渡、弧外那段 alpha=0、边框环）。
+// repaintBackingBands 只重算底图里"必须按新坐标画"的那几块。
 //
-// 带宽必须同时盖住两件事，所以是 band + |d| 而不是 band：
+// 需要重算的像素只有两类来源：
 //
-//	· 平移之后**新露出一条**桌面（宽度 |dx|、|dy|）；
-//	· 老图那条贴边带被整体搬进了内部 —— 它是按形状覆盖率算出来的（边上是
-//	  alpha=0、弧外铺的是桌面），搬到内部就成脏像素，必须一起重算。
+//	· 形状边界附近那 1~2 像素（抗锯齿过渡、边框环、弧外那段 alpha=0）；
+//	· 老图那一圈"按边界覆盖率算出来的"像素被整体搬进了内部（成脏像素），
+//	  以及平移之后新露出来的那条桌面 —— 两张都只需 |d| 宽。
+//
+// 所以边条的宽度是 3+|d|，不是 r+4；四角那 r 见方的一块（弧 + 弧外三角）
+// 单独补。整张是 74 万像素，这里约 4~5 万，一次平移 2ms 上下。
 func (a *application) repaintBackingBands(cx, cy, cw, ch, r, band, dx, dy int) {
-	left, right, top, bottom := band, band, band, band
-	if dx > 0 {
-		right += dx
-	} else if dx < 0 {
-		left -= dx
+	_ = band
+	abs := func(v int) int {
+		if v < 0 {
+			return -v
+		}
+		return v
 	}
-	if dy > 0 {
-		bottom += dy
-	} else if dy < 0 {
-		top -= dy
-	}
-	if left+right >= cw || top+bottom >= ch {
+	ex, ey := 3+abs(dx), 3+abs(dy)
+	if ex*2 >= cw || ey*2 >= ch || ex >= cw/2 || ey >= ch/2 {
 		a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rectangle{})
 		return
 	}
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, 0, cw, top))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ch-bottom, cw, ch))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, top, left, ch-bottom))
-	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-right, top, cw, ch-bottom))
+	// 上下横条（全宽）、左右竖条（避开横条已经盖过的两头）
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, 0, cw, ey))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ch-ey, cw, ch))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ey, ex, ch-ey))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-ex, ey, cw, ch-ey))
+	// 四个角块：弧、弧外三角，**以及老角块被搬进来落下的那块** —— 老角块
+	// 在旧坐标里是 [0,cr)×[0,cr)，内容出现在新坐标为止减 (dx,dy) 的位置，
+	// 所以角落要重算的并集是 cr+|d| 见方，不只是 cr。
+	cr := r + 2
+	cq, chq := cr+abs(dx), cr+abs(dy)
+	if cq >= cw || chq >= ch {
+		a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rectangle{})
+		return
+	}
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, 0, cq, chq))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-cq, 0, cw, chq))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(0, ch-chq, cq, ch))
+	a.composeBacking(cx, cy, cw, ch, r, backingPad, image.Rect(cw-cq, ch-chq, cw, ch))
 }
 
 // composeBacking 返回客户区大小的位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
@@ -425,15 +474,29 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.
 			}
 			gNearRow = gimg.Pix[(gj-gimg.Rect.Min.Y)*gimg.Stride:]
 		}
-		// 上下两条 r 像素的横带之外、左右两条 r 像素的竖带之内 —— 这一整段都在
-		// 圆角矩形的"直线部分"包围盒里，离弧远，覆盖率必为 1：直接铺玻璃。
-		midRow := y >= r && y < ch-r
+		// 这个像素要不要精确的形状覆盖率？只有两类要：最外 3 圈（抗锯齿过渡、
+		// 边框环、弧外那段 alpha=0）和四角的 r 见方块（弧 + 弧外三角）。
+		// 其余一律最近邻 —— 磨砂图本来就在 1/8 分辨率上糊过，放大时双线性和
+		// 最近邻的差别是 8 像素块里的一两档色差，看不出来。
+		//
+		// 判定只看 (x,y)、与窗口位置无关 —— 拖动时"平移内容"能成立全靠这一点：
+		// 同一个像素，在旧图和搬过来的像素里必须走同一条采样算法，否则平移值和
+		// 重新采样值对不上，四角那圈会看出一道分界线。
+		edgeY := y < 3 || y >= ch-3
+		cornerY := y < r+2 || y >= ch-r-2
 		for x := region.Min.X; x < region.Max.X; x++ {
 			o := out.PixOffset(x, y)
 			px := float64(x) + 0.5 - halfW
 
-			if midRow && x >= r && x < cw-r {
-				// 内部整片：最近邻取玻璃色就是全部工作，写完接着下一个。
+			edgeX := x < 3 || x >= cw-3
+			cornerX := x < r+2 || x >= cw-r-2
+			exact := edgeX || edgeY || (cornerX && cornerY)
+			sdOut := -2.0
+			if exact {
+				sdOut = outer.sd(px, py)
+			}
+			if !exact || sdOut < -1.2 {
+				// 覆盖率必为 1（离边界超过一个像素）：最近邻取玻璃色就是全部工作。
 				if gNearRow != nil {
 					o0 := (gxn[x] - gbx) * 4
 					out.Pix[o+0] = gNearRow[o0]
@@ -464,7 +527,6 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.
 				gr, gg, gb = 247, 248, 252
 			}
 
-			sdOut := outer.sd(px, py)
 			// 覆盖率。
 			//
 			// 以前是"距离边界 0.5px 以内线性过渡"——那只是**直边**的正确抗锯齿模型：
@@ -475,16 +537,9 @@ func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.
 			// 现在贴着边界的那一圈（|sd| < 1.2px）改成 4×4 超采样：把像素切成 16 个
 			// 子格，各自判内/外，覆盖率是"数出来的面积"而不是"中心的距离"——这就是
 			// iced/cairo 那套覆盖率抗锯齿的做法，弧上也是 16 档过渡，不再有台阶。
-			// 只对边界那一圈做（整块 1136×660 里约 1 万像素），代价 ~1ms。
 			const sub = 4
 			var cOut, ringC float64
 			switch {
-			case sdOut < -1.2:
-				// 离边界超过一个像素，必为 1/1，不用算。
-				cOut = 1
-				if sdOut > -1 {
-					ringC = 1 // 正好落在边框那 1px 里
-				}
 			case sdOut > 1.2:
 				cOut = 0
 			default:
