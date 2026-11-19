@@ -408,16 +408,28 @@ func (a *application) repaintBackingBands(cx, cy, cw, ch, r, band, dx, dy int) {
 // composeBacking 返回客户区大小的位图：桌面 + 玻璃 + 边框环，按覆盖率相加。
 // cw/ch 是**含内边距**的尺寸，inset 是四周多出来的物理像素数（backingPad），
 // 形状本身仍然铺在 [inset, inset+cw-2inset] 这一段，也就是客户的真实范围。
+// composeBacking 把底图合成到 a.backPix（主面板专用的复用缓冲）。
 func (a *application) composeBacking(cx, cy, cw, ch, r, inset int, region image.Rectangle) *image.RGBA {
-	if a.backPix == nil || a.backPix.Rect.Dx() != cw || a.backPix.Rect.Dy() != ch {
-		a.backPix = image.NewRGBA(image.Rect(0, 0, cw, ch))
+	pix := a.composeBackingInto(a.backPix, cx, cy, cw, ch, r, inset, region)
+	a.backPix = pix
+	return pix
+}
+
+// composeBackingInto 把整窗底图合成进 dst —— 传 nil 就新开一张。
+//
+// 抽出 dst 参数是为了让设置窗、文件互传窗也用同一套合成：它们和面板只有
+// "客户区原点 + 尺寸"不同，其余（磨砂图、取景基准、桌面兜底色、边框色、
+// 缩放比、圆角半径）全都是应用级共享的，所以合成逻辑一行都不用分叉。
+func (a *application) composeBackingInto(dst *image.RGBA, cx, cy, cw, ch, r, inset int, region image.Rectangle) *image.RGBA {
+	if dst == nil || dst.Rect.Dx() != cw || dst.Rect.Dy() != ch {
+		dst = image.NewRGBA(image.Rect(0, 0, cw, ch))
 	}
 	if region.Empty() {
 		region = image.Rect(0, 0, cw, ch)
 	} else {
 		region = region.Intersect(image.Rect(0, 0, cw, ch))
 	}
-	out := a.backPix
+	out := dst
 	// 所有像素都会被写到（形状外铺桌面），不用清零。
 
 	br, bg, bb := uint8(217), uint8(217), uint8(222)

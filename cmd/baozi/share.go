@@ -21,6 +21,9 @@ type shareWindow struct {
 	app     *application
 	win     *mygo.Window
 	session *share.Session
+	// glass 是和面板、设置窗同一套的自绘玻璃（mygo 的 Vibrancy 在 Win10 上
+	// 对 noRedirect 窗口没有视觉作用，那个窗口一直是纯色底）。
+	glass *subGlass
 
 	qrURL string
 	qr    *ui.Bitmap
@@ -87,14 +90,27 @@ func ttlLabel(minutes int) string {
 func newShareWindow(a *application) *shareWindow {
 	s := &shareWindow{app: a}
 	s.win = mygo.NewWindow(mygo.WindowOptions{
-		Title:     "Baozi 文件互传",
-		Width:     760,
-		Height:    680,
-		Hidden:    true,
-		Vibrancy:  mygo.VibrancyGlass,
-		MinWidth:  640,
-		MinHeight: 520,
-		Content:   ui.View(s.view),
+		Title:             "Baozi 文件互传",
+		Width:             760,
+		Height:            680,
+		Hidden:            true,
+		TitleBarStyle:     mygo.TitleBarHidden,
+		HideWindowButtons: true,
+		Transparent:       true,
+		CornerRadius:      0,
+		MinWidth:          640,
+		MinHeight:         520,
+		Content:           ui.View(s.view),
+	})
+	s.glass = a.newSubGlass(s.win, "互传")
+	s.win.OnResize(func() {
+		if s.glass == nil {
+			return
+		}
+		// 尺寸变了底图必须整张重烘；缩放期间先收起投影（每帧重画 layered 位图
+		// 是缩放卡顿的老来源），停手后由 view 里的 refreshShadow 补回来。
+		s.glass.hideShadow()
+		s.glass.refresh(true)
 	})
 	s.win.OnClose(func(e *mygo.CloseEvent) {
 		// 退出流程里必须放行，否则 mygo 的 Quit 会因为"窗口不肯关"被整体取消。
@@ -102,6 +118,9 @@ func newShareWindow(a *application) *shareWindow {
 			return
 		}
 		e.PreventDefault()
+		if s.glass != nil {
+			s.glass.hideShadow()
+		}
 		s.win.Hide()
 	})
 	return s
@@ -125,6 +144,10 @@ func (s *shareWindow) show() {
 	// 不再一打开就开服务：分享是一次性的，要用户自己点「生成链接」。
 	s.win.Show()
 	s.win.Focus()
+	if s.glass != nil {
+		s.glass.refresh(true)
+		s.glass.refreshShadow()
+	}
 }
 
 // list 是当前要分享的条目：已经开始共享就以会话里的为准，否则是攒着的候选。
@@ -209,13 +232,30 @@ func (s *shareWindow) stop() {
 }
 
 func (s *shareWindow) view(c *ui.Context) {
+	// 和面板同一套判断：玻璃的明暗跟壁纸走（见 main.go 的 view）。
+	if s.app != nil && s.app.frost != nil {
+		th := ui.LightTheme()
+		if s.app.deskDark {
+			th = ui.DarkTheme()
+		}
+		th.Background = ui.Transparent
+		c.SetTheme(th)
+	}
 	t := c.Theme()
 	// 和面板同一套字体，切窗口时不换字形。
 	usePanelFont(t)
-	c.Root().Background(t.Background)
+	c.Root().Background(ui.Transparent)
+	// 兜底：这一帧还没有底图就补烘一次（有了就不动）。
+	if s.glass != nil && s.glass.bitmap() == nil {
+		s.glass.refresh(true)
+	}
 
 	ui.Column(c).Fill().Children(func() {
-		ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).Children(func() {
+		// 最底层：和面板、设置窗同一套的自绘玻璃（圆角、边框、逐像素 alpha）。
+		if s.glass != nil {
+			s.glass.drawBitmap(c)
+		}
+		ui.Row(c).Padding(20, 24, 12, 24).Gap(12).AlignItems(ui.Center).DragWindow().Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "文件互传").FontSize(20).Bold()
 				if s.tab == 1 {
@@ -225,6 +265,12 @@ func (s *shareWindow) view(c *ui.Context) {
 					ui.Text(c, "局域网直连，不经过云端；生成一条带有效期的临时链接，到期自动失效").FontSize(11).TextColor(t.TextMuted)
 				}
 			})
+			if ui.Button(c, "✕ 关闭").Clicked() {
+				s.win.Hide()
+				if s.glass != nil {
+					s.glass.hideShadow()
+				}
+			}
 		})
 		ui.Row(c).Padding(0, 24).Children(func() {
 			ui.Tabs(c, &s.tab, "局域网链接", "跨网直传")

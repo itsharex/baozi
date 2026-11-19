@@ -21,6 +21,10 @@ import (
 type settingsWindow struct {
 	app *application
 	win *mygo.Window
+	// glass 是和面板同一套的自绘玻璃（圆角 + 边框 + 磨砂）。设置窗当初走的是
+	// mygo 的 Vibrancy，而 Win10 的 DWM accent 对 noRedirect 窗口只返回成功、
+	// 什么都不画 —— 那个窗口一直是纯色底。现在换成和面板同一份合成。
+	glass *subGlass
 
 	// 编辑中的副本，只有点"保存并应用"才写回配置。
 	doubleCtrl  bool
@@ -98,14 +102,29 @@ func newSettingsWindow(a *application) *settingsWindow {
 		Title: "Baozi 设置",
 		// 必须 Hidden：窗口创建即显示，不带这一项的话 Baozi 一启动就弹一个设置窗口，
 		// 它会占着任务栏、抢前台，还会让"点任务栏再双击 Ctrl"唤出的面板拿不到焦点。
-		Hidden:       true,
-		Width:        920,
-		Height:       820,
-		Vibrancy:     mygo.VibrancyGlass,
-		MinWidth:     800,
-		MinHeight:    560,
-		Content:      ui.View(s.view),
-		CornerRadius: 0,
+		Hidden: true,
+		// 和面板一样走"整窗自绘"：标题栏和窗口按钮都不要，形状（圆角）由底图画出来。
+		// 留着系统标题栏的话，圆角只能靠 SetWindowRgn ——— 那是 1 位掩码，弧上必然是
+		// 阶梯；而客户区透明又会露出标题栏下面那条硬边，两边都对不上。
+		TitleBarStyle:     mygo.TitleBarHidden,
+		HideWindowButtons: true,
+		Transparent:       true,
+		CornerRadius:      0,
+		Width:             920,
+		Height:            820,
+		MinWidth:          800,
+		MinHeight:         560,
+		Content:           ui.View(s.view),
+	})
+	s.glass = a.newSubGlass(s.win, "设置")
+	s.win.OnResize(func() {
+		if s.glass == nil {
+			return
+		}
+		// 尺寸变了底图必须整张重烘（子窗不走平移快路径）。缩放期间先把投影收起来：
+		// 每帧重画一张 layered 位图是缩放卡顿的老来源，停手后再补。
+		s.glass.hideShadow()
+		s.glass.refresh(true)
 	})
 	s.win.OnClose(func(e *mygo.CloseEvent) {
 		// 退出流程里必须放行，否则 mygo 的 Quit 会因为"窗口不肯关"被整体取消。
@@ -113,6 +132,9 @@ func newSettingsWindow(a *application) *settingsWindow {
 			return
 		}
 		e.PreventDefault()
+		if s.glass != nil {
+			s.glass.hideShadow()
+		}
 		s.win.Hide()
 	})
 	s.load()
@@ -181,6 +203,11 @@ func (s *settingsWindow) show() {
 	s.load()
 	s.win.Show()
 	s.win.Focus()
+	// 先 Show 再烘底图：句柄和客户区尺寸只有显示之后才准（藏着的窗口 DWM 不给尺寸）。
+	if s.glass != nil {
+		s.glass.refresh(true)
+		s.glass.refreshShadow()
+	}
 }
 
 // settingsNavItems 是左栏的设置项，顺序和右栏的段落一一对应。
@@ -198,10 +225,26 @@ const (
 )
 
 func (s *settingsWindow) view(c *ui.Context) {
+	// 和面板同一套判断：玻璃的明暗跟壁纸走，不跟系统的明暗外观走。
+	if s.app != nil && s.app.frost != nil {
+		th := ui.LightTheme()
+		if s.app.deskDark {
+			th = ui.DarkTheme()
+		}
+		// 圆角裁掉的四角要露出这块窗口自己的底（noRedirect 窗口透不出桌面），
+		// 所以清屏色必须是真透明，形状整个交给底图。
+		th.Background = ui.Transparent
+		c.SetTheme(th)
+	}
 	t := c.Theme()
 	// 和面板同一套字体，切窗口时不换字形。
 	usePanelFont(t)
-	c.Root().Background(t.Background)
+	c.Root().Background(ui.Transparent)
+	// 兜底：万一这一帧还没有底图（窗口不是经由 show() 显示的，比如系统恢复、
+	// 或者测试里直接 ShowWindow），补烘一次。有了就什么都不做。
+	if s.glass != nil && s.glass.bitmap() == nil {
+		s.glass.refresh(true)
+	}
 
 	// 测试里是直接 &settingsWindow{app: a} 构造的，未必走过 newSettingsWindow，
 	// 这里补一次，保证左栏能选、选中项就是 navSel。
@@ -216,12 +259,24 @@ func (s *settingsWindow) view(c *ui.Context) {
 	}
 
 	ui.Column(c).Fill().Children(func() {
-		// 顶栏
-		ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).Children(func() {
+		// 最底层：整窗自绘的玻璃底图（圆角、边框、逐像素 alpha 全在里面）。
+		// 必须在其它内容之前画，后面的元素盖在它上面。
+		if s.glass != nil {
+			s.glass.drawBitmap(c)
+		}
+		// 顶栏（整条都能拖动窗口：这一版没有系统标题栏，没有它就拿不走窗口）
+		ui.Row(c).Padding(20, 24, 14, 24).Gap(10).AlignItems(ui.Center).DragWindow().Children(func() {
 			ui.Column(c).Grow(1).Gap(2).Children(func() {
 				ui.Text(c, "Baozi 设置").FontSize(20).Bold()
 				ui.Text(c, "改动保存后立即生效；配置文件在 "+s.app.cfgPath).FontSize(11).TextColor(t.TextMuted)
 			})
+			// 隐藏了窗口按钮，得自己给一个关到托盘的口子。
+			if ui.Button(c, "✕ 关闭").Clicked() {
+				s.win.Hide()
+				if s.glass != nil {
+					s.glass.hideShadow()
+				}
+			}
 		})
 		ui.Divider(c)
 
