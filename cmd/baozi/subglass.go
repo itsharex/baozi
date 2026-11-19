@@ -160,6 +160,14 @@ func (g *subGlass) dipSize() (float32, float32) {
 // show 标记"这个窗口要上屏了"：投影层这时才允许显示。
 func (g *subGlass) show() {
 	g.visible = true
+	// 主面板在建窗时就调了 win.DisableViewFrame，把 DWM 画的那一圈非客户区关掉。
+	// 抽 subGlass 时漏了这一步 —— 于是设置窗/互传窗的边上还留着 DWM 的一圈
+	// （深底上是白亮的 1px 直边），用户看到的就是"四角还是直角"。补上。
+	if g.win != nil {
+		if hwnd := g.win.NativeHandle(); hwnd != 0 {
+			win.DisableViewFrame(hwnd)
+		}
+	}
 }
 
 // hide 标记"窗口收起来了"：投影层必须一起收，否则它会自己留在屏幕上。

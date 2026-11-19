@@ -139,6 +139,13 @@ func (d *subDrag) begin() {
 	d.pending = true
 	d.active = false
 	procSetCapture.Call(d.hwnd)
+	// 和主面板一样：一按下就切到"糊透"的玻璃（setDragFade），松手再恢复。
+	//
+	// 这一步才是主面板拖动"看着正常"的真相：拖动时玻璃被糊成一整片，
+	// 里面的桌面色本来就看不出位移，所以不会出现"背景停在原地"的观感。
+	// 子窗之前没做这步，玻璃还停在起点那块桌面上 —— 用户一眼就看出来。
+	d.glass.app.setDragFade(true)
+	d.glass.refresh(true)
 	log.Printf("子窗拖动: %s begin（光标 %d,%d 窗口 %d,%d）",
 		d.glass.name, d.startCurX, d.startCurY, d.startWinX, d.startWinY)
 }
@@ -180,11 +187,18 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 			d.active = false
 			d.pending = false
 			procRelCapture.Call()
+			d.glass.app.setDragFade(false)
 			d.glass.refresh(true)
 			d.glass.refreshShadow()
 			return 0
 		}
-		d.pending = false
+		if d.pending {
+			// 没到阈值：当普通点击。仍然要把糊化退掉。
+			d.pending = false
+			d.glass.app.setDragFade(false)
+			d.glass.refresh(true)
+			break
+		}
 
 	case wmMouseMove:
 		if !d.pending && !d.active {
@@ -234,6 +248,7 @@ func (d *subDrag) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintptr {
 			d.active = false
 			d.pending = false
 			procRelCapture.Call()
+			d.glass.app.setDragFade(false)
 			d.glass.refresh(true)
 			d.glass.refreshShadow()
 		}

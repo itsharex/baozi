@@ -104,7 +104,10 @@ func (f *shadowFollower) proc(hwnd, msg, wparam, lparam, id, data uintptr) uintp
 		}
 	case wmExitSizeMove:
 		f.drag = false
-		// 停手：底图按最终位置重烘一次，投影按新位置重画并显示。
+		// 停手：糊化退掉、底图按最终位置重烘一次，投影按新位置重画并显示。
+		if f.glass != nil && f.glass.app != nil {
+			f.glass.app.setDragFade(false)
+		}
 		f.glass.refresh(true)
 		f.glass.refreshShadow()
 	case wmNonClientLeftButtonDown:
