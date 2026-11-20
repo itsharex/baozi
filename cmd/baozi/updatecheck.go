@@ -129,8 +129,20 @@ func (a *application) runUpdateCheck(manual bool) {
 	}
 	// 结果变了：面板底栏的提示和关于页的状态都得跟上。
 	// 这里只是排一帧，不重烘玻璃 —— 与外观无关的状态变化不该触发整张底图重算。
+	a.refreshUpdateUI()
+}
+
+// refreshUpdateUI 请两块界面各重画一帧。
+//
+// 单靠面板那一帧是不够的：设置窗是另一张表面，它不跟着面板重画。如果检查是在
+// "设置 → 关于"开着的时候跑完的，那一行就会一直停在"正在检查…"，看起来像卡住
+// 了 —— 实际只是没人让它重画。
+func (a *application) refreshUpdateUI() {
 	if a.panelUp.Load() {
 		a.panel.Update(func() {})
+	}
+	if a.settings != nil && a.settings.win != nil {
+		a.settings.win.Update(func() {})
 	}
 }
 

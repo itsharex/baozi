@@ -584,11 +584,13 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 			busy := snap.Busy || snap.Installing
 			if ui.Button(c, "立即检查").Clicked() {
 				if !busy {
+					// 不在底栏写"正在检查"：状态行自己已经是"正在检查…"，底栏再挂
+					// 一句就变成了两处进度、而且查完没人清它 —— 看着像卡住。
+					s.message = ""
 					s.app.checkUpdatesNow(func() {
 						// 查完排一帧，让这一行文字换成新结果。
 						s.win.Update(func() {})
 					})
-					s.message = "正在后台检查更新…"
 				}
 			}
 		})
