@@ -1806,7 +1806,7 @@ params.Rgrc[0].Bottom = windowRect.Bottom
 ```
 
 客户区、窗口矩形、圆角区域从此是同一个矩形，四角只剩一套圆角，半径随便改
-（当前 `glassRadius = 32` DIP）。内容层也不再自己裁圆角，只留一圈跟圆弧重合的描边。
+（`glassRadius` 默认 24 DIP，设置里可改）。内容层也不再自己裁圆角，只留一圈跟圆弧重合的描边。
 
 **代价是自己接管命中测试。** 客户区铺满之后每个点都在客户区里，`DefWindowProc`
 一律回答 `HTCLIENT`，四条边的缩放全丢，按在边上只会拖动窗口。要补两处：
@@ -2406,4 +2406,32 @@ Windows 不允许改正在运行的可执行文件，而我们要换的就是自
 同一段 `applyUpdate` → 退出，覆盖和重启照样由脚本完成。给端到端验收、快捷方式和
 计划任务用；正常双击启动不带参数，完全走不到这条分支。两条路共用同一段代码，
 免得只有界面那条会被修好、命令行那条慢慢漂掉。
+
+## mygo 补丁：改了哪十处，为什么不能放回本项目
+
+`go.mod` 里是 `replace github.com/egoist/mygo => ./.patched-mygo`：仓库里放一份
+上游 `v0.8.1` 的源码副本，只参与本项目编译；`go/pkg/mod` 里的上游和 `go.sum`
+都没动，别的项目不受影响。
+
+副本里相对上游只有下面十处改动。`tools/make-mygo-patch.ps1` 会把它们导成
+`patches/mygo-v0.8.1.patch`；带 `-Verify` 跑一遍会把这个 patch 应用到一个干净的
+上游副本上，再逐字节比对，确认"文件里写的"就是"实际在编的"。
+
+| 文件 | 改动 | 不放回本项目的原因 |
+|---|---|---|
+| `internal/gpu/d3d11/d3d11.go` | 内容背景 alpha < 255 时不再强行拉成 1 | 在渲染器给交换链铺底色的那一步；外部拿不到这一帧 |
+| `internal/windows/compositor.go` | `roundPixels`：按半径对整帧做像素级圆角，弧上带抗锯齿 | DirectComposition 的几何裁剪是硬边；像素在这一层，外部改不了 |
+| `internal/windows/surface.go` | 内容子窗口加 `WS_EX_NOREDIRECTIONBITMAP`；子窗口回答 `WM_NCHITTEST` 并把 `WM_NCLBUTTONDOWN` 转发给顶层 | 子窗口由 mygo 创建，WndProc 是它私有的；外部只能改样式，接不住这些消息 |
+| `internal/windows/window.go` | `WM_NCCALCSIZE` 让客户区铺满整个窗口；`resizeHitTest` 自己算四条边和四角 | 客户区尺寸由 mygo 的窗口过程算；子类化再改一层，等于和它抢同一批消息 |
+| `internal/windows/window.go` | `WindowOptions.CornerRadius` 记进 window，供合成器取用 | 半径要在建窗口时落进内部状态；0 表示直角、不做内容裁剪 |
+| `ui/frame.go`、`ui/services.go`、`ui/runtime.go`、`ui/window.go`、`content.go` | `FrameNow()`：立刻出帧、不等下一次刷新 | 出帧节拍在 host 的 `PacedSurface` 里；外面只能 `Invalidate`，那正是差一帧的来源 |
+| `ui/headless.go` | 无窗口模式的 `frameNow`，以及 `Tester.Drags()` 计数 | 测试钩子，跟着上面那条走 |
+
+`FrameNow` 是拖动玻璃时"内容和窗口一起走"的关键：只 `Invalidate` 的话，窗口移动
+落在下一帧、新内容再落一帧，那一帧的差就是"玻璃追不上窗口"。
+
+早先这里还留过两处调试代码：首帧往 `%TEMP%\mygo-show.txt`、`mygo-round.txt`
+写诊断，以及 `radius<=0` 时按 30px 兜底。后者会让传 `CornerRadius: 0` 的设置窗、
+互传窗也被切 30px 圆角——那是验证阶段的常量，不是设计，已经删掉；现在 0 就是直角。
+
 

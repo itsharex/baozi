@@ -4,11 +4,8 @@ package windows
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"math"
-	"os"
-	"path/filepath"
 	"time"
 	"unsafe"
 
@@ -279,10 +276,6 @@ type compositor struct {
 	// Windows 10's DWM gives a window square corners whatever
 	// WindowOptions.CornerRadius says.
 	radius int32
-	// roundLogged is whether roundPixels has said what it saw, once.
-	roundLogged bool
-	// showLogged is whether show has said its size, once.
-	showLogged bool
 	// retry is when to draw again after drawing failed fails times in a
 	// row, with a device that stayed valid.
 	retry time.Time
@@ -313,10 +306,6 @@ func (c *compositor) show(px []uint32, w, h int32) {
 		return
 	}
 	b := c.b
-	if !c.showLogged {
-		os.WriteFile(filepath.Join(os.TempDir(), "mygo-show.txt"), []byte(fmt.Sprintf("w=%d h=%d radius=%d\n", w, h, c.radius)), 0o644)
-		c.showLogged = true
-	}
 	dev := b.composition()
 	if dev == nil {
 		b.composeLater(b.compRetry)
@@ -398,22 +387,8 @@ func (c *compositor) draw(dev *composition, px []uint32, w, h int32) error {
 // which is the same jagged edge a window region gives.
 func (c *compositor) roundPixels(px []uint32, w, h int32) {
 	r := c.radius
-	// baozi 的诊断补丁：窗口建好时没人把 CornerRadius 传进来（实测 radius=0，
-	// 所以内容四角一直是直角）。这里先按 24 DIP × 1.25 = 30 兜底，用来验证
-	// "内容层 alpha 裁圆角"这条路通不通；验证完应该由调用方把半径传对。
-	if r <= 0 {
-		r = 30
-	}
 	if r <= 0 || w < 2*r || h < 2*r {
-		if !c.roundLogged {
-			os.WriteFile(filepath.Join(os.TempDir(), "mygo-round.txt"), []byte(fmt.Sprintf("skip r=%d w=%d h=%d\n", r, w, h)), 0o644)
-			c.roundLogged = true
-		}
 		return
-	}
-	if !c.roundLogged {
-		os.WriteFile(filepath.Join(os.TempDir(), "mygo-round.txt"), []byte(fmt.Sprintf("round r=%d w=%d h=%d\n", r, w, h)), 0o644)
-		c.roundLogged = true
 	}
 	rf := float64(r)
 	for _, corner := range [4][2]int32{

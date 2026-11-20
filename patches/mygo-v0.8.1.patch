@@ -1,0 +1,463 @@
+# 本文件由 tools\make-mygo-patch.ps1 生成，不要手改。
+#
+# 上游：github.com/egoist/mygo v0.8.1
+# 应用方式（在 mygo 源码根目录）：
+#   git apply -p1 patches/mygo-v0.8.1.patch
+#
+# 十条改动解决的问题见 docs/architecture.md 的「mygo 补丁」一节。
+diff --git a/content.go b/content.go
+index 537ff48..7e33153 100644
+--- a/content.go
++++ b/content.go
+@@ -166,6 +166,23 @@ func (w *Window) Invalidate() {
+ 	})
+ }
+ 
++// FrameNow draws the window's pending frame at once, without waiting for the
++// display's next refresh, and returns once it is drawn.
++//
++// It is for a caller that moves the window and changes what it shows in the
++// same gesture, as dragging it: Invalidate alone lands the move in the next
++// frame and the new content in the frame after, and that one frame of
++// difference is what reads as the glass lagging behind the window.
++func (w *Window) FrameNow() {
++	if w == nil || w.conn == nil || w.conn.Surface == nil {
++		return
++	}
++	w.contentChanged()
++	if p, ok := w.conn.Surface.(platform.PacedSurface); ok {
++		p.FrameNow()
++	}
++}
++
+ // Update runs fn on the main thread, where the window's Content builds its
+ // user interface, then redraws the Content. Goroutines change the state
+ // the interface shows through it:
+diff --git a/internal/gpu/d3d11/d3d11.go b/internal/gpu/d3d11/d3d11.go
+index b8b9f75..fe23430 100644
+--- a/internal/gpu/d3d11/d3d11.go
++++ b/internal/gpu/d3d11/d3d11.go
+@@ -662,6 +662,15 @@ func (r *Renderer) setBackground(c scene.Color) bool {
+ // the window's swap chain shows it.
+ func (r *Renderer) background() [4]float32 {
+ 	rgba := r.bg.Premul(1)
++	// A translucent content background must stay translucent: its alpha
++	// is what shows the window behind it (the desktop snapshot under a
++	// rounded corner, say). Forcing it to 1 turns every unpainted pixel —
++	// the corners left round, a frame still being drawn — into opaque
++	// white. An opaque background is still forced opaque, as before.
++	if r.bg.A < 255 {
++		rgba[3] = float32(r.bg.A) / 255
++		return rgba
++	}
+ 	rgba[3] = 1
+ 	return rgba
+ }
+diff --git a/internal/windows/compositor.go b/internal/windows/compositor.go
+index c0b7299..07edccf 100644
+--- a/internal/windows/compositor.go
++++ b/internal/windows/compositor.go
+@@ -5,6 +5,7 @@ package windows
+ import (
+ 	"errors"
+ 	"log"
++	"math"
+ 	"time"
+ 	"unsafe"
+ 
+@@ -269,6 +270,12 @@ type compositor struct {
+ 	target, visual, surface uintptr
+ 	w, h                    int32
+ 	px                      []uint32 // the pixels to show, kept from one paint to the next
++	// radius rounds the window's corners, in its pixels, 0 while it is
++	// square. The corners are taken off the pixels themselves (roundPixels):
++	// a clip of the visual's geometry edges the arc at the pixel grid, and
++	// Windows 10's DWM gives a window square corners whatever
++	// WindowOptions.CornerRadius says.
++	radius int32
+ 	// retry is when to draw again after drawing failed fails times in a
+ 	// row, with a device that stayed valid.
+ 	retry time.Time
+@@ -276,7 +283,11 @@ type compositor struct {
+ }
+ 
+ func newCompositor(b *Backend, hwnd uintptr) *compositor {
+-	return &compositor{b: b, hwnd: hwnd}
++	c := &compositor{b: b, hwnd: hwnd}
++	if w := b.windows[hwnd]; w != nil {
++		c.radius = w.cornerRadius
++	}
++	return c
+ }
+ 
+ // pixels returns room for n pixels.
+@@ -343,6 +354,7 @@ func (c *compositor) draw(dev *composition, px []uint32, w, h int32) error {
+ 			return hresultError("IDCompositionVisual::SetContent", hr)
+ 		}
+ 	}
++	c.roundPixels(px, w, h)
+ 	var tex uintptr
+ 	var offset point
+ 	if hr := comCall(c.surface, dcompSurfaceBeginDraw, 0, uintptr(unsafe.Pointer(&iidID3D11Texture2D)),
+@@ -362,6 +374,51 @@ func (c *compositor) draw(dev *composition, px []uint32, w, h int32) error {
+ 	return nil
+ }
+ 
++// roundPixels takes the corners off px, top-down rows of premultiplied BGRA
++// w wide and h high, at the window's radius: every pixel of the four corners
++// keeps the part of its alpha that the rounded rectangle covers, and with
++// premultiplied alpha the colour goes with it. That leaves the arc smooth —
++// a pixel at the edge is partly the window and partly the desktop behind it,
++// which the window shows through — and no pixel outside the arc at all.
++//
++// The arc is drawn here rather than clipped by the visual's geometry because
++// DirectComposition's clips are hard-edged: an IDCompositionRectangleClip
++// takes the corners of the visual but leaves the arc a stair of whole pixels,
++// which is the same jagged edge a window region gives.
++func (c *compositor) roundPixels(px []uint32, w, h int32) {
++	r := c.radius
++	if r <= 0 || w < 2*r || h < 2*r {
++		return
++	}
++	rf := float64(r)
++	for _, corner := range [4][2]int32{
++		{0, 0}, {w - r, 0}, {0, h - r}, {w - r, h - r},
++	} {
++		x0, y0 := corner[0], corner[1]
++		for y := int32(0); y < r; y++ {
++			for x := int32(0); x < r; x++ {
++				// How much of this pixel the quarter disc of radius r, its
++				// centre at (r, r) of this corner, covers: the distance from
++				// that centre, offset by half a pixel for the pixel's middle.
++				dx, dy := rf-float64(x)-0.5, rf-float64(y)-0.5
++				cover := rf - math.Sqrt(dx*dx+dy*dy)
++				if cover <= 0 {
++					px[(y0+y)*w+x0+x] = 0
++					continue
++				}
++				if cover >= 1 {
++					continue
++				}
++				p := px[(y0+y)*w+x0+x]
++				px[(y0+y)*w+x0+x] = uint32(float64(p>>24)*cover)<<24 |
++					uint32(float64((p>>16)&0xFF)*cover)<<16 |
++					uint32(float64((p>>8)&0xFF)*cover)<<8 |
++					uint32(float64(p&0xFF)*cover)
++			}
++		}
++	}
++}
++
+ func (c *compositor) free() {
+ 	for _, p := range []*uintptr{&c.surface, &c.visual, &c.target} {
+ 		if *p != 0 {
+diff --git a/internal/windows/surface.go b/internal/windows/surface.go
+index 3751f50..3883728 100644
+--- a/internal/windows/surface.go
++++ b/internal/windows/surface.go
+@@ -213,7 +213,11 @@ func registerSurfaceClass() {
+ func newSurface(w *window) *surface {
+ 	registerSurfaceClass()
+ 	s := &surface{w: w}
+-	s.hwnd = createWindow(0, surfaceClass, "", wsChild|wsVisible|wsClipSiblings, 0, 0, 0, 0, w.hwnd)
++	// The content surface is a child window, and a child window with a
++	// redirection bitmap gets an opaque white one: the pixels the parent's
++	// DirectComposition surface leaves translucent would show that white
++	// instead of the desktop. A window without one lets them through.
++	s.hwnd = createWindow(wsExNoRedirect, surfaceClass, "", wsChild|wsVisible|wsClipSiblings, 0, 0, 0, 0, w.hwnd)
+ 	if s.hwnd == 0 {
+ 		return nil
+ 	}
+@@ -499,6 +503,12 @@ func (s *surface) PresentPixels(pix []byte, stride, width, height int) {
+ 		if s.comp == nil {
+ 			s.comp = newCompositor(s.w.b, s.hwnd)
+ 		}
++		if s.w != nil && s.w.opts.CornerRadius > 0 {
++			// The radius in pixels follows the DPI the window has now, not
++			// the one it was made with: at creation the window may not know
++			// its monitor yet, and a window moved to another one changes it.
++			s.comp.radius = toPx(s.w.opts.CornerRadius, s.dpi())
++		}
+ 		px := s.comp.pixels(width * height)
+ 		for y := range height {
+ 			copy(px[y*width:(y+1)*width], unsafe.Slice((*uint32)(unsafe.Pointer(&pix[y*stride])), width))
+@@ -695,6 +705,21 @@ func (s *surface) pointer(kind platform.SurfaceEventKind, lp uintptr, button int
+ 
+ func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool) {
+ 	switch m {
++	case wmNCHitTest:
++		// 客户区铺满整个窗口（frameCalcSize）之后，鼠标总是落在 surface 这个
++		// 子窗口上，主窗口的 WM_NCHITTEST 根本不会被问 —— 边缘就只剩拖动。
++		// 这里把边缘一圈判成缩放，中间照旧交给 UI（拖动区移动窗口）。
++		if w := s.w; w.captionless() && !w.fullScreen && !w.IsMaximized() && w.hasStyle(wsThickFrame) {
++			if hit, ok := w.resizeHitTest(getXParam(lp), getYParam(lp)); ok {
++				return hit, true
++			}
++		}
++	case wmNCLButtonDown, wmNCLButtonDblClk:
++		// 命中测试把边缘判成缩放之后，系统把 NCLBUTTONDOWN 发给这个子窗口。
++		// 子窗口自己不会缩放，转发给顶层窗口，缩放循环才真的开始
++		// （topedge.go 的顶边窗口也是这么做的）。
++		r, _, _ := procSendMessageW.Call(s.w.hwnd, uintptr(m), wp, lp)
++		return r, true
+ 	case wmMouseMove, wmLButtonDown, wmLButtonDblClk, wmLButtonUp, wmRButtonDown, wmRButtonDblClk, wmRButtonUp,
+ 		wmMButtonDown, wmMButtonDblClk, wmMButtonUp, wmXButtonDown, wmXButtonDblClk, wmXButtonUp, wmMouseWheel, wmMouseHWheel:
+ 		if s.forwardMouse(m, wp, lp) {
+diff --git a/internal/windows/window.go b/internal/windows/window.go
+index aaa2865..83b69d2 100644
+--- a/internal/windows/window.go
++++ b/internal/windows/window.go
+@@ -22,6 +22,10 @@ type window struct {
+ 	// flyoutSize.
+ 	flyout     platform.Flyout
+ 	flyoutSize platform.Size
++	// cornerRadius rounds the window's content in its surface's clip, in the
++	// window's pixels: WindowOptions.CornerRadius, where the platform rounds
++	// nothing itself (Windows 10, whose DWM gives every window square corners).
++	cornerRadius int32
+ 
+ 	// The WebView2 controller is created asynchronously; calls that need
+ 	// it wait in pending until it exists, or fail with webViewErr, why it
+@@ -202,7 +206,12 @@ func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler)
+ 	if o.Panel || o.Frameless && o.CornerRadius > 0 {
+ 		// Windows 11 gives tool windows the small corners of menus, and
+ 		// frameless windows none: rounded, they take its own corners,
+-		// whatever the radius.
++		// whatever the radius. Windows 10 rounds nothing at all, so the
++		// content is cut to the radius in its surface's clip instead (see
++		// compositor.round), which antialiases it as DWM does on 11.
++		if o.CornerRadius > 0 {
++			w.cornerRadius = int32(toPx(o.CornerRadius, dpiOf(w.hwnd)))
++		}
+ 		w.roundFlyout()
+ 	}
+ 	if o.Flyout != nil {
+@@ -578,6 +587,16 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
+ 		if w.captionless() && wp != 0 && !w.fullScreen {
+ 			return w.frameCalcSize(wp, lp), true
+ 		}
++	case wmNCHitTest:
++		// 客户区铺满整个窗口（frameCalcSize）之后，每个点都落在客户区里，
++		// DefWindowProc 会一律回答 HTCLIENT —— 四条边的缩放就没了，按在边上
++		// 只会走拖动区去移动窗口。这里自己把边缘一圈按边框厚度判成缩放，
++		// 角的 16px 判成角（和 Chromium 的框一样）。
++		if w.captionless() && !w.fullScreen && !w.IsMaximized() && w.hasStyle(wsThickFrame) {
++			if hit, ok := w.resizeHitTest(getXParam(lp), getYParam(lp)); ok {
++				return hit, true
++			}
++		}
+ 	case wmEraseBkgnd:
+ 		brush := w.bgBrush
+ 		if w.surface != nil && w.surface.bgBrush != 0 {
+@@ -830,21 +849,72 @@ func (w *window) frameCalcSize(wp, lp uintptr) uintptr {
+ 		return 0
+ 	}
+ 	if windowLong(w.hwnd, gwlStyle)&wsThickFrame != 0 {
+-		top := params.Rgrc[0].Top
++		windowRect := params.Rgrc[0]
+ 		procDefWindowProcW.Call(w.hwnd, wmNCCalcSize, wp, lp)
+-		params.Rgrc[0].Top = top
++		// 去掉标题栏，客户区铺满**整个窗口**。
++		//
++		// 原先是只去掉标题栏、把左/右/下那几条不可见边框留给系统：那几条能让
++		// 窗口从四边拖大小，但客户区随之小一圈（这台机器上是 18×9）。玻璃面板的
++		// 圆角区域铺的是整个窗口矩形，内容却画在这个小一圈的客户区里 —— 底部和
++		// 两侧那 9px 没有内容可画，透出来是桌面，看上去就是"左下、右下两个角被
++		// 啃掉了一块"，怎么调圆角半径都补不上。
++		//
++		// 全吃掉不吃亏：WM_NCHITTEST 由 DefWindowProc 按**窗口矩形**回答，与客户区
++		// 大小无关，四条边照样能拖大小（Electron 的 frame:false 就是这么处理的）。
++		params.Rgrc[0].Top = windowRect.Top
+ 		if w.hiddenTitleBar && windows11() {
+ 			params.Rgrc[0].Top++
+ 		}
+-		if b := w.frameBorder(); b > 0 {
+-			params.Rgrc[0].Left -= b
+-			params.Rgrc[0].Right += b
+-			params.Rgrc[0].Bottom += b
+-		}
++		params.Rgrc[0].Left = windowRect.Left
++		params.Rgrc[0].Right = windowRect.Right
++		params.Rgrc[0].Bottom = windowRect.Bottom
+ 	}
+ 	return 0
+ }
+ 
++// resizeHitTest answers WM_NCHITTEST along the edges of a window whose client
++// area covers the whole window: ok false in the middle, where the drag region
++// of the page or of native UI moves the window.
++func (w *window) resizeHitTest(sx, sy int32) (uintptr, bool) {
++	pt := point{sx, sy}
++	procScreenToClient.Call(w.hwnd, uintptr(unsafe.Pointer(&pt)))
++	var r rect
++	procGetClientRect.Call(w.hwnd, uintptr(unsafe.Pointer(&r)))
++	if pt.X < 0 || pt.Y < 0 || pt.X >= r.Right || pt.Y >= r.Bottom {
++		return 0, false
++	}
++	dpi := dpiOf(w.hwnd)
++	b := resizeBorder(dpi)
++	corner := toPx(resizeCornerSize, dpi)
++	left := pt.X < b
++	right := pt.X >= r.Right-b
++	top := pt.Y < b
++	bottom := pt.Y >= r.Bottom-b
++	nearLeft := pt.X < corner
++	nearRight := pt.X >= r.Right-corner
++	nearTop := pt.Y < corner
++	nearBottom := pt.Y >= r.Bottom-corner
++	switch {
++	case nearTop && nearLeft:
++		return htTopLeft, true
++	case nearTop && nearRight:
++		return htTopRight, true
++	case nearBottom && nearLeft:
++		return htBottomLeft, true
++	case nearBottom && nearRight:
++		return htBottomRight, true
++	case top:
++		return htTop, true
++	case bottom:
++		return htBottom, true
++	case left:
++		return htLeft, true
++	case right:
++		return htRight, true
++	}
++	return 0, false
++}
++
+ // frameBorder returns how many pixels of the left, right and bottom
+ // borders that DefWindowProc keeps a resizable frameless window are its
+ // client area's on Windows 10: the innermost, which DWM draws as the
+diff --git a/ui/frame.go b/ui/frame.go
+index c9ce14e..7086b11 100644
+--- a/ui/frame.go
++++ b/ui/frame.go
+@@ -44,6 +44,20 @@ func (c *Context) Invalidate() {
+ 	}
+ }
+ 
++// FrameNow draws the pending frame at once, without waiting for the display's
++// next refresh, and blocks until it is drawn.
++//
++// It is for a caller that has just moved its window and changed what it shows
++// in the same gesture, as a window being dragged: the move and the new content
++// then reach the compositor in one frame. With Invalidate alone the move lands
++// in the next frame and the new content in the one after, and that one frame of
++// difference is what reads as the content lagging behind the window.
++func (c *Context) FrameNow() {
++	if c != nil {
++		c.services.FrameNow()
++	}
++}
++
+ // Key assigns the identity of the next control before its state is read.
+ // A compound widget consumes the key for its outermost element.
+ func (c *Context) Key(key any) *Context {
+diff --git a/ui/headless.go b/ui/headless.go
+index 5260574..4583e0a 100644
+--- a/ui/headless.go
++++ b/ui/headless.go
+@@ -77,6 +77,9 @@ type headless struct {
+ 	dragData    transfer.Data
+ 	dragLocal   any
+ 	dragOptions transfer.DragOptions
++	// drags counts startDrag calls, so a test can tell whether a press went
++	// to a DragWindow element or to something that took it first.
++	drags int
+ 	// webViews are where the last frame showing web views showed them;
+ 	// tabbedInto the web view Tab gave the keyboard last, from its end
+ 	// when tabbedBack.
+@@ -114,7 +117,7 @@ func (h *headless) repaintTimer(at time.Time)                  { h.repaintAt = a
+ func (h *headless) setCursor(c Cursor)                         { h.cursor = c }
+ func (h *headless) setTextInput(t platform.TextInputState)     { h.ime = t }
+ func (h *headless) updateAccessibility(t *platform.AccessTree) { h.keepAccess(t) }
+-func (h *headless) startDrag()                                 {}
++func (h *headless) startDrag()                                 { h.drags++ }
+ func (h *headless) setDropFormats([]transfer.Format)           {}
+ func (h *headless) readClipboard() string {
+ 	if r := h.reading; r != nil {
+@@ -182,6 +185,9 @@ func (h *headless) invalidate() {
+ 	h.requested.Store(true)
+ }
+ 
++// frameNow has nothing to show at once: headless frames go nowhere.
++func (h *headless) frameNow() { h.invalidate() }
++
+ // writeClipboard copies s, unless FailClipboard set an error;
+ // writeClipboardThen gives done that error before the next frame too, as
+ // a window gives it after the system wrote the clipboard.
+@@ -329,6 +335,11 @@ func (t *Tester) runLater() {
+ // still until Advance moves it.
+ func (t *Tester) Now() time.Time { return t.now }
+ 
++// Drags is how many times the view asked the window to move, a press on
++// a DragWindow element being one: a test tells whether a spot of the panel
++// can be dragged by pressing it and reading whether Drags grew.
++func (t *Tester) Drags() int { return t.h.drags }
++
+ // Advance moves the Tester's clock on by d, running the frames due
+ // meanwhile at their times: one each refresh while something moves, and
+ // those of After and Painter.After when they come due. An animation of
+diff --git a/ui/runtime.go b/ui/runtime.go
+index 62ec3bd..9b7ea32 100644
+--- a/ui/runtime.go
++++ b/ui/runtime.go
+@@ -78,6 +78,13 @@ type host interface {
+ 	active() bool
+ 	// invalidate asks for a frame from any goroutine.
+ 	invalidate()
++	// frameNow draws the pending frame at once, without waiting for the
++	// display's next refresh. It is what a caller that has just moved the
++	// window and changed what it shows needs: the move and the new content
++	// then reach the compositor in the same frame, rather than a frame
++	// apart, which shows as the content lagging the window while dragged.
++	// It blocks until the frame is drawn, so call it from the main thread.
++	frameNow()
+ 	// post runs fn on the main thread soon; it is safe from any goroutine.
+ 	post(fn func())
+ 	openURL(url string, done func(error))
+diff --git a/ui/services.go b/ui/services.go
+index 2e50161..66bac41 100644
+--- a/ui/services.go
++++ b/ui/services.go
+@@ -26,6 +26,14 @@ func (s Services) Invalidate() {
+ 		rt.host.invalidate()
+ 	}
+ }
++
++// FrameNow draws the pending frame at once, without waiting for the display's
++// next refresh. See Context.FrameNow.
++func (s Services) FrameNow() {
++	if rt := s.owner.Value(); rt != nil && !rt.closed {
++		rt.host.frameNow()
++	}
++}
+ func (s Services) ReadClipboard() string {
+ 	if rt := s.owner.Value(); rt != nil && !rt.closed {
+ 		return rt.host.readClipboard()
+diff --git a/ui/window.go b/ui/window.go
+index 3b3dd5b..87accac 100644
+--- a/ui/window.go
++++ b/ui/window.go
+@@ -942,6 +942,20 @@ func (h *windowHost) active() bool { return h.conn.Active == nil || h.conn.Activ
+ 
+ func (h *windowHost) invalidate() { h.conn.Invalidate() }
+ 
++// frameNow draws the pending frame without waiting for the display's next
++// refresh: the window's move and the content it shows then reach the
++// compositor in the same frame instead of a frame apart.
++func (h *windowHost) frameNow() {
++	if h.conn == nil || h.conn.Surface == nil {
++		return
++	}
++	if p, ok := h.conn.Surface.(platform.PacedSurface); ok {
++		p.FrameNow()
++		return
++	}
++	h.conn.Invalidate()
++}
++
+ func (h *windowHost) openURL(u string, done func(error)) {
+ 	if h.conn.OpenURL != nil {
+ 		h.conn.OpenURL(u, done)

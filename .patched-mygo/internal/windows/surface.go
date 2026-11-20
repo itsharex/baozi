@@ -213,8 +213,10 @@ func registerSurfaceClass() {
 func newSurface(w *window) *surface {
 	registerSurfaceClass()
 	s := &surface{w: w}
-	// baozi patch: 内容子窗口也要无重定向位图，DWM 才会尊重 DirectComposition
-	// 表面的 alpha —— 否则窗口的圆角外是这块子窗口的不透明白底。
+	// The content surface is a child window, and a child window with a
+	// redirection bitmap gets an opaque white one: the pixels the parent's
+	// DirectComposition surface leaves translucent would show that white
+	// instead of the desktop. A window without one lets them through.
 	s.hwnd = createWindow(wsExNoRedirect, surfaceClass, "", wsChild|wsVisible|wsClipSiblings, 0, 0, 0, 0, w.hwnd)
 	if s.hwnd == 0 {
 		return nil
