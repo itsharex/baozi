@@ -798,8 +798,16 @@ func (s *settingsWindow) syncCommandEditor() {
 }
 
 // commitCommandEditor 把编辑框里的文本写回选中的那条（保存、新建、删除、切条目前都先调）。
+//
+// 只有编辑框已经和选中的那条同步过（cmdSync == cmdSel）才写回。否则那几行文本
+// 根本不是这条命令的内容 —— 典型场景：本次会话压根没打开过「自定义命令」页，
+// cmdAlias/cmdArgs 还是空的，这时候点「保存」会把选中那条的激活词和参数清空，
+// 而保存前的归一化又会把"没激活词"的条目当空壳丢掉：命令就这么一条条消失了。
 func (s *settingsWindow) commitCommandEditor() {
 	if len(s.cmds) == 0 || s.cmdSel < 0 || s.cmdSel >= len(s.cmds) {
+		return
+	}
+	if s.cmdSync != s.cmdSel {
 		return
 	}
 	cmd := &s.cmds[s.cmdSel]

@@ -512,6 +512,10 @@ func Load() (*Config, string, error) {
 }
 
 // Save 原子写入配置。
+//
+// 覆盖之前先把上一版留成 config.json.bak：这份文件里装着用户的命令、热键、
+// 索引范围，一旦被一次"状态不对"的保存覆盖掉（比如界面还没读完就点了保存），
+// 没有任何东西能找回来。备份失败不影响保存本身 —— 存下去比留底重要。
 func Save(cfg *Config, path string) error {
 	if cfg.Index.Roots == nil {
 		cfg.Index.Roots = SystemRoots()
@@ -519,6 +523,9 @@ func Save(cfg *Config, path string) error {
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
+	}
+	if old, err := os.ReadFile(path); err == nil && len(old) > 0 {
+		_ = os.WriteFile(path+".bak", old, 0o644)
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
