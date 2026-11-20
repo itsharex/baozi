@@ -542,31 +542,24 @@ func (s *settingsWindow) indexSection(c *ui.Context, t *ui.Theme) {
 func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 	snap := s.app.upd.snapshot()
 	ui.Column(c).Gap(10).Children(func() {
-		sectionTitle(c, t, "关于", "自绘玻璃的 Windows 启动器：双击 Ctrl 唤出，搜索文件、应用和历史。")
+		// 这一页只摆内容，不摆灰色说明：标签、注释、括号里的补充全部去掉，
+		// 剩下"版本号 / GitHub 入口 / 更新状态 / 网络 / 开关"五行。
+		sectionTitle(c, t, "关于", "")
 
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "版本").FontSize(12).TextColor(t.TextMuted).Width(70)
 			ui.Text(c, version.Display()).FontSize(12).Bold()
-			if version.IsDev() {
-				ui.Text(c, "本地编译，不参与更新比较").FontSize(11).TextColor(t.TextMuted)
-			}
 		})
 
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "GitHub").FontSize(12).TextColor(t.TextMuted).Width(70)
 			if ui.Button(c, "github.com/"+update.Repo).Clicked() {
 				openExternal(update.RepoPage)
 			}
-			ui.Text(c, "源码、Release 和安装包都在这里").FontSize(11).TextColor(t.TextMuted)
 		})
 
 		ui.Divider(c)
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "更新").FontSize(12).TextColor(t.TextMuted).Width(70)
 			ui.Text(c, updateStatusText(snap)).FontSize(12).Grow(1).SingleLine()
 			if snap.Newer && !snap.Installing {
-				// 有 zip 就直接下载+覆盖（脚本等本进程退出后干活）；没有 zip
-				// （比如某个 release 忘了传安装包）就退回打开下载页，别让按钮点了没反应。
 				if snap.ZipURL != "" {
 					if ui.PrimaryButton(c, "下载并更新").Clicked() {
 						s.app.installUpdate(snap)
@@ -594,20 +587,15 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 				}
 			}
 		})
-		// 网络这一行是给"检查一直失败"准备的：先让人看见它走的是直连还是代理。
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, "网络").FontSize(12).TextColor(t.TextMuted).Width(70)
 			ui.Text(c, update.ProxySummary()).FontSize(12).Grow(1).SingleLine()
 		})
 		if res := lastUpdateResult(); res != "" {
 			ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-				ui.Text(c, "上一次").FontSize(12).TextColor(t.TextMuted).Width(70)
 				ui.Text(c, res).FontSize(12).Grow(1).SingleLine()
 			})
 		}
-		ui.Checkbox(c, &s.autoUpdate, "启动时自动检查更新（后台进行，不阻塞启动）")
-		ui.Text(c, "只发一次 GitHub 请求，8 秒超时；代理读系统设置（也认 HTTPS_PROXY）；连不上就当作没查过。").
-			FontSize(11).TextColor(t.TextMuted)
+		ui.Checkbox(c, &s.autoUpdate, "启动时自动检查更新")
 	})
 }
 
@@ -632,12 +620,12 @@ func updateStatusText(s updateSnapshot) string {
 		// 用户刚点过按钮，最想看到的是"刚才那一下成不成"，而不是"有新版本"。
 		return s.Progress
 	case s.Newer:
-		return "发现新版本 " + s.Tag + "（当前 " + version.Display() + "）"
+		// 「关于」页不摆括号补充，所以状态行只说结论，版本号都在别处能看到。
+		return "发现新版本 " + s.Tag
 	case s.Tag != "" && version.IsDev():
-		// 本地编的版本没有可比的身份，别硬说"已是最新"——那只让人以为自己落后。
-		return "开发版（不参与比较）· 线上最新 " + s.Tag
+		return "开发版 · 线上最新 " + s.Tag
 	case s.Tag != "":
-		return "已是最新（" + s.Tag + "）"
+		return "已是最新"
 	case version.IsDev():
 		return "还没查过"
 	default:

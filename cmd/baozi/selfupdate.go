@@ -45,7 +45,7 @@ func (a *application) installUpdate(snap updateSnapshot) {
 		if !strings.EqualFold(filepath.Base(exe), "baozi.exe") {
 			// 调试版/改名版不参与自更新：脚本按三个固定文件名覆盖，
 			// 对着 baozi.debug.exe 覆盖等于把用户换回发布版，太容易误解。
-			a.setUpdProgress("当前不是发布版（" + filepath.Base(exe) + "），请用 zip 替换")
+			a.setUpdProgress("当前不是发布版 " + filepath.Base(exe) + "，请用 zip 替换")
 			return
 		}
 		installDir := filepath.Dir(exe)
@@ -54,7 +54,7 @@ func (a *application) installUpdate(snap updateSnapshot) {
 		// 十来兆再在脚本那一步失败，不如现在就告诉用户该怎么办。
 		probe := filepath.Join(installDir, ".baozi-wtest")
 		if f, err := os.Create(probe); err != nil {
-			a.setUpdProgress("安装目录不可写（" + installDir + "），请用管理员身份运行后再更新")
+			a.setUpdProgress("安装目录不可写 " + installDir + "，请用管理员身份运行")
 			writeUpdateLog("安装目录不可写：%v", err)
 			return
 		} else {
@@ -251,7 +251,7 @@ func lastUpdateResult() string {
 			return "上次更新成功"
 		case strings.Contains(s, "安装结束（有失败项"):
 			// 把失败那几行带上，用户才知道哪一步没成。
-			return "上次更新有失败项（详见 update.log）：" + firstFailure(lines[i:])
+			return "上次更新有失败项 " + firstFailure(lines[i:])
 		}
 	}
 	return ""

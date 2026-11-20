@@ -31,7 +31,9 @@ func TestSettingsAboutSection(t *testing.T) {
 	if s.navSel != secAbout {
 		t.Fatalf("没选中「关于」，navSel=%d", s.navSel)
 	}
-	for _, want := range []string{"关于", "版本", "GitHub", "更新", "启动时自动检查更新"} {
+	// 这一页只留内容：版本号、GitHub 入口、状态行与按钮、开关。
+	// 灰色标签（"版本""GitHub""更新""网络""上一次"）和括号补充都去掉了。
+	for _, want := range []string{"关于", "立即检查", "启动时自动检查更新"} {
 		if !tr.HasText(want) {
 			t.Fatalf("关于页里没找到「%s」", want)
 		}
@@ -39,6 +41,15 @@ func TestSettingsAboutSection(t *testing.T) {
 	// GitHub 地址要原样写出来（用户拿它当入口，不能只写个"项目主页"）。
 	if !tr.HasText("github.com/" + update.Repo) {
 		t.Fatalf("关于页里没有 GitHub 地址 github.com/%s", update.Repo)
+	}
+	// 版本号自己就是内容，直接摆出来。
+	if !tr.HasText(version.Display()) {
+		t.Fatalf("关于页里没有版本号 %s", version.Display())
+	}
+	for _, gone := range []string{"本地编译，不参与更新比较", "源码、Release 和安装包都在这里", "上一次"} {
+		if tr.HasText(gone) {
+			t.Fatalf("关于页里还留着灰字「%s」", gone)
+		}
 	}
 }
 
@@ -56,7 +67,7 @@ func TestUpdateStatusText(t *testing.T) {
 	}{
 		{"正在查", updateSnapshot{Busy: true}, "正在检查…"},
 		{"有新版", updateSnapshot{Tag: "v0.4.0", Newer: true}, "发现新版本 v0.4.0"},
-		{"已最新", updateSnapshot{Tag: "v0.3.0"}, "已是最新（v0.3.0）"},
+		{"已最新", updateSnapshot{Tag: "v0.3.0"}, "已是最新"},
 		{"失败", updateSnapshot{Err: "github 返回 403"}, "检查失败：github 返回 403"},
 		{"没查过", updateSnapshot{}, "还没查过"},
 		{"倒计时中", updateSnapshot{Tag: "v0.4.0", Newer: true, Installing: true, Progress: "正在下载 v0.4.0…"}, "正在下载 v0.4.0…"},
@@ -80,8 +91,30 @@ func TestUpdateStatusDevBuild(t *testing.T) {
 	defer func() { version.Version = old }()
 
 	got := updateStatusText(updateSnapshot{Tag: "v0.3.0"})
-	if !strings.Contains(got, "不参与比较") {
-		t.Fatalf("开发版应当说明不参与比较，实际 %q", got)
+	if !strings.Contains(got, "开发版") {
+		t.Fatalf("开发版应当标出来，实际 %q", got)
+	}
+	// 「关于」页不摆括号补充，状态行自己就不能带括号。
+	if strings.ContainsAny(got, "（）") {
+		t.Fatalf("状态行不该带括号：%q", got)
+	}
+}
+
+// TestUpdateStatusNoParens 是「关于」页那条要求（删掉灰色字和括号内容）的守门：
+// 任何状态下都不许带括号。
+func TestUpdateStatusNoParens(t *testing.T) {
+	snaps := []updateSnapshot{
+		{Busy: true},
+		{Tag: "v0.4.0", Newer: true},
+		{Tag: "v0.3.0"},
+		{Err: "403"},
+		{},
+		{Tag: "v0.4.0", Newer: true, Installing: true, Progress: "正在下载 v0.4.0…"},
+	}
+	for _, s := range snaps {
+		if got := updateStatusText(s); strings.ContainsAny(got, "（）") {
+			t.Errorf("状态 %+v 说出带括号的话：%q", s, got)
+		}
 	}
 }
 
