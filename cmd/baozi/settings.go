@@ -564,8 +564,16 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "更新").FontSize(12).TextColor(t.TextMuted).Width(70)
 			ui.Text(c, updateStatusText(snap)).FontSize(12).Grow(1).SingleLine()
-			if snap.Newer {
-				if ui.PrimaryButton(c, "打开下载页").Clicked() {
+			if snap.Newer && !snap.Installing {
+				// 有 zip 就直接下载+覆盖（脚本等本进程退出后干活）；没有 zip
+				// （比如某个 release 忘了传安装包）就退回打开下载页，别让按钮点了没反应。
+				if snap.ZipURL != "" {
+					if ui.PrimaryButton(c, "下载并更新").Clicked() {
+						s.app.installUpdate(snap)
+						s.message = "开始更新 " + snap.Tag + "…"
+					}
+				}
+				if ui.Button(c, "打开下载页").Clicked() {
 					page := snap.PageURL
 					if page == "" {
 						page = update.ReleasePage
@@ -573,7 +581,7 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 					openExternal(page)
 				}
 			}
-			busy := snap.Busy
+			busy := snap.Busy || snap.Installing
 			if ui.Button(c, "立即检查").Clicked() {
 				if !busy {
 					s.app.checkUpdatesNow(func() {
@@ -584,8 +592,19 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 				}
 			}
 		})
+		// 网络这一行是给"检查一直失败"准备的：先让人看见它走的是直连还是代理。
+		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "网络").FontSize(12).TextColor(t.TextMuted).Width(70)
+			ui.Text(c, update.ProxySummary()).FontSize(12).Grow(1).SingleLine()
+		})
+		if res := lastUpdateResult(); res != "" {
+			ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, "上一次").FontSize(12).TextColor(t.TextMuted).Width(70)
+				ui.Text(c, res).FontSize(12).Grow(1).SingleLine()
+			})
+		}
 		ui.Checkbox(c, &s.autoUpdate, "启动时自动检查更新（后台进行，不阻塞启动）")
-		ui.Text(c, "只发一次 GitHub 请求，8 秒超时；连不上就当作没查过，不影响任何功能。").
+		ui.Text(c, "只发一次 GitHub 请求，8 秒超时；代理读系统设置（也认 HTTPS_PROXY）；连不上就当作没查过。").
 			FontSize(11).TextColor(t.TextMuted)
 	})
 }
@@ -593,6 +612,10 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 // updateStatusText 把一份更新快照翻译成一句话。
 func updateStatusText(s updateSnapshot) string {
 	switch {
+	case s.Installing && s.Progress != "":
+		// 更新进行中：这一行就是进度条。它比"发现新版本"重要 ——
+		// 用户点完按钮最想知道的是"它到底在动没有"。
+		return s.Progress
 	case s.Busy:
 		return "正在检查…"
 	case s.Err != "":

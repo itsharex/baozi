@@ -49,7 +49,7 @@ func Latest(ctx context.Context) (*Release, error) {
 	req.Header.Set("User-Agent", "baozi-update-check")
 	req.Header.Set("Accept", "application/vnd.github+json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := sharedClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

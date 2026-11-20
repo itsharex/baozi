@@ -39,17 +39,25 @@ type updateState struct {
 	last *update.Release // 最近一次成功的结果（可能是"已是最新"）
 	err  string          // 最近一次失败的原因（空表示没失败过）
 	at   time.Time       // 最近一次发起检查的时刻
+
+	// 下载/覆盖阶段的状态。"关于"页在 installing 时把按钮换成一句进度，
+	// 用户能看见下到哪一步了（下载慢的时候尤其重要）。
+	installing bool
+	progress   string
 }
 
 // updateSnapshot 是给界面读的一帧快照（值拷贝，出了锁就不用再管并发）。
 type updateSnapshot struct {
-	Busy    bool
-	Tag     string
-	PageURL string
-	Newer   bool
-	Err     string
-	At      time.Time
-	Current string
+	Busy       bool
+	Installing bool
+	Progress   string
+	Tag        string
+	PageURL    string
+	ZipURL     string
+	Newer      bool
+	Err        string
+	At         time.Time
+	Current    string
 }
 
 // startUpdateCheck 在启动后**后台**查一次新版本。
@@ -164,13 +172,45 @@ func (s *updateState) snapshot() updateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur := version.Version
-	out := updateSnapshot{Busy: s.busy, Err: s.err, At: s.at, Current: cur}
+	out := updateSnapshot{
+		Busy: s.busy, Installing: s.installing, Progress: s.progress,
+		Err: s.err, At: s.at, Current: cur,
+	}
 	if s.last != nil {
 		out.Tag = s.last.Tag
 		out.PageURL = s.last.PageURL
+		out.ZipURL = s.last.ZipURL
 		out.Newer = update.Newer(cur, s.last.Tag)
 	}
 	return out
+}
+
+// beginInstall 抢到"这次更新归我装"，返回 false 表示已经在装或正在查。
+func (s *updateState) beginInstall() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.installing {
+		return false
+	}
+	s.installing = true
+	s.progress = "准备更新…"
+	return true
+}
+
+func (s *updateState) endInstall() {
+	s.mu.Lock()
+	s.installing = false
+	s.mu.Unlock()
+}
+
+// setUpdProgress 改一行进度，并请界面重画一帧（"关于"页正开着的话立刻能看到）。
+func (a *application) setUpdProgress(msg string) {
+	a.upd.mu.Lock()
+	a.upd.progress = msg
+	a.upd.mu.Unlock()
+	if a.settings != nil && a.settings.win != nil {
+		a.settings.win.Update(func() {})
+	}
 }
 
 // latestTag 是给面板底栏用的：有新版本就返回版本号，否则空。
