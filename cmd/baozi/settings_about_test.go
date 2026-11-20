@@ -53,6 +53,37 @@ func TestSettingsAboutSection(t *testing.T) {
 	}
 }
 
+// 「关于」页现在摆一个"使用代理 地址"的复选框；地址在这一页打开时现读，
+// 关掉开关后更新一律直连。
+func TestAboutProxyCheckbox(t *testing.T) {
+	a := testApp(t)
+	s := &settingsWindow{app: a}
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7892")
+	s.load()
+	if s.proxyAddr != "127.0.0.1:7892" {
+		t.Fatalf("打开设置时没读到代理地址：%q", s.proxyAddr)
+	}
+	if !s.useProxy {
+		t.Fatal("缺省应该是勾上的")
+	}
+
+	tr := ui.NewTester(s.view, 900, 820)
+	tr.Frame()
+	_ = tr.Click(settingsNavItems[secAbout])
+	tr.Frame()
+	if !tr.HasText("使用代理 127.0.0.1:7892") {
+		t.Fatal("关于页里没有「使用代理 127.0.0.1:7892」")
+	}
+
+	// 取消勾选立刻生效，并落进配置。
+	s.useProxy = false
+	update.SetUseProxy(false)
+	defer update.SetUseProxy(true)
+	if update.ProxySummary() != "直连（已关掉代理）" {
+		t.Fatalf("关掉后还在走代理：%q", update.ProxySummary())
+	}
+}
+
 // 状态行：四种情况各自说人话，别把原始错误或空串直接摆上去。
 func TestUpdateStatusText(t *testing.T) {
 	// 测试里没有注入版本号，默认是 dev —— 先钉一个真版本，才能验"已是最新"那句话。
@@ -140,6 +171,31 @@ func TestUpdateAutoCheckDefault(t *testing.T) {
 	cfg.Updates = config.Updates{AutoCheck: &off}
 	if cfg.UpdateAutoCheck() {
 		t.Fatal("写了 false 就该关掉")
+	}
+}
+
+// 代理开关缺省也是开的，并且能落盘；老配置里没有 useProxy 就当开。
+func TestUpdateUseProxyDefaultAndPersist(t *testing.T) {
+	cfg := config.Default()
+	if !cfg.UpdatesUseProxy() {
+		t.Fatal("缺省应该用代理")
+	}
+	off := false
+	cfg.Updates = config.Updates{UseProxy: &off}
+	if cfg.UpdatesUseProxy() {
+		t.Fatal("写了 false 就该关掉")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Save(cfg, path); err != nil {
+		t.Fatalf("保存失败：%v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读回失败：%v", err)
+	}
+	if !strings.Contains(string(raw), `"useProxy": false`) {
+		t.Fatalf("config.json 里没写 useProxy=false：\n%s", string(raw))
 	}
 }
 

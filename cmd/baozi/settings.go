@@ -77,6 +77,11 @@ type settingsWindow struct {
 	// 关于页：启动时要不要在后台查一次新版本。
 	// 检查结果不在这里存 —— 它属于运行时状态，挂在 application.upd 上。
 	autoUpdate bool
+	// useProxy / proxyAddr 是"关于"页那个"使用代理 地址"复选框。
+	// 地址不落盘：每次打开设置（load）都从环境变量/系统代理现读一次，
+	// 所以用户把 Clash 换个端口，下次打开设置就跟上了。
+	useProxy  bool
+	proxyAddr string
 
 	// 自定义命令：结构化编辑（左列选中哪条，右列就改哪条）。
 	cmds     []config.Command
@@ -194,6 +199,11 @@ func (s *settingsWindow) load() {
 	s.srcXplorer2 = cfg.PathSourceEnabled(win.SourceXplorer2)
 	s.srcTessoa = cfg.PathSourceEnabled(win.SourceTessoa)
 	s.autoUpdate = cfg.UpdateAutoCheck()
+	// 代理：开关来自配置，地址来自"现在系统里实际是什么"。load 在每次 show() 时调，
+	// 所以这就是"设置打开时读取"。
+	s.useProxy = cfg.UpdatesUseProxy()
+	s.proxyAddr = update.ProxyAddress()
+	update.SetUseProxy(s.useProxy)
 
 	// 自定义命令：编辑器直接改结构化的清单，不再让用户拼竖线。
 	s.cmds = append([]config.Command(nil), cfg.Commands...)
@@ -587,9 +597,17 @@ func (s *settingsWindow) aboutSection(c *ui.Context, t *ui.Theme) {
 				}
 			}
 		})
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Text(c, update.ProxySummary()).FontSize(12).Grow(1).SingleLine()
-		})
+		// 代理不写"系统代理/环境变量"这种来源名，只给一个开关和地址：
+		// 用户关心的是"走不走 127.0.0.1:7892"，不是这条地址从哪读到的。
+		if s.proxyAddr != "" {
+			el := ui.Checkbox(c, &s.useProxy, "使用代理 "+s.proxyAddr)
+			if el.Changed() {
+				// 立刻生效：下一次检查/下载就按新开关走，不必等保存。
+				update.SetUseProxy(s.useProxy)
+			}
+		} else {
+			ui.Text(c, "未检测到代理").FontSize(12)
+		}
 		if res := lastUpdateResult(); res != "" {
 			ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, res).FontSize(12).Grow(1).SingleLine()
@@ -1044,9 +1062,10 @@ func (s *settingsWindow) save() {
 		Xplorer2: boolPtr(s.srcXplorer2),
 		Tessoa:   boolPtr(s.srcTessoa),
 	}
-	// 关于页：自动检查更新写具体值，缺省是开。
+	// 关于页：自动检查更新 + 用不用代理，都写具体值（缺省是开）。
 	auto := s.autoUpdate
-	cfg.Updates = config.Updates{AutoCheck: &auto}
+	proxyOn := s.useProxy
+	cfg.Updates = config.Updates{AutoCheck: &auto, UseProxy: &proxyOn}
 
 	if err := config.Save(&cfg, s.app.cfgPath); err != nil {
 		s.message = "保存失败：" + err.Error()

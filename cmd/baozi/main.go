@@ -36,6 +36,7 @@ import (
 	"baozi/internal/index"
 	"baozi/internal/pinyin"
 	"baozi/internal/search"
+	"baozi/internal/update"
 	"baozi/internal/win"
 
 	"github.com/egoist/mygo"
@@ -2843,6 +2844,8 @@ func (a *application) ready() {
 
 	// 更新检查：起一个 goroutine 就返回。它自己先睡 3 秒再发请求，
 	// 所以"启动"这条路上没有任何一行代码在等网络（见 updatecheck.go）。
+	// 代理开关先按配置落定，否则第一次检查会用缺省（开），与用户的选择不一致。
+	update.SetUseProxy(a.cfg.UpdatesUseProxy())
 	a.startUpdateCheck()
 
 	// 文件对话框跟随：记住文件管理器最近待过的目录，那个「打开 / 另存为」框再回到前台时

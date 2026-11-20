@@ -139,6 +139,9 @@ type Updates struct {
 	// AutoCheck 为真时，每次启动在后台查一次 GitHub Releases（缺省开）。
 	// 检查永远是后台 goroutine + 超时，任何情况下都不许挡启动。
 	AutoCheck *bool `json:"autoCheck,omitempty"`
+	// UseProxy 为真时，更新检查/下载走代理（缺省开）。地址不落盘：
+	// 每次打开设置都从环境变量/系统代理现读，用户换了端口不用改配置。
+	UseProxy *bool `json:"useProxy,omitempty"`
 }
 
 // UpdateAutoCheck 报启动后要不要自动查新版本；没配过就是查。
@@ -147,6 +150,14 @@ func (c *Config) UpdateAutoCheck() bool {
 		return true
 	}
 	return *c.Updates.AutoCheck
+}
+
+// UpdatesUseProxy 报更新要不要走代理；没配过就是走（有就比没有强）。
+func (c *Config) UpdatesUseProxy() bool {
+	if c.Updates.UseProxy == nil {
+		return true
+	}
+	return *c.Updates.UseProxy
 }
 
 // PathSources 是"文件对话框跟随"的目录来源开关，和 internal/win 的 Source* 常量一一对应。

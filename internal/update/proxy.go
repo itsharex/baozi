@@ -1,12 +1,29 @@
 package update
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/sys/windows/registry"
 )
+
+// useProxy 是"要不要用代理"这个开关（缺省开）。
+//
+// 开的时候按 ProxyFunc 的顺序找代理（环境变量 → 系统代理 → 直连）；
+// 关掉就一律直连 —— 用户把代理软件关了、但注册表里那一条还留着的时候，
+// 复选框就是他唯一的出口。
+var useProxy atomic.Bool
+
+func init() { useProxy.Store(true) }
+
+// SetUseProxy 改这个开关（"关于"页那个复选框调它）。
+func SetUseProxy(on bool) { useProxy.Store(on) }
+
+// UseProxy 报当前开关状态。
+func UseProxy() bool { return useProxy.Load() }
 
 // ProxyFunc 是更新检查/下载用的代理规则。顺序是：
 //
@@ -18,14 +35,19 @@ import (
 // 只认 registry 里的 ProxyEnable / ProxyServer / ProxyOverride，不解析 PAC 脚本
 // （ProxyAutoConfigURL）。PAC 需要 WinHTTP 的 autoproxy 解析器，对"一个人用一台
 // 机器"的场景收益太低；公司里强制 PAC 的用户可以把 HTTPS_PROXY 设上，那条路是通的。
+//
+// 开关关掉时整段跳过，直接返回 nil（不查环境变量、不读注册表）。
 func ProxyFunc() func(*http.Request) (*url.URL, error) {
-	sys := readSystemProxy()
 	return func(req *http.Request) (*url.URL, error) {
+		if !useProxy.Load() {
+			return nil, nil
+		}
 		// 先用 Go 自带的那套（它只看环境变量）。
 		if u, err := http.ProxyFromEnvironment(req); err != nil || u != nil {
 			return u, err
 		}
-		if sys == "" || bypassed(req.URL.Hostname(), sysBypass) {
+		sys, bypass := readSystemProxy()
+		if sys == "" || bypassed(req.URL.Hostname(), bypass) {
 			return nil, nil
 		}
 		// 系统代理写的是 host:port，没有 scheme；Go 要求 http 代理用 http:// 前缀。
@@ -33,31 +55,64 @@ func ProxyFunc() func(*http.Request) (*url.URL, error) {
 	}
 }
 
-// sysBypass 是 registry 里 ProxyOverride 的值的副本（读一次就固定，
-// 一次更新检查期间代理设置不会变）。
-var sysBypass string
+// ProxyAddress 报"现在会用哪个代理"，给"关于"页那个复选框当标签用。
+//
+// 只返回 host:port（环境变量里写成 http://127.0.0.1:7892 的，也削成 127.0.0.1:7892）：
+// 标签只有一行，用户要认的是"哪个地址"，不是协议。找不到代理就返回空。
+func ProxyAddress() string {
+	if u := proxyFromEnv(); u != "" {
+		return hostPort(u)
+	}
+	sys, _ := readSystemProxy()
+	return sys
+}
 
-// readSystemProxy 读出系统代理的 host:port；没开或读不到就返回空。
-func readSystemProxy() string {
-	sysBypass = ""
+// hostPort 把 "http://127.0.0.1:7892" 削成 "127.0.0.1:7892"；已经没 scheme 就原样。
+func hostPort(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	if u.Port() == "" {
+		// 没写端口就按协议补一个，不然标签上只有个主机名，看不出是什么。
+		if u.Scheme == "https" {
+			return net.JoinHostPort(u.Hostname(), "443")
+		}
+		return net.JoinHostPort(u.Hostname(), "80")
+	}
+	return u.Host
+}
+
+// readSystemProxy 读出系统代理的 host:port 和"绕过"清单；没开或读不到就返回空。
+//
+// 每次调用都重读注册表：用户刚在 Clash 里开关过代理，读缓存就会显示上一条。
+// （一次更新检查里只会调一两次，这点开销无所谓。）
+func readSystemProxy() (proxy, bypass string) {
 	k, err := registry.OpenKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer k.Close()
 
 	if enable, _, err := k.GetIntegerValue("ProxyEnable"); err != nil || enable == 0 {
-		return ""
+		return "", ""
 	}
 	server, _, err := k.GetStringValue("ProxyServer")
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	if override, _, err := k.GetStringValue("ProxyOverride"); err == nil {
-		sysBypass = override
+		bypass = override
 	}
-	return proxyFor(server, "https")
+	return proxyFor(server, "https"), bypass
 }
 
 // proxyFor 从 ProxyServer 里挑出某个协议该用的那一条。

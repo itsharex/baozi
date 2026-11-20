@@ -2,6 +2,7 @@ package update
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -83,5 +84,48 @@ func TestProxyFuncNoEnv(t *testing.T) {
 	}
 	if u != nil && u.Host == "" {
 		t.Fatalf("拿到一个空代理地址：%v", u)
+	}
+}
+
+// TestProxyOff 关掉开关就一律直连，哪怕环境变量里明写着代理。
+func TestProxyOff(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:18080")
+	SetUseProxy(false)
+	defer SetUseProxy(true)
+
+	u, err := ProxyFunc()(mustReq(t, "https://api.github.com/x"))
+	if err != nil {
+		t.Fatalf("ProxyFunc: %v", err)
+	}
+	if u != nil {
+		t.Fatalf("关掉代理还走了 %v", u)
+	}
+	if !strings.Contains(ProxySummary(), "直连") {
+		t.Fatalf("摘要该说直连，实际 %q", ProxySummary())
+	}
+}
+
+// TestHostPort 标签上只留 host:port，不带 scheme。
+func TestHostPort(t *testing.T) {
+	cases := map[string]string{
+		"http://127.0.0.1:7892": "127.0.0.1:7892",
+		"127.0.0.1:7892":        "127.0.0.1:7892",
+		"https://proxy.corp":    "proxy.corp:443",
+		"http://proxy.corp":     "proxy.corp:80",
+		"":                      "",
+		"garbage":               "garbage",
+	}
+	for in, want := range cases {
+		if got := hostPort(in); got != want {
+			t.Errorf("hostPort(%q)=%q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestProxyAddress 有环境变量时用它（削成 host:port），这是"关于"页标签的来源。
+func TestProxyAddress(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7892")
+	if got := ProxyAddress(); got != "127.0.0.1:7892" {
+		t.Fatalf("ProxyAddress=%q", got)
 	}
 }

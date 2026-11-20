@@ -77,13 +77,16 @@ func Download(ctx context.Context, rawurl, dst string) (int64, error) {
 	return n, nil
 }
 
-// ProxySummary 给"关于"页显示一行：现在走的是哪条路。
-// 不是给诊断用的大文章，就一句话，用户看一眼就知道"到底有没有用上代理"。
+// ProxySummary 是给日志/诊断看的一句话：现在实际走的是哪条路。
+// （"关于"页不再显示它 —— 那一页只摆一个"使用代理 地址"的复选框。）
 func ProxySummary() string {
+	if !UseProxy() {
+		return "直连（已关掉代理）"
+	}
 	if u := proxyFromEnv(); u != "" {
 		return "环境变量：" + u
 	}
-	if sys := readSystemProxy(); sys != "" {
+	if sys, _ := readSystemProxy(); sys != "" {
 		return "系统代理：" + sys
 	}
 	return "直连"
