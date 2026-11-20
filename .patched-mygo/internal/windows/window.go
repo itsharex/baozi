@@ -588,10 +588,12 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 			return w.frameCalcSize(wp, lp), true
 		}
 	case wmNCHitTest:
-		// 客户区铺满整个窗口（frameCalcSize）之后，每个点都落在客户区里，
-		// DefWindowProc 会一律回答 HTCLIENT —— 四条边的缩放就没了，按在边上
-		// 只会走拖动区去移动窗口。这里自己把边缘一圈按边框厚度判成缩放，
-		// 角的 16px 判成角（和 Chromium 的框一样）。
+		// With the client area covering the whole window (frameCalcSize),
+		// every point is a client point and DefWindowProc answers HTCLIENT
+		// everywhere: the edges would only move the window, never resize it.
+		// Answer the border ring here instead, by the frame's thickness, with
+		// the outer 16px of each corner as its corner (Chromium's frame does
+		// the same).
 		if w.captionless() && !w.fullScreen && !w.IsMaximized() && w.hasStyle(wsThickFrame) {
 			if hit, ok := w.resizeHitTest(getXParam(lp), getYParam(lp)); ok {
 				return hit, true
@@ -851,16 +853,19 @@ func (w *window) frameCalcSize(wp, lp uintptr) uintptr {
 	if windowLong(w.hwnd, gwlStyle)&wsThickFrame != 0 {
 		windowRect := params.Rgrc[0]
 		procDefWindowProcW.Call(w.hwnd, wmNCCalcSize, wp, lp)
-		// 去掉标题栏，客户区铺满**整个窗口**。
+		// Drop the title bar and let the client area cover the whole window.
 		//
-		// 原先是只去掉标题栏、把左/右/下那几条不可见边框留给系统：那几条能让
-		// 窗口从四边拖大小，但客户区随之小一圈（这台机器上是 18×9）。玻璃面板的
-		// 圆角区域铺的是整个窗口矩形，内容却画在这个小一圈的客户区里 —— 底部和
-		// 两侧那 9px 没有内容可画，透出来是桌面，看上去就是"左下、右下两个角被
-		// 啃掉了一块"，怎么调圆角半径都补不上。
+		// DefWindowProc leaves the left, right and bottom invisible borders
+		// in place: they make the window resizable from its edges, but they
+		// also shrink the client area by a few pixels (18×9 on this machine).
+		// A window whose content is a rounded glass panel drawn across the
+		// whole window shows the desktop through those strips at the bottom
+		// and sides, which reads as the bottom corners being cut off, and no
+		// corner radius can paint over it.
 		//
-		// 全吃掉不吃亏：WM_NCHITTEST 由 DefWindowProc 按**窗口矩形**回答，与客户区
-		// 大小无关，四条边照样能拖大小（Electron 的 frame:false 就是这么处理的）。
+		// Taking the whole rect costs nothing: DefWindowProc answers
+		// WM_NCHITTEST against the window rect, not the client area, so the
+		// edges still resize (Electron's frame: false does the same).
 		params.Rgrc[0].Top = windowRect.Top
 		if w.hiddenTitleBar && windows11() {
 			params.Rgrc[0].Top++

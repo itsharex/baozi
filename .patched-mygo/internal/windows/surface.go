@@ -706,18 +706,20 @@ func (s *surface) pointer(kind platform.SurfaceEventKind, lp uintptr, button int
 func (s *surface) message(hwnd uintptr, m uint32, wp, lp uintptr) (uintptr, bool) {
 	switch m {
 	case wmNCHitTest:
-		// 客户区铺满整个窗口（frameCalcSize）之后，鼠标总是落在 surface 这个
-		// 子窗口上，主窗口的 WM_NCHITTEST 根本不会被问 —— 边缘就只剩拖动。
-		// 这里把边缘一圈判成缩放，中间照旧交给 UI（拖动区移动窗口）。
+		// With the client area covering the whole window (frameCalcSize), the
+		// pointer is always over the content surface: the window itself is
+		// never asked, so its edges would only move the window. Answer the
+		// border ring here too, and leave the middle to the UI, whose drag
+		// region moves the window.
 		if w := s.w; w.captionless() && !w.fullScreen && !w.IsMaximized() && w.hasStyle(wsThickFrame) {
 			if hit, ok := w.resizeHitTest(getXParam(lp), getYParam(lp)); ok {
 				return hit, true
 			}
 		}
 	case wmNCLButtonDown, wmNCLButtonDblClk:
-		// 命中测试把边缘判成缩放之后，系统把 NCLBUTTONDOWN 发给这个子窗口。
-		// 子窗口自己不会缩放，转发给顶层窗口，缩放循环才真的开始
-		// （topedge.go 的顶边窗口也是这么做的）。
+		// Once the hit test says a border, the system sends the button down
+		// to this child, which cannot resize its parent on its own. Forward it,
+		// and the resize loop starts (topedge.go's edge window forwards too).
 		r, _, _ := procSendMessageW.Call(s.w.hwnd, uintptr(m), wp, lp)
 		return r, true
 	case wmMouseMove, wmLButtonDown, wmLButtonDblClk, wmLButtonUp, wmRButtonDown, wmRButtonDblClk, wmRButtonUp,
