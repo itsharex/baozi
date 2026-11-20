@@ -3366,6 +3366,13 @@ func main() {
 		log.Fatalf("数据目录: %v", err)
 	}
 	app.cfg, app.cfgPath, app.dataDir = cfg, cfgPath, dir
+	// 内置脚本（关机/睡眠）在这里落盘，并把配置里指向旧外部路径的命令改成
+	// builtin:shutdown：脚本随程序走，不再依赖用户自己目录里的那份拷贝。
+	if ensureBuiltinCommands(app.cfg) {
+		if err := config.Save(app.cfg, app.cfgPath); err != nil {
+			log.Printf("保存配置（内置命令迁移）: %v", err)
+		}
+	}
 	// 外观必须在建面板窗口之前落地：圆角半径会作为 WindowOptions.CornerRadius
 	// 传给 mygo（窗口级参数，只在创建时读一次），晚一步就得改完重启才生效。
 	applyAppearance(cfg)

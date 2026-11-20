@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"baozi/internal/builtin"
 	"baozi/internal/config"
 )
 
@@ -115,6 +116,11 @@ func expandArgs(args []string, words []string, dir string) []string {
 // -WindowStyle Hidden -File …，一长串。填 D:\x\y.ps1 就不用管了。
 // 认不出来的扩展名原样交给 exec（.exe / .cmd 在 PATH 里的短名都走这条路）。
 func launchSpec(program string, args []string) (string, []string) {
+	// 内置脚本（builtin:shutdown 这类写法）先换成落盘后的真实路径：
+	// 配置里存的是"内置"这个名字，路径可能因用户目录不同而变化。
+	if p, ok := builtin.Resolve(program); ok {
+		program = p
+	}
 	low := strings.ToLower(strings.TrimSpace(program))
 	switch {
 	case strings.HasSuffix(low, ".ps1"):

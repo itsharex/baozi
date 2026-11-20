@@ -717,7 +717,7 @@ func (s *settingsWindow) commandsPage(c *ui.Context, t *ui.Theme) {
 					ui.TextInput(c, &cmd.Name).Placeholder("定时关机")
 
 					formField(c, t, "程序", "")
-					ui.TextInput(c, &cmd.Exec).Placeholder(`D:\1tools\scripts\shutdown-after.ps1`)
+					ui.TextInput(c, &cmd.Exec).Placeholder(`C:\Users\你\脚本.ps1`)
 
 					formField(c, t, "参数", "")
 					ui.TextArea(c, &s.cmdArgs).Height(110).FontSize(12)
