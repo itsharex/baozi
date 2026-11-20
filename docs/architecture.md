@@ -2329,11 +2329,12 @@ GDI 区域的弧按扫描线量整格、没有抗锯齿，屏幕上是"一格一
 本机随手 `go build` 出来的是 `dev`，关于页显示"开发版"并**不参与更新比较**
 （自己编的版本跟线上比没有意义，只会天天提示有新版本）。
 
-**检查更新只查不装。** `internal/update` 发一次 `GET /repos/l0rraine/baozi/releases/latest`
-（带 UA —— GitHub 对没有 UA 的请求直接 403），取 `tag_name` 与 windows 那个 zip
-的直链；`Newer` 按三段数字比较，不是字符串比较（`v0.9.0` vs `v0.10.0` 就是会
-栽跟头的那种）。替换安装目录这件事不在这里做：动用户的文件必须有人点一下，
-所以关于页只给「打开下载页」。
+**检查本身不改动磁盘。** `internal/update` 发一次
+`GET /repos/l0rraine/baozi/releases/latest`（带 UA —— GitHub 对没有 UA 的请求直接
+403），取 `tag_name` 与 windows 那个 zip 的直链；`Newer` 按三段数字比较，不是
+字符串比较（`v0.9.0` vs `v0.10.0` 就是会栽跟头的那种）。写磁盘是另一个动作：
+动用户的文件必须有人点一下按钮，所以关于页只在发现新版本时给「下载并更新」
+（release 里没有 zip 时退回「打开下载页」）。
 
 **为什么它一定不拖慢启动。** 三道闸：
 
@@ -2348,4 +2349,49 @@ GDI 区域的弧按扫描线量整格、没有抗锯齿，屏幕上是"一格一
 结果只存在内存里（`application.upd`，一把小锁 + 值快照），界面每帧读一份快照
 来画，所以打开设置、滚动、点「立即检查」都不会被网络挡住。有新版本时面板底栏
 会顺嘴提一句（"有新版本 v0.4.0 · 设置 → 关于"），不新增控件、不弹窗、不抢焦点。
+
+### 代理
+
+Go 的 `http.ProxyFromEnvironment` 只看环境变量，而 Clash / v2rayN 这类工具改的是
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`。只按环境变量
+取代理，就会出现"明明开着代理，检查更新还是连不上"。所以 `internal/update` 自己
+写了一个 `ProxyFunc`，顺序是：**环境变量 → 系统代理（ProxyEnable/ProxyServer/
+ProxyOverride）→ 直连**。检查和下载共用 `sharedClient`，两段路的代理行为一致。
+
+只认 registry 里的静态代理，**不解析 PAC**（`ProxyAutoConfigURL`）：PAC 要走
+WinHTTP 的 autoproxy 解析器，对一个人一台机器的场景收益太低；公司强制 PAC 的
+情况把 `HTTPS_PROXY` 设上就行。`ProxyOverride` 支持 `*.x` / `x.*` / `<local>` /
+精确主机名四种写法。关于页的「网络」行显示 `update.ProxySummary()`（直连 /
+系统代理 / 环境变量），排查"检查失败"时先看这一行。
+
+### 替换安装目录
+
+Windows 不允许改正在运行的可执行文件，而我们要换的就是自己。所以"下载并更新"
+分成两段：主进程只管下载、解压、写脚本、退出；覆盖由一个 detached 的
+`powershell.exe` 完成（`cmd/baozi/selfupdate.go`）：
+
+1. 等主进程退出（最多 15 秒，等不到就直接结束）；
+2. 只结束**装在同一目录**的 `baozi.exe` / `baozi-hook.exe` / `baozi-index.exe`
+   —— 按进程名一律打死会把用户另开的调试拷贝也关掉；`baozi-index` 若是服务，
+   先试 `Stop-Service`（没管理员权限就只记日志跳过）；
+3. 三个 exe 各自备份成 `.old` 再覆盖，缺哪个记哪个；
+4. `Start-Process` 重新拉起 `baozi.exe`；
+5. 全部成功才删临时目录，有失败项就留着给人排查。
+
+每一步都写 `%LOCALAPPDATA%\Baozi\update.log`，关于页的「上一次」行读它。
+
+两个踩过的坑：
+
+- **脚本必须带 UTF-8 BOM**。Windows PowerShell 5.1 读没有 BOM 的 `.ps1` 时按
+  系统 ANSI（这里就是 GBK）解码，脚本里全是中文，引号会被中文字节的第二个字节
+  吃掉，整个脚本变成语法错误 —— 表现就是"点了按钮，然后什么都没发生"。
+  沙盒里干跑时就是这么炸的。
+- **日志不要用 `Add-Content -Encoding UTF8`**：5.1 每次追加都会再写一个 BOM，
+  日志中段出现乱码字节，主程序按 UTF-8 读回去会读到坏行。改用
+  `[System.IO.File]::AppendAllText` + 不带 BOM 的 `UTF8Encoding`。
+
+装前先验安装目录可写（建一个探针文件再删）：放在 `Program Files` 里又没提权时，
+宁可当场说"用管理员身份运行"，也不要下载完十几兆再在覆盖那一步失败。
+运行在 `baozi.debug.exe` 上时拒绝自更新 —— 按三个固定文件名覆盖等于把调试构建
+换成发布版，太容易误解。
 
