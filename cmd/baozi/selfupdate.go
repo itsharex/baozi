@@ -33,92 +33,123 @@ func (a *application) installUpdate(snap updateSnapshot) {
 	go func() {
 		defer a.upd.endInstall()
 
-		if snap.ZipURL == "" {
-			a.setUpdProgress("安装包里没有 Windows 版本，只能打开下载页")
-			return
-		}
 		exe, err := os.Executable()
 		if err != nil {
 			a.setUpdProgress("定位自身失败：" + err.Error())
 			return
 		}
-		if !strings.EqualFold(filepath.Base(exe), "baozi.exe") {
-			// 调试版/改名版不参与自更新：脚本按三个固定文件名覆盖，
-			// 对着 baozi.debug.exe 覆盖等于把用户换回发布版，太容易误解。
-			a.setUpdProgress("当前不是发布版 " + filepath.Base(exe) + "，请用 zip 替换")
+		if err := applyUpdate(snap, exe, a.setUpdProgress); err != nil {
+			a.setUpdProgress(err.Error())
 			return
 		}
-		installDir := filepath.Dir(exe)
-
-		// 先确认安装目录可写。放在 Program Files 里的情况没有提权分支：与其下载完
-		// 十来兆再在脚本那一步失败，不如现在就告诉用户该怎么办。
-		probe := filepath.Join(installDir, ".baozi-wtest")
-		if f, err := os.Create(probe); err != nil {
-			a.setUpdProgress("安装目录不可写 " + installDir + "，请用管理员身份运行")
-			writeUpdateLog("安装目录不可写：%v", err)
-			return
-		} else {
-			f.Close()
-			os.Remove(probe)
-		}
-
-		stage, err := update.StageDir()
-		if err != nil {
-			a.setUpdProgress("建临时目录失败：" + err.Error())
-			return
-		}
-
-		a.setUpdProgress("正在下载 " + snap.Tag + "…")
-		zipPath := filepath.Join(stage, "update.zip")
-		// 下载给 5 分钟：这个包十来兆，但用户可能正在走代理/慢网。
-		dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		n, err := update.Download(dctx, snap.ZipURL, zipPath)
-		dcancel()
-		if err != nil {
-			a.setUpdProgress("下载失败：" + err.Error())
-			writeUpdateLog("下载失败：%v", err)
-			return
-		}
-		writeUpdateLog("下载完成：%d 字节 → %s", n, zipPath)
-
-		a.setUpdProgress("正在解压…")
-		if _, err := update.ExtractZip(zipPath, stage); err != nil {
-			a.setUpdProgress("解压失败：" + err.Error())
-			writeUpdateLog("解压失败：%v", err)
-			return
-		}
-
-		script := filepath.Join(stage, "apply-update.ps1")
-		// 必须带 UTF-8 BOM：Windows PowerShell 5.1 读 .ps1 时，没有 BOM 就按 ANSI(GBK)
-		// 解码。脚本里全是中文，一旦按 GBK 读，引号会被中文的第二个字节吃掉，
-		// 整个脚本变成一堆语法错误 —— 更新就"点了没反应"。（干跑时真踩到了。）
-		if err := os.WriteFile(script, append([]byte("\xef\xbb\xbf"), updateScript(installDir, stage, os.Getpid())...), 0o644); err != nil {
-			a.setUpdProgress("写更新脚本失败：" + err.Error())
-			writeUpdateLog("写脚本失败：%v", err)
-			return
-		}
-		writeUpdateLog("准备覆盖：%s → %s（新版本 %s）", stage, installDir, snap.Tag)
-
-		a.setUpdProgress("正在退出并替换文件…")
-		// 隐藏窗口、独立进程组：脚本要在我们退出之后继续活下去。
-		cmd := exec.Command("powershell.exe",
-			"-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-			"-File", script)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow:    true,
-			CreationFlags: 0x00000008 | 0x00000200, // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-		}
-		if err := cmd.Start(); err != nil {
-			a.setUpdProgress("拉起更新脚本失败：" + err.Error())
-			writeUpdateLog("拉起脚本失败：%v", err)
-			return
-		}
-		_ = cmd.Process.Release()
-		writeUpdateLog("更新脚本已启动（pid=%d），本进程退出", cmd.Process.Pid)
 
 		// 给界面留一帧把"正在替换"写出去，然后正常退出（走 shutdown，落盘历史/位置）。
 		time.AfterFunc(600*time.Millisecond, a.quit)
 	}()
+}
+
+// applyUpdate 做完"验目录 → 下载 → 解压 → 写脚本 → 拉起脚本"这一串，返回 nil 表示
+// 脚本已经在跑、本进程该尽快退出；返回 error 表示没成，错误文本可以直接显示给用户。
+//
+// 和界面完全解耦（只通过 progress 回调报告进度），因为除了"关于"页上的那个按钮，
+// `baozi.exe --update-now` 这条无窗口路径也要走同一套流程 —— 两份实现迟早会漂。
+func applyUpdate(snap updateSnapshot, exe string, progress func(string)) error {
+	if snap.ZipURL == "" {
+		return fmt.Errorf("安装包里没有 Windows 版本，只能打开下载页")
+	}
+	if !strings.EqualFold(filepath.Base(exe), "baozi.exe") {
+		// 调试版/改名版不参与自更新：脚本按三个固定文件名覆盖，
+		// 对着 baozi.debug.exe 覆盖等于把用户换回发布版，太容易误解。
+		return fmt.Errorf("当前不是发布版 %s，请用 zip 替换", filepath.Base(exe))
+	}
+	installDir := filepath.Dir(exe)
+
+	// 先确认安装目录可写。放在 Program Files 里的情况没有提权分支：与其下载完
+	// 十来兆再在脚本那一步失败，不如现在就告诉用户该怎么办。
+	probe := filepath.Join(installDir, ".baozi-wtest")
+	if f, err := os.Create(probe); err != nil {
+		writeUpdateLog("安装目录不可写：%v", err)
+		return fmt.Errorf("安装目录不可写 %s，请用管理员身份运行", installDir)
+	} else {
+		f.Close()
+		os.Remove(probe)
+	}
+
+	stage, err := update.StageDir()
+	if err != nil {
+		return fmt.Errorf("建临时目录失败：%v", err)
+	}
+
+	progress("正在下载 " + snap.Tag + "…")
+	zipPath := filepath.Join(stage, "update.zip")
+	// 下载给 5 分钟：这个包十来兆，但用户可能正在走代理/慢网。
+	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	n, err := update.Download(dctx, snap.ZipURL, zipPath)
+	dcancel()
+	if err != nil {
+		writeUpdateLog("下载失败：%v", err)
+		return fmt.Errorf("下载失败：%v", err)
+	}
+	writeUpdateLog("下载完成：%d 字节 → %s", n, zipPath)
+
+	progress("正在解压…")
+	if _, err := update.ExtractZip(zipPath, stage); err != nil {
+		writeUpdateLog("解压失败：%v", err)
+		return fmt.Errorf("解压失败：%v", err)
+	}
+
+	script := filepath.Join(stage, "apply-update.ps1")
+	// 必须带 UTF-8 BOM：Windows PowerShell 5.1 读 .ps1 时，没有 BOM 就按 ANSI(GBK)
+	// 解码。脚本里全是中文，一旦按 GBK 读，引号会被中文的第二个字节吃掉，
+	// 整个脚本变成一堆语法错误 —— 更新就"点了没反应"。（干跑时真踩到了。）
+	if err := os.WriteFile(script, append([]byte("\xef\xbb\xbf"), updateScript(installDir, stage, os.Getpid())...), 0o644); err != nil {
+		writeUpdateLog("写脚本失败：%v", err)
+		return fmt.Errorf("写更新脚本失败：%v", err)
+	}
+	writeUpdateLog("准备覆盖：%s → %s（新版本 %s）", stage, installDir, snap.Tag)
+
+	progress("正在退出并替换文件…")
+	// 隐藏窗口、单独一个进程组：脚本要在我们退出之后继续活下去。
+	//
+	// 这里**故意不加** DETACHED_PROCESS：Windows PowerShell 5.1 在"没有控制台"的脱离进程里
+	// 起不来 —— 实测同样参数下，带 DETACHED 的那次连脚本第一行都没执行就没了（日志空白），
+	// 不带的一次正常跑完。窗口已经用 HideWindow + -WindowStyle Hidden 藏掉了，不需要它。
+	//
+	// CREATE_BREAKAWAY_FROM_JOB 是为了应付把进程塞进"关句柄就杀光"的作业对象里的宿主
+	// （IDE、部分终端、自动化工具）。真实场景（资源管理器/计划任务启动）里没有作业对象，
+	// 带这个标志只是无害；宿主禁止脱离时 CreateProcess 会报拒绝，再退回不带的那次尝试。
+	flags := uint32(0x00000200)  // CREATE_NEW_PROCESS_GROUP
+	const breakaway = 0x01000000 // CREATE_BREAKAWAY_FROM_JOB
+	start := func(extra uint32) (*exec.Cmd, error) {
+		cmd := exec.Command("powershell.exe",
+			"-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+			"-File", script)
+		// 父进程是 windowsgui，本身没有可继承的标准句柄；显式接 NUL 更稳。
+		if nul, err := os.OpenFile(os.DevNull, os.O_RDWR, 0); err == nil {
+			cmd.Stdin, cmd.Stdout, cmd.Stderr = nul, nul, nul
+			defer nul.Close()
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: flags | extra,
+		}
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		return cmd, nil
+	}
+	cmd, err := start(breakaway)
+	if err != nil {
+		writeUpdateLog("带断作业启动失败（%v），退回普通启动", err)
+		cmd, err = start(0)
+	}
+	if err != nil {
+		writeUpdateLog("拉起脚本失败：%v", err)
+		return fmt.Errorf("拉起更新脚本失败：%v", err)
+	}
+	_ = cmd.Process.Release()
+	writeUpdateLog("更新脚本已启动（pid=%d），本进程退出", cmd.Process.Pid)
+	return nil
 }
 
 // updateScript 生成那段"等退出 → 停进程 → 备份 → 覆盖 → 重启"的 PowerShell。

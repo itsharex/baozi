@@ -3348,6 +3348,11 @@ func (a *application) quit() {
 }
 
 func main() {
+	// `baozi.exe --update-now`：不建窗口，直接查 + 装 + 退出（脚本会覆盖并重启）。
+	// 放在单实例锁之前 —— 它本来就是个一次性的短命进程，不该被已经在跑的那份挡住。
+	if handleUpdateFlag(os.Args[1:]) {
+		return
+	}
 	if !mygo.App.RequestSingleInstanceLock() {
 		return
 	}
