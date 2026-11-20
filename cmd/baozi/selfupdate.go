@@ -50,6 +50,18 @@ func (a *application) installUpdate(snap updateSnapshot) {
 		}
 		installDir := filepath.Dir(exe)
 
+		// 先确认安装目录可写。放在 Program Files 里的情况没有提权分支：与其下载完
+		// 十来兆再在脚本那一步失败，不如现在就告诉用户该怎么办。
+		probe := filepath.Join(installDir, ".baozi-wtest")
+		if f, err := os.Create(probe); err != nil {
+			a.setUpdProgress("安装目录不可写（" + installDir + "），请用管理员身份运行后再更新")
+			writeUpdateLog("安装目录不可写：%v", err)
+			return
+		} else {
+			f.Close()
+			os.Remove(probe)
+		}
+
 		stage, err := update.StageDir()
 		if err != nil {
 			a.setUpdProgress("建临时目录失败：" + err.Error())

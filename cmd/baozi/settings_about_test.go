@@ -59,6 +59,8 @@ func TestUpdateStatusText(t *testing.T) {
 		{"已最新", updateSnapshot{Tag: "v0.3.0"}, "已是最新（v0.3.0）"},
 		{"失败", updateSnapshot{Err: "github 返回 403"}, "检查失败：github 返回 403"},
 		{"没查过", updateSnapshot{}, "还没查过"},
+		{"倒计时中", updateSnapshot{Tag: "v0.4.0", Newer: true, Installing: true, Progress: "正在下载 v0.4.0…"}, "正在下载 v0.4.0…"},
+		{"装完但还没散", updateSnapshot{Tag: "v0.4.0", Newer: true, Progress: "下载失败：代理连不上"}, "下载失败：代理连不上"},
 	}
 	for _, c := range cases {
 		got := updateStatusText(c.snap)

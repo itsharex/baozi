@@ -625,6 +625,10 @@ func updateStatusText(s updateSnapshot) string {
 			msg = string(r[:90]) + "…"
 		}
 		return "检查失败：" + msg
+	case s.Progress != "" && !s.Installing:
+		// 上一次安装的收尾话（多半是失败原因）。放在"发现新版本"之前：
+		// 用户刚点过按钮，最想看到的是"刚才那一下成不成"，而不是"有新版本"。
+		return s.Progress
 	case s.Newer:
 		return "发现新版本 " + s.Tag + "（当前 " + version.Display() + "）"
 	case s.Tag != "" && version.IsDev():
