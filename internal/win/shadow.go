@@ -84,6 +84,7 @@ var (
 	procUpdateLayeredWindow = user32.NewProc("UpdateLayeredWindow")
 	procShowWindow          = user32.NewProc("ShowWindow")
 	procSetWindowPos        = user32.NewProc("SetWindowPos")
+	procGetWindow           = user32.NewProc("GetWindow")
 
 	shadowClassOnce  sync.Once
 	shadowClassReady bool
@@ -116,11 +117,14 @@ type Shadow struct {
 
 	shown bool
 
-	// insertAfter 是这一层应当落在哪个 z 序位置（Place 里按宿主的 z 带算出来）：
-	// 宿主是顶层窗口（启动面板）就是 hwndTopmost；宿主是普通窗口（设置/互传）就是
-	// 宿主自己的 hwnd —— 紧贴宿主下面。Show/ForceShow 之后要照着它重新落一次位，
-	// 否则窗口一现原形就被系统放回顶层带里去。
+	// insertAfter 是这一层最近一次落位用的锚点（Place 里算一次），只作诊断。
+	// 真正决定位置的算法在 restackTarget：现算宿主上面那个窗口，
+	// 所以宿主被重新排列之后也不会停在旧邻居后面。
 	insertAfter uintptr
+	// host 是这块影跟着的宿主窗口（0 表示还没 Place 过），hostTopmost 是它的 z 带。
+	// restack 每次都用它们现算"紧贴宿主上方"是谁。
+	host        uintptr
+	hostTopmost bool
 
 	// 诊断：最近一次 UpdateLayeredWindow 的结果。
 	dbg     bool
@@ -627,34 +631,43 @@ func (s *Shadow) Place(panel uintptr, sp ShadowSpec) bool {
 	s.dbg = ulr == 0
 	s.dbgInfo = "err=" + ulerr.Error()
 	s.x, s.y = dst.X, dst.Y
-	// 压在面板**上面**一层（HWND_TOPMOST），不是垫在下面。
-	// 垫在下面实测完全看不见：窗口被 SetWindowRgn 切掉形状之后，DWM 对这块
-	// 区域的处理让下面的分层窗口整片不透出来（位图 alpha 明明有值、
-	// UpdateLayeredWindow 也返回成功）。放上面就没这个问题 —— 面板里面那块的
-	// alpha 恒为 0，所以面板本身一点不受影响；鼠标穿透由 WM_NCHITTEST 兜住。
+	// 这一层永远紧贴宿主**上方**，而不是跑到"那一带的最前"。
 	//
-	// 但"上面"必须限定在**宿主自己那一带**：启动面板本身是 WS_EX_TOPMOST，
-	// 所以压顶层带没问题；设置窗和文件互传窗**不是**顶层窗口（ex=0x00200100，
-	// 只有 NOREDIRECTION|VISIBLE）。如果这一圈影还硬压顶层带，就会出现
-	// "宿主被别的程序盖住了、影还浮在最上面"——用户看到的就是一个和设置窗一样大、
-	// 里面能透出下面那个程序内容、带边框和阴影的空壳，点它还没反应（那是
-	// NOACTIVATE 的分层窗口，点不到下面的真窗口）。
-	// 所以：宿主的 z 带决定这一层的位置；宿主是普通窗口就紧贴宿主下面。
-	// 顶层窗口用统筹带里的宿主自己也没有意义（它不属于那一带），退回 hwndTopmost。
+	// 为什么必须在宿主上方：放在宿主下面（insertAfter=宿主）实测整圈影都看不见 ——
+	// 宿主用 SetWindowRgn 切了圆角之后，DWM 不再把压在它下面的分层窗口透出来，
+	// 位图 alpha 有值、UpdateLayeredWindow 也成功，屏幕上是干净的白（这次重新试过，
+	// 影内/影外取样都是 255,255,255，见 tools\zorder.ps1）。
+	//
+	// 但"上方"不等于"整个顶层带最前"。旧写法是面板这种顶层宿主一律 HWND_TOPMOST，
+	// 结果只要有个别的置顶窗口（任务管理器、某些播放器、翻译浮窗）盖住面板，
+	// 这一圈影还浮在那窗口上面，跟面板彻底脱节：看起来像"一圈边框和影子排在最前，
+	// 中间是被盖住的面板"。
+	// 现在的位置算法：先把自己的 z 带对齐宿主的带（顶层/普通），再把这一层插到
+	// "当前紧挨宿主上方的那个窗口"后面 —— 等价于插在宿主和它上面那个窗口之间，
+	// 面板被谁盖住，影就跟着被谁盖住。宿主已经在自己带的最前时，落回那一带最前。
 	after := hwndTopmost
 	if panel != 0 {
+		s.host = panel
 		ex, _, _ := procGetWindowLongPtrW.Call(panel, gwlExStyleIndex)
-		if ex&wsExTopmost == 0 {
-			after = panel
-			// 先把这一层自己的顶层标志摘掉，否则 SetWindowPos 会拒绝把它排到
-			// 普通窗口下面（顶层窗口永远在所有普通窗口之上）。
-			procSetWindowPos.Call(s.hwnd, hwndNoTopmost, 0, 0, 0, 0,
-				swpNoSize|swpNoZOrder|swpNoActivate)
+		s.hostTopmost = ex&wsExTopmost != 0
+		// 只换 z 带，不挪位置不动尺寸，也不带 ZORDER：带 ZORDER 的话它会立刻跑到
+		// 那一带的最前面，真正想要的位置交给下面那次 SetWindowPos。
+		band := uintptr(hwndNoTopmost)
+		if s.hostTopmost {
+			band = hwndTopmost
 		}
+		procSetWindowPos.Call(s.hwnd, band, 0, 0, 0, 0,
+			swpNoSize|swpNoMove|swpNoZOrder|swpNoActivate)
+		after = s.restackTarget()
 	}
 	s.insertAfter = after
+	flags := uintptr(swpNoActivate)
+	if after == s.hwnd {
+		// 已经紧贴宿主上方：只摆位置，别再动 z 序（传自己是非法参数）。
+		flags |= swpNoZOrder
+	}
 	pr, _, _ := procSetWindowPos.Call(s.hwnd, after, uintptr(dst.X), uintptr(dst.Y),
-		uintptr(tw), uintptr(th), swpNoActivate)
+		uintptr(tw), uintptr(th), flags)
 	s.dbgInfo = fmt.Sprintf("ulw=%v swp=%v %s", ulr != 0, pr != 0, s.dbgInfo)
 	s.buildCost, s.ulwCost = tULW.Sub(tBuild), ulwCost
 	return true
@@ -982,16 +995,49 @@ func (s *Shadow) Move(x, y, m int) {
 	s.x, s.y = dst.X, dst.Y
 }
 
-// restack 把这一层重新落回 Place 算出来的 z 位置。调用方必须已经持有 s.mu。
+// restackTarget 算这一层该插到谁后面，等价于"紧贴宿主上方"。
+//
+// SetWindowPos 的 hwndInsertAfter 语义是"排在谁后面"，所以想插在宿主前面（视觉上的
+// 上一层）就得插到宿主上面那个窗口的后面：z 序变成 [上面那个窗口, 这一层, 宿主]。
+// 宿主已经在自己那一带的最前时，直接落回那一带最前。
+//
+// 每次都现算而不是缓存 Anchor：ShowWindow 会把这一层塞回那一带最前，
+// 期间宿主自己也可能被别的程序重新排过。
+func (s *Shadow) restackTarget() uintptr {
+	if s.host == 0 || s.hwnd == 0 {
+		return hwndTopmost
+	}
+	// GW_HWNDPREV = 3：宿主上面紧挨着的那一个。
+	if above, _, _ := procGetWindow.Call(s.host, 3); above != 0 {
+		if above == s.hwnd {
+			// 正好紧贴宿主上方，位置已经对了 —— 返回自己当"别动"的暗号。
+			// 这里不能退回 hwndTopmost：那等于又把它抬到顶层带最前，
+			// 别人盖住宿主时影就又浮到人家上面去了。
+			return s.hwnd
+		}
+		return above
+	}
+	if s.hostTopmost {
+		return hwndTopmost
+	}
+	// HWND_TOP（0）：宿主已经在普通带最前，那就落在普通带最前，别把这一层提到顶层带。
+	return 0
+}
+
+// restack 把这一层重新落回"紧贴宿主上方"。调用方必须已经持有 s.mu。
 //
 // ShowWindow 把一块藏起来的窗口重新放上屏时，系统会把它塞到自己那一带的最前面
 // —— 普通带里的"最前面"就是压在所有其它普通窗口之上。宿主不在最前面的时候，
-// 这一圈影就又浮出来了，所以每次上屏都照着 Place 记下的位置落一次。
+// 这一圈影就又浮出来了，所以每次上屏都按当前邻居重算一次位置。
 func (s *Shadow) restack() {
-	if s == nil || s.hwnd == 0 || s.insertAfter == 0 {
+	if s == nil || s.hwnd == 0 {
 		return
 	}
-	procSetWindowPos.Call(s.hwnd, s.insertAfter, 0, 0, 0, 0,
+	target := s.restackTarget()
+	if target == s.hwnd {
+		return
+	}
+	procSetWindowPos.Call(s.hwnd, target, 0, 0, 0, 0,
 		swpNoMove|swpNoSize|swpNoActivate)
 }
 
