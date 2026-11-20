@@ -2417,6 +2417,10 @@ Windows 不允许改正在运行的可执行文件，而我们要换的就是自
 `patches/mygo-v0.8.1.patch`；带 `-Verify` 跑一遍会把这个 patch 应用到一个干净的
 上游副本上，再逐字节比对，确认"文件里写的"就是"实际在编的"。
 
+补丁已经提到上游：[egoist/mygo#2130](https://github.com/egoist/mygo/pull/2130)
+（分支 `l0rraine:win10-glass-corners`，基于上游 `main`，三个提交）。合了就可以把
+`replace` 换回上游版本、删掉这份副本。
+
 | 文件 | 改动 | 不放回本项目的原因 |
 |---|---|---|
 | `internal/gpu/d3d11/d3d11.go` | 内容背景 alpha < 255 时不再强行拉成 1 | 在渲染器给交换链铺底色的那一步；外部拿不到这一帧 |
