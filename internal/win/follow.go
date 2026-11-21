@@ -14,15 +14,16 @@
 //     `--print-cwd` 问活动窗格，tessoa.go）
 //     - Arke（Rust+GPUI 双栏，调它的 `--api -` state 接口问活动窗格，arke.go）
 //     每种都能在设置里单独关掉。
-//  2. 每当一个「打开 / 另存为」框成为前台，且上一次活动的确实是文件管理器：
-//     - 第一次见到它，把最近记住的目录送过去；
-//     - 之后它再出现、而版本号变过（期间文件管理器换过目录）→ 再送一次；
+//  2. 每当一个「打开 / 另存为」框成为前台：
+//     - 第一次见到它：只有上一次活动的确实是文件管理器，才把最近记住的目录送过去；
+//     - 之后它再出现、而版本号变过（期间文件管理器换过目录）→ 再送一次，
+//     不管中间是否还夹了别的窗口（Alt+Tab 会先切到应用主窗，见 shouldFollow）；
 //     - 版本没变就一动不动，免得把用户手动在框里选的目录拽回去。
 //
 // 于是用户的实际感受就是：在文件管理器里按"打开 / 另存为"，框直接落在他刚才看的位置。
-// Lertaro 注释里另有一条经验也照抄了：
-// 只有"上一次激活的确实是文件管理器"时才重读它的路径，否则用户手动在对话框里选的目录
-// 会在下一次激活时被打回旧目录。
+// Lertaro 那条"上一次激活的确实是文件管理器才重读"对**第一次出现**仍然成立，
+// 防止从任何程序打开的框被一个旧目录拽走；但同一个框第二次以后靠版本号判断，
+// 否则 Alt+Tab 回来（中间夹了应用主窗）就会漏。
 package win
 
 import (
@@ -253,14 +254,21 @@ func (f *DialogFollow) poll() {
 		f.lastActive = root
 		f.mu.Unlock()
 
-		// 上一次活动的就是那个文件管理器窗口 → 现读它此刻的目录（不是轮询时缓存的那个）。
-		// 上一次活动的是别的程序就不重读也不跟随 —— 否则用户手动在框里换过的目录会被拽回去。
-		if prev != 0 && src != 0 && prev == src && f.isPathSource(src) {
-			// 现场重读且不吃缓存：tessoa 切窗格 / 切布局都不会改变前台窗口，
+		prevWasSource := prev != 0 && src != 0 && prev == src && f.isPathSource(src)
+		_, seenBefore := f.dialogSeen(root)
+
+		// 什么时候现场重读来源目录：
+		//   - 刚从文件管理器切过来：必须读（对话框要的正是"此刻"的位置）；
+		//   - 这个对话框以前出现过：也要读。用户可能是 Alt+Tab 去了一趟 Arke /
+		//     资源管理器，再 Alt+Tab 回来；中途那个应用主窗口（不是对话框）可能
+		//     成为过前台，prev 就不再等于来源窗口。只认 prev 的话会漏掉这种切换，
+		//     而版本号已经变了，说明用户在框外确实换过目录。
+		if src != 0 && f.isPathSource(src) && (prevWasSource || seenBefore) {
+			// 不吃缓存：tessoa 切窗格 / Arke 双栏换栏都不会改变前台窗口，
 			// 轮询期间记下的那个目录很可能还是上一个窗格的。
 			f.rememberDir(f.folderOfFresh(src))
-			f.handleDialog(root)
 		}
+		f.handleDialog(root, prevWasSource)
 
 	default:
 		f.mu.Lock()
@@ -328,20 +336,55 @@ func (f *DialogFollow) rememberDir(dir string) {
 	}
 }
 
+// dialogSeen 报这个对话框以前出现过没有，以及它上次同步时的版本号。
+func (f *DialogFollow) dialogSeen(hwnd uintptr) (int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.seen[hwnd]
+	return v, ok
+}
+
+// shouldFollow 是"这次对话框成为前台，要不要送目录"的唯一判断。抽出来单测，
+// 因为真实的窗口切换没法在 CI 里稳定复现（尤其 Alt+Tab 会夹一个应用主窗口）。
+//
+//   - 第一次见：只有刚从文件管理器切过来才送。否则可能是用户从任何程序里
+//     打开的一个框，它原本停在哪就停在哪，不该被一个几小时前的目录拽走。
+//   - 见过：只要期间版本号变过（用户在框外确实换过目录）就送，**不管紧邻的
+//     上一个前台是不是文件管理器**。
+//     这一条是为了 Alt+Tab：框开着 → Alt+Tab 去 Arke 换目录 → Alt+Tab 回来时
+//     Windows 可能先把应用主窗（记事本本身）切成前台，用户再点一下框；这时
+//     prev 是记事本而不是 Arke，只认 prev 就会漏。版本号变过就足以说明
+//     用户去文件管理器动过目录，和中间夹了谁都无关。
+func shouldFollow(seenVersion int, seenBefore bool, version int, prevWasSource bool) bool {
+	if !seenBefore {
+		return prevWasSource
+	}
+	return seenVersion != version
+}
+
 // handleDialog 是 tracker 的核心规则：
-//   - 框第一次出现 → 直接把 lastDir 送过去；
+//   - 框第一次出现、且上一次活动的是文件管理器 → 直接把 lastDir 送过去；
 //     之前是"第一次只登记、等版本再变一次才送"，结果是打开框基本不跟随
 //     （版本在框出现那一刻就已经是最新的，等它再变一次纯属碰运气）；
 //   - 之后它再出现、而版本号变过（期间文件管理器换过目录）→ 再送一次；
 //   - 版本没变就一动不动，免得把用户手动在框里选的目录拽回去。
-func (f *DialogFollow) handleDialog(hwnd uintptr) {
+func (f *DialogFollow) handleDialog(hwnd uintptr, prevWasSource bool) {
 	f.mu.Lock()
 	seen, ok := f.seen[hwnd]
 	version, dir := f.version, f.lastDir
+	// 先登记版本再决定跳不跳：这次没跳（比如第一次出现时上一个前台不是
+	// 文件管理器）也要记下基线，否则用户之后去文件管理器换了目录再回来，
+	// 这个框会被永远当成"第一次"，还是不会跳。
 	f.seen[hwnd] = version
 	f.mu.Unlock()
 
-	if dir == "" || (ok && seen == version) {
+	if dir == "" {
+		return
+	}
+	if !shouldFollow(seen, ok, version, prevWasSource) {
+		if !ok {
+			f.logf("跟随: 对话框 %#x 第一次出现（版本 %d），上一个前台不是目录来源，不跳", hwnd, version)
+		}
 		return
 	}
 	if ok {
