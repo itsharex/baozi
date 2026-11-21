@@ -802,7 +802,7 @@ Alt+Tab 回来时，Windows 可能先把记事本主窗切成前台（`Notepad`�
 
 ### 8.3 怎么跳（`NavigateDialog`，照 `StandardFileDialogAdapter`）
 
-不是注入 DLL，而是**往"文件名"框写完整路径，再让它回车**
+不是注入 DLL，而是**往"文件名"框写完整路径，再触发对话框的默认按钮**
 （新式 Common Item Dialog 的文件名框仍是一个普通 `Edit`，进程外能写）。
 
 ```
@@ -810,9 +810,16 @@ IsFileDialog(hwnd)?                       ← #32770 且内部有 "Breadcrumb Pa
 EnumChildWindows（递归） → 第一个 class == "Edit"    ← 文件名框（ComboBoxEx32/1148 里面）
   → 目录补尾 "\"，WM_SETTEXT 写入
   → 父窗口 WM_COMMAND((EN_CHANGE<<16)|ctrlID)
-  → 回读校验；不一致就绝不回车（否则会把框里原来那个文件名提交掉）
-  → 250ms 后 SetFocus + EM_SETSEL + WM_KEYDOWN/WM_KEYUP VK_RETURN
+  → 回读校验；不一致就绝不触发（否则会把框里原来那个文件名提交掉）
+  → 250ms 后 PostMessage(hwnd, WM_COMMAND, IDOK)
 ```
+
+**为什么是 `WM_COMMAND(IDOK)` 而不是发回车键**：对话框的"回车=按默认按钮"是消息循环
+里的 `IsDialogMessage` 完成的；`PostMessage(WM_KEYDOWN, VK_RETURN)` 直接投给文件名
+`Edit`，绕过了这一步，多数时候只把路径留在编辑框里、地址栏不动（用户截图里的现象：
+地址栏还是"文档"，文件名框里是 `D:\Backup\Downloads\`）。默认按钮实际收到的就是
+`WM_COMMAND(IDOK)`；路径以反斜杠结尾时外壳把它当目录导航，不会保存文件
+（实测对话框保持打开，地址栏变成目标目录）。
 
 三个必须注意的点：
 
@@ -923,7 +930,7 @@ xplorer2，所以只应看到资源管理器与 TC，一个都不能多）：
 > 所以"记事本现场"只能由用户手动复现；功能路径与 WinForms 靶子完全相同
 > （都是 `#32770` + Common Item Dialog）。
 
-### 8.4 那些弯路：为什么只能走"文件名框 + 回车"
+### 8.4 那些弯路：为什么只能走"文件名框 + 默认按钮"
 
 DLL 注入那条（`WH_CBT` 捕获 + `IShellView::Navigate`）需要往目标进程里塞代码，
 本机没有 C 编译器（`gcc/g++/cl/tcc/zig/clang` 全无），Go 的 `-buildmode=c-shared` 出 DLL
@@ -944,7 +951,7 @@ DLL 注入那条（`WH_CBT` 捕获 + `IShellView::Navigate`）需要往目标进
 
 差别只有一处：**这些试的都是"地址栏"（`Edit(id=41477)`），而不是"文件名"框**。
 地址栏写进去只改显示、不回灌给 Shell 视图；文件名框是对话框真正会读的那个输入，
-写它 + 回车，Shell 自己就会导航。
+写它、再触发默认按钮，Shell 自己就会导航。
 
 ### 现在也给的后备
 

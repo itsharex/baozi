@@ -5,13 +5,18 @@
 // 新式 Common Item Dialog 的"文件名"框仍然是一个普通 Edit 控件（不是 DirectUI 自绘），
 // 所以可以 WM_SETTEXT 把完整路径写进去 —— 这是从进程外改"已经开着的对话框"目录的可行通道。
 // 往地址栏（Breadcrumb Parent 下的 ToolbarWindow32）写字只改显示、列表不动；
-// 往文件名框写路径 + 回车，外壳自己会导航过去。
+// 往文件名框写路径，再触发默认按钮，外壳自己会导航过去。
 //
-// 步骤与 Lertaro 一致：
+// 步骤：
 //  1. EnumChildWindows 找第一个 class == "Edit" 的子窗口；
 //  2. WM_SETTEXT 写入路径（目录补尾反斜杠），再给父窗口发 WM_COMMAND(EN_CHANGE)；
 //  3. 校验真的写进去了（写不进去就绝不回车，否则会把原来的文件名提交出去）；
-//  4. 延时 ~250ms 后 SetFocus + PostMessage(WM_KEYDOWN/WM_KEYUP VK_RETURN) 触发导航。
+//  4. 延时 ~250ms 后给对话框投递 WM_COMMAND(IDOK) 触发导航。
+//     这里不能用 PostMessage(WM_KEYDOWN, VK_RETURN)：键盘回车要先经过对话框的消息循环
+//     （IsDialogMessage）才会变成"按默认按钮"，直接投给 Edit 的 WM_KEYDOWN 多数时候
+//     只停在编辑框里 —— 实测现象就是路径写进了文件名框、地址栏仍停在原目录。
+//     默认按钮收到的就是 WM_COMMAND(IDOK)；路径以反斜杠结尾时外壳会把它当目录导航，
+//     不会真的保存（实测对话框保持打开、地址栏变成目标目录）。
 //
 // 一条硬规矩：**绝不 AttachThreadInput**。它把本线程和对话框线程的输入队列绑死，
 // 而 Go 的 goroutine 会在 OS 线程之间迁移、那个线程之后还会被 runtime 复用，
@@ -22,7 +27,6 @@ package win
 
 import (
 	"os"
-	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -42,18 +46,13 @@ var (
 	procGetWindowThreadProcess = user32.NewProc("GetWindowThreadProcessId")
 	procFindWindowExW          = user32.NewProc("FindWindowExW")
 	procEnumChildWindows       = user32.NewProc("EnumChildWindows")
-	procGetCurrentThreadID     = kernel32.NewProc("GetCurrentThreadId")
 )
 
 const (
 	wmSetText = 0x000C
 	wmGetText = 0x000D
 	wmCommand = 0x0111
-	wmKeyDown = 0x0100
-	wmKeyUp   = 0x0101
 	enChange  = 0x0300
-	vkReturn  = 0x0D
-	emSetSel  = 0x00B1
 	maxText   = 2048
 
 	smtoBlock       = 0x0001
@@ -158,20 +157,16 @@ func NavigateDialog(hwnd uintptr, path string) bool {
 		return false
 	}
 
-	// 回车稍后再发，让外壳先把 WM_SETTEXT 处理完（Lertaro 用 300ms）。
+	// 稍后再发，让外壳先把 WM_SETTEXT / EN_CHANGE 处理完（Lertaro 用 300ms）。
 	go func() {
-		// 固定在这个 OS 线程上：SetFocus 会同步等目标线程处理 WM_SETFOCUS，
-		// 线程中途被 runtime 换走会让这件事变得没法推理。
-		runtime.LockOSThread()
-		defer runtime.UnlockOSThread()
 		time.Sleep(250 * time.Millisecond)
 		if fg, _, _ := procGetForegroundWindow.Call(); RootOwner(fg) == hwnd {
-			// 只有它真的是前台才动焦点；不是的话只投递消息，绝不抢前台。
-			procSetFocus.Call(edit)
+			// 等价于用户按了这个框的默认按钮。Lertaro 原本发的是回车键，
+			// 但 PostMessage 到 Edit 绕过了 IsDialogMessage，回车不会变成默认按钮；
+			// 直接送 IDOK 才稳定。target 是已存在的目录且带尾反斜杠，
+			// 外壳会导航进去而不是保存。
+			procPostMessageW.Call(hwnd, wmCommand, 1, 0)
 		}
-		sendMsg(edit, emSetSel, 0, ^uintptr(0))
-		procPostMessageW.Call(edit, wmKeyDown, vkReturn, 0)
-		procPostMessageW.Call(edit, wmKeyUp, vkReturn, 0)
 	}()
 	return true
 }
