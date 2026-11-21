@@ -13,11 +13,12 @@ const (
 	SourceXyplorer = "xyplorer"
 	SourceXplorer2 = "xplorer2"
 	SourceTessoa   = "tessoa"
+	SourceArke     = "arke"
 )
 
 // SourceNames 是全部来源，按设置界面里的展示顺序。
 func SourceNames() []string {
-	return []string{SourceExplorer, SourceTotalCmd, SourceOpus, SourceXyplorer, SourceXplorer2, SourceTessoa}
+	return []string{SourceExplorer, SourceTotalCmd, SourceOpus, SourceXyplorer, SourceXplorer2, SourceTessoa, SourceArke}
 }
 
 // SourceLabel 是给界面 / 日志用的名字。
@@ -35,16 +36,21 @@ func SourceLabel(kind string) string {
 		return "xplorer2"
 	case SourceTessoa:
 		return "tessoa"
+	case SourceArke:
+		return "Arke"
 	}
 	return kind
 }
 
 // sourceFolderFresh 和 sourceFolder 一样，但要求"现在重新读一次"、不吃缓存。
-// 只有 tessoa 有区别：它一次查询要起一个进程，平时靠缓存省着，
-// 而对话框出现的那一刻必须给到焦点窗格的最新目录。
+// 只有 tessoa / Arke 有区别：tessoa 一次查询要起一个进程，Arke 要起一个短命
+// 客户端问 state；平时靠缓存省着，而对话框出现的那一刻必须给到焦点窗格的最新目录。
 func sourceFolderFresh(kind string, hwnd uintptr) string {
-	if kind == SourceTessoa {
+	switch kind {
+	case SourceTessoa:
 		return TessoaFolderFresh(hwnd)
+	case SourceArke:
+		return ArkeFolderFresh(hwnd)
 	}
 	return sourceFolder(kind, hwnd)
 }
@@ -64,6 +70,8 @@ func sourceKind(hwnd uintptr) string {
 		return SourceXplorer2
 	case IsTessoa(hwnd):
 		return SourceTessoa
+	case IsArke(hwnd):
+		return SourceArke
 	}
 	return ""
 }
@@ -83,6 +91,8 @@ func sourceFolder(kind string, hwnd uintptr) string {
 		return Xplorer2Folder(hwnd)
 	case SourceTessoa:
 		return TessoaFolder(hwnd)
+	case SourceArke:
+		return ArkeFolder(hwnd)
 	}
 	return ""
 }

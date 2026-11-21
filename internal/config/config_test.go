@@ -75,7 +75,7 @@ func TestIconSizeAt(t *testing.T) {
 // 目录来源开关的缺省语义：配置里没有这一块 → 全部启用（老配置的行为不变）。
 func TestPathSourcesDefaultOn(t *testing.T) {
 	var c Config
-	for _, kind := range []string{"explorer", "totalcmd", "opus", "xyplorer", "xplorer2"} {
+	for _, kind := range []string{"explorer", "totalcmd", "opus", "xyplorer", "xplorer2", "tessoa", "arke"} {
 		if !c.PathSourceEnabled(kind) {
 			t.Fatalf("%s 在缺省配置下应当是启用的", kind)
 		}
@@ -124,7 +124,7 @@ func TestPathSourcesJSONRoundTrip(t *testing.T) {
 	follow := false
 	c := Default()
 	c.DialogFollow = &follow
-	c.PathSources = &PathSources{Explorer: &on, TotalCmd: &on, Opus: &off, Xyplorer: &on, Xplorer2: &off}
+	c.PathSources = &PathSources{Explorer: &on, TotalCmd: &on, Opus: &off, Xyplorer: &on, Xplorer2: &off, Arke: &off}
 
 	path := filepath.Join(dir, "config.json")
 	if err := Save(c, path); err != nil {
@@ -146,13 +146,16 @@ func TestPathSourcesJSONRoundTrip(t *testing.T) {
 	if !got.PathSourceEnabled("xyplorer") {
 		t.Fatal("xyplorer=true 应当读回开启")
 	}
+	if got.PathSourceEnabled("arke") {
+		t.Fatal("arke=false 应当读回关闭")
+	}
 
 	// 落盘的键名要和跟随器 / 设置页用的字面量一致，否则改名之后静默失效。
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读回 config.json: %v", err)
 	}
-	for _, key := range []string{`"explorer"`, `"totalcmd"`, `"opus"`, `"xyplorer"`, `"xplorer2"`} {
+	for _, key := range []string{`"explorer"`, `"totalcmd"`, `"opus"`, `"xyplorer"`, `"xplorer2"`, `"arke"`} {
 		if !strings.Contains(string(data), key) {
 			t.Fatalf("pathSources 缺少键 %s：%s", key, data)
 		}

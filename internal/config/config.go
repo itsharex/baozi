@@ -170,6 +170,8 @@ type PathSources struct {
 	Xplorer2 *bool `json:"xplorer2,omitempty"`
 	// Tessoa 走它自己的 `--print-cwd`（自绘窗口读不到地址栏），详见 internal/win/tessoa.go。
 	Tessoa *bool `json:"tessoa,omitempty"`
+	// Arke 走它的 `--api -` state 查询（双栏窗口里按活动窗格给目录），详见 internal/win/arke.go。
+	Arke *bool `json:"arke,omitempty"`
 }
 
 // DialogFollowOn 表示"文件对话框跟随"是否开启：配置里没写就是开（和产品默认一致）。
@@ -202,6 +204,8 @@ func (c *Config) PathSourceEnabled(kind string) bool {
 		v = p.Xplorer2
 	case "tessoa":
 		v = p.Tessoa
+	case "arke":
+		v = p.Arke
 	default:
 		return true
 	}

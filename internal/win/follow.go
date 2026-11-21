@@ -4,7 +4,7 @@
 // `Core/Hook/ExplorerIntegration/FileDialogNavigationTracker.cs`：
 //
 //  1. 记住"最近一次文件管理器所在的目录"（lastDir），目录一变就把版本号 +1；
-//     目录来源目前接了六种（见 sources.go 的 Source*）：
+//     目录来源目前接了七种（见 sources.go 的 Source*）：
 //     - 资源管理器（CabinetWClass，读地址栏面包屑 + 已知文件夹名字还原）
 //     - Total Commander（TTOTAL_CMD，WM_COPYDATA 远程控制协议，totalcmd.go）
 //     - Directory Opus（dopus.lister，文件显示容器的地址栏，opus.go）
@@ -12,6 +12,7 @@
 //     - xplorer2（ATL:ExplorerFrame，读可见的地址栏 ComboBox，xplorer2.go）
 //     - tessoa（Rust+wgpu 自绘，UIA 树只有顶层一个节点，只能调它的
 //     `--print-cwd` 问活动窗格，tessoa.go）
+//     - Arke（Rust+GPUI 双栏，调它的 `--api -` state 接口问活动窗格，arke.go）
 //     每种都能在设置里单独关掉。
 //  2. 每当一个「打开 / 另存为」框成为前台，且上一次活动的确实是文件管理器：
 //     - 第一次见到它，把最近记住的目录送过去；
@@ -81,7 +82,7 @@ func (f *DialogFollow) folderOf(hwnd uintptr) string {
 	return sourceFolder(kind, hwnd)
 }
 
-// folderOfFresh 同上，但要求现场重读（只有 tessoa 会因此多起一个进程）。
+// folderOfFresh 同上，但要求现场重读（tessoa 会因此多起一个进程，Arke 多查一次 state）。
 func (f *DialogFollow) folderOfFresh(hwnd uintptr) string {
 	kind := sourceKind(hwnd)
 	if kind == "" || !f.sourceEnabled(kind) {

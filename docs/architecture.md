@@ -492,7 +492,7 @@ DO 只做纯转发（自己只发 `peer_joined` / `peer_left`）。免费计划�
 统一出口是 `internal/win/sources.go` 的 `sourceKind(hwnd)` + `sourceFolder(kind, hwnd)`，
 跟随器侧再包一层 `(*DialogFollow).isPathSource` / `folderOf`（见第 8 节），
 新增一种来源只要在 `SourceNames` / `sourceKind` / `sourceFolder` 三处加一行。
-六种来源都能在设置里单独关掉（`config.pathSources`，见第 11 节）。
+七种来源都能在设置里单独关掉（`config.pathSources`，见第 11 节）。
 
 ## 8. 打开/保存对话框跟随文件管理器（已实现，对应 Lertaro `IFileDialogAdapter` + `IActivePathCollector`）
 
@@ -502,7 +502,7 @@ DO 只做纯转发（自己只发 `peer_joined` / `peer_left`）。免费计划�
 > 切回那个「另存为」框，**它的路径自己变成「下载」**。
 
 三块拼起来：每隔 200ms 看一眼前台窗口（`internal/win/follow.go`）、
-前台是可提供目录的程序（六种来源，见第 7 节）就读出它的当前目录、
+前台是可提供目录的程序（七种来源，见第 7 节）就读出它的当前目录、
 前台是文件对话框就按版本号决定要不要跳过去。
 
 ### 8.1 记住文件管理器的目录
@@ -722,14 +722,47 @@ D:\1tools\tessoa.exe --open D:\work\baozi → 日志里 "已转发给主实例�
 **并且必须是真实存在的目录**才认。盘根 `D:\` 先按原样试，试不过才去掉尾部分隔符 ——
 否则 `D:\` 会被削成 `D:`，那是"当前盘当前目录"，不是盘根。
 
-### 8.2 什么时候跳（照抄 `FileDialogNavigationTracker.cs`）
+#### 8.1.7 Arke（`ArkeFolder`）
 
+Arke（Koimsurai/Arke，本机 v0.8.0-rc.1，Rust + GPUI）对外有一个版本化的 JSON 接口
+（仓库 `docs/integration.md`），是它承诺给启动器 / 对话框助手用的那一条：
+
+```
+arke.exe --api -        # stdin: {"v":1,"cmd":"state"}；stdout: 一行 JSON
+```
+
+回复里有**每个窗口 → 标签页 → 窗格**，每层恰好一个 `active: true`；
+窗格的 `location.kind` 为 `folder` 时带 `path`。双栏时取活动标签里的活动窗格，
+不去猜另一栏 —— 接口文档就是这么建议的（`home` / `search` / `recycle_bin` /
+`remote` / `other` 都没有"能送进对话框的目录"，一律当没有）。
+
+为什么不读 `%APPDATA%\Arke\settings.json`：那是上次退出时的会话快照，
+运行中切标签、切窗格、进目录都不写回；接口回的才是实时状态。
+
+几个和 tessoa 不同的点：
+
+- **窗口类名是 `ArkeWindow`**（弹出菜单是 `ArkeWindow.Popup`），`IsArke` 直接按类名认，
+  `GetClassName` 可靠；但不能用 `FindWindowW` 按类名跨进程找 —— Arke 的窗口类没有
+  注册成全局类，实测 `FindWindowW("ArkeWindow")` 返回 0（本机 go test 里改成
+  `EnumWindows` + `GetClassName` 才找得到）。
+- **`state` 不会启动 Arke**：没有实例时直接回 `{"v":1,"windows":[]}`；所以不必像
+  tessoa 那样担心"问一次就把软件打开"。仍然先 `IsWindow(root)`，避免窗口刚关时
+  问到别的窗口的目录。
+- 有多个 Arke 窗口时，先按 `hwnd` 找调用方那个窗口，找不到才退回第一个 active 窗口。
+- 单次查询要起一个短命 `arke.exe --api` 客户端（已有实例时走它的单实例管道转发），
+  因此和 tessoa 一样做 400ms 缓存；对话框弹出时 `ArkeFolderFresh` 不吃缓存，
+  保证双栏里刚切过去的那一栏能立刻生效。
+- 查询结果还要过 `arkeFolderFromJSON`：要求 `v==1`、路径去掉 `\\?\` 前缀、
+  并且**必须是真实存在的目录**才认。单测覆盖了活动窗格、活动标签、按 hwnd 选窗口、
+  `home` 不猜、目录已被删除、空 / 版本不符、长路径前缀。
+
+### 8.2 什么时候跳（照抄 `FileDialogNavigationTracker.cs`）
 状态只有两样：`lastDir`（最近一次文件管理器待过的目录）和 `version`（目录变一次 +1），
 外加每对话框一个 `seen[hwwnd] = 它上次同步时的 version`：
 
 | 情形 | 动作 |
 |---|---|
-| 前台是文件管理器（六种来源之一） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
+| 前台是文件管理器（七种来源之一） | 记下它的窗口（`lastSource`），顺手读一次目录更新 `lastDir` |
 | **对话框成为前台，且上一次活动的是那个文件管理器窗口** | **现场重读**它的目录（不吃缓存），再按下面的版本规则决定跳不跳 |
 | 前台是文件管理器，目录与 `lastDir` 不同 | `lastDir = dir`，`version++` |
 | 对话框**第一次**成为前台 | 直接 `NavigateDialog(hwnd, lastDir)` |
@@ -753,7 +786,7 @@ D:\1tools\tessoa.exe --open D:\work\baozi → 日志里 "已转发给主实例�
 读到的永远是最新的；而且只记住 hwnd、不缓存内容。反过来，上一次活动的若不是
 文件管理器（比如中间切过浏览器），就不重读、也不跳，避免把人拽回旧目录。
 
-`lastExplorer` 已改名 `lastSource`：现在"目录来源"有六种，判断"上一次活动的是不是
+`lastExplorer` 已改名 `lastSource`：现在"目录来源"有七种，判断"上一次活动的是不是
 同一个来源窗口"和"能不能现读"都走 `(*DialogFollow).isPathSource()` /
 `folderOf()` 两个分派点（它们是方法不是包级函数了，因为要先按设置过滤来源）。
 
@@ -1133,7 +1166,7 @@ CPU。删 4000 个文件时变化连续涌来，于是出现「重建 15 秒 →
 |---|---|---|
 | 常规·唤出 | 开关、`NumberInput`（间隔）、`TextInput`（备用组合键）、开关（全屏抑制） | `hotkey.*` |
 
-| 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（六种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa） | `dialogFollow` / `pathSources.*` |
+| 常规·文件对话框跟随 | 开关（总）、两行 `Checkbox`（七种目录来源：资源管理器 / Total Commander / Directory Opus / XYplorer / xplorer2 / tessoa / Arke） | `dialogFollow` / `pathSources.*` |
 | 常规·排序 | 三条 `Slider`（频次/类型/准确性）、`TextArea`（类型优先级，每行一个扩展名）、`NumberInput`（最多结果）、`Select` + `NumberInput`（图标大小：台阶/自定义倍数）、`Checkbox`（图片/视频缩略图） | `search.weights` / `typeOrder` / `maxResults` / `search.iconScale` / `search.thumbnails` |
 | 常规·索引 | 两个 `TextArea`（根目录、排除目录，每行一条）、开关（隐藏）、`NumberInput`（重建间隔）、按钮（立即重建） | `index.*` |
 | 自定义命令 | 左列 `ui.List`（每条两行：显示名 + 全部激活词）＋ 新建/删除；右列表单：`TextInput`×3（激活词 / 显示名 / 程序）、`TextArea`（参数，一行一个）、`TextInput`（工作目录）、`Checkbox`（执行后不收起）、「将执行：」实时预览 | `commands`（结构化，不再是竖线文本） |
@@ -2465,5 +2498,6 @@ Windows 不允许改正在运行的可执行文件，而我们要换的就是自
 早先这里还留过两处调试代码：首帧往 `%TEMP%\mygo-show.txt`、`mygo-round.txt`
 写诊断，以及 `radius<=0` 时按 30px 兜底。后者会让传 `CornerRadius: 0` 的设置窗、
 互传窗也被切 30px 圆角——那是验证阶段的常量，不是设计，已经删掉；现在 0 就是直角。
+
 
 

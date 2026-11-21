@@ -73,6 +73,7 @@ type settingsWindow struct {
 	srcXyplorer bool
 	srcXplorer2 bool
 	srcTessoa   bool
+	srcArke     bool
 
 	// 关于页：启动时要不要在后台查一次新版本。
 	// 检查结果不在这里存 —— 它属于运行时状态，挂在 application.upd 上。
@@ -198,6 +199,7 @@ func (s *settingsWindow) load() {
 	s.srcXyplorer = cfg.PathSourceEnabled(win.SourceXyplorer)
 	s.srcXplorer2 = cfg.PathSourceEnabled(win.SourceXplorer2)
 	s.srcTessoa = cfg.PathSourceEnabled(win.SourceTessoa)
+	s.srcArke = cfg.PathSourceEnabled(win.SourceArke)
 	s.autoUpdate = cfg.UpdateAutoCheck()
 	// 代理：开关来自配置，地址来自"现在系统里实际是什么"。load 在每次 show() 时调，
 	// 所以这就是"设置打开时读取"。
@@ -446,6 +448,7 @@ func (s *settingsWindow) followSection(c *ui.Context, t *ui.Theme) {
 			ui.Checkbox(c, &s.srcXyplorer, "XYplorer")
 			ui.Checkbox(c, &s.srcXplorer2, "xplorer2")
 			ui.Checkbox(c, &s.srcTessoa, "tessoa")
+			ui.Checkbox(c, &s.srcArke, "Arke")
 		})
 	})
 }
@@ -1069,6 +1072,7 @@ func (s *settingsWindow) save() {
 		Xyplorer: boolPtr(s.srcXyplorer),
 		Xplorer2: boolPtr(s.srcXplorer2),
 		Tessoa:   boolPtr(s.srcTessoa),
+		Arke:     boolPtr(s.srcArke),
 	}
 	// 关于页：自动检查更新 + 用不用代理，都写具体值（缺省是开）。
 	auto := s.autoUpdate

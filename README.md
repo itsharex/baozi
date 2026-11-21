@@ -136,7 +136,8 @@ Windows 上的快速启动器：**双击 Ctrl 唤出**，一个浮窗里搜文�
 不用唤出面板：打开「另存为」框停在「文档」，去资源管理器切到「下载」，再切回那个框，
 **它的路径自己变成「下载」**。
 
-来源支持资源管理器、Total Commander、Directory Opus、XYplorer、xplorer2、tessoa，每种都能在设置里单独关掉。
+来源支持资源管理器、Total Commander、Directory Opus、XYplorer、xplorer2、tessoa、Arke，每种都能在设置里单独关掉。
+Arke 走它自己的 `--api` state 接口，双栏里取活动窗格的那个目录。
 只认标准 `#32770` 对话框；Electron / Qt 自绘的那种不覆盖。整个功能也可以一键关掉。
 
 ## 局域网文件互传

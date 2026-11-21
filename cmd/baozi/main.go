@@ -2928,7 +2928,7 @@ func (a *application) ready() {
 
 	// 文件对话框跟随：记住文件管理器最近待过的目录，那个「打开 / 另存为」框再回到前台时
 	// 自动把路径送过去（Lertaro 的 IActivePathCollector + FileDialogNavigationTracker）。
-	// 目录来源六种（资源管理器 / TC / Opus / XYplorer / xplorer2 / tessoa），设置里可逐个关掉；
+	// 目录来源七种（资源管理器 / TC / Opus / XYplorer / xplorer2 / tessoa / Arke），设置里可逐个关掉；
 	// 关掉总开关（config.dialogFollow = false）就完全不碰别人的窗口。
 	a.syncFollow()
 
