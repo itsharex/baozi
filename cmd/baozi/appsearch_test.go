@@ -20,6 +20,42 @@ func mkApp(name, id string) appEntry {
 	}
 }
 
+// 回归：应用别名不再吃掉散落子序列的假命中，否则应用段硬置顶会让
+// "arke" 先把夸克网盘（quark cloud drive）顶到最前、"kk" 顶出 WorkBuddy。
+func TestAppAliasNoFalseTop(t *testing.T) {
+	a := testApp(t)
+	apps := []appEntry{
+		mkApp("夸克网盘", `D:\Program Files\QuarkCloudDrive\quark_cloud_drive.exe`),
+		mkApp("WorkBuddy", `WorkBuddy.WorkBuddy`),
+		mkApp("Arke", `C:\Program Files\Arke\arke.exe`),
+	}
+	a.apps.Store(&apps)
+
+	got := a.searchAll("arke")
+	if len(got) == 0 {
+		t.Fatal("搜 arke 什么都没匹配到")
+	}
+	if got[0].Name != "Arke" {
+		t.Fatalf("搜 arke 第一条应是 Arke，实际 %q（共 %d 条）", got[0].Name, len(got))
+	}
+	for _, r := range got {
+		if r.Name == "夸克网盘" {
+			t.Fatalf("夸克网盘不该被 arke 命中（别名准确度 %.2f）", r.Accuracy)
+		}
+	}
+
+	for _, r := range a.searchAll("kk") {
+		if r.Name == "WorkBuddy" {
+			t.Fatalf("WorkBuddy 不该被 kk 命中（别名准确度 %.2f）", r.Accuracy)
+		}
+	}
+	for _, r := range a.searchAll("kk") {
+		if r.Name == "夸克网盘" && r.Accuracy < 0.88 {
+			t.Fatalf("夸克网盘应由拼音首字母 kk 命中，准确度 %.2f", r.Accuracy)
+		}
+	}
+}
+
 // 回归：搜 cal 时，nvm / Python 这些装在 AppData\Local 下的应用不该冒出来。
 // 它们此前是靠路径里的 "Local"（Lo-cal）命中的，且带着应用类型权重排到最前。
 func TestAppSearchIgnoresPathNoise(t *testing.T) {

@@ -66,6 +66,22 @@ func AccuracyPy(query, name, path, py, fullPy string) (float64, bool) {
 	return worst, true
 }
 
+// aliasAccuracyFloor 是别名能算作命中的最低匹配质量：子串（0.78）算，
+// 字符散落（0.35~0.52）不算。别名是产品名的英文/拼音串，散落子序列几乎
+// 只能凑巧命中（arke → quark cloud drive、kk → WorkBuddy WorkBuddy），
+// 而应用段是硬置顶，这种假命中会直接把无关应用排到最前。
+const aliasAccuracyFloor = 0.62
+
+// AccuracyAlias 匹配应用的别名（AppAlias），只认前缀、词边界或子串，
+// 拒绝散落子序列。名字本身仍走 AccuracyPy 的完整规则。
+func AccuracyAlias(query, alias string) (float64, bool) {
+	acc, ok := AccuracyPy(query, alias, "", "", "")
+	if !ok || acc < aliasAccuracyFloor {
+		return 0, false
+	}
+	return acc, true
+}
+
 // pinyinScore 给拼音命中分档。首字母命中优先于全拼：
 // 敲 4 个字母命中 4 个字的名字，比敲全拼更"精准"，也更符合用户的实际习惯。
 func pinyinScore(q, py, full string) float64 {

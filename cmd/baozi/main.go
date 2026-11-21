@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"io/fs"
 	"log"
 	"math"
 	"net/http"
@@ -105,6 +106,12 @@ type application struct {
 	// 旧快照在被替换后依然有效（搜索进行中的那次读的是旧表，不会看到半新半旧的数据）。
 	cat  atomic.Pointer[index.Table]
 	apps atomic.Pointer[[]appEntry]
+	// appsMTime 是上一次读应用列表时开始菜单目录的最新 mtime（UnixNano），
+	// appsReloading 保证同一时间只有一次重读；appsChecked 是上次检查它的时间
+	// （主线程），避免每次唤出都递归走一遍开始菜单。
+	appsMTime     atomic.Int64
+	appsReloading atomic.Bool
+	appsChecked   time.Time
 
 	// 增量同步状态（只由 refreshIndex 读写，用 idxMu 串行化）。
 	// idxPath 是已载入的那份快照文件的完整路径（可能是 index.bin，也可能是
@@ -1678,7 +1685,7 @@ func (a *application) searchAll(q string) []search.Result {
 		for i, app := range *apps {
 			acc, ok := search.AccuracyPy(q, app.Name, "", app.initials, app.full)
 			if app.alias != "" {
-				if alt, ok2 := search.AccuracyPy(q, app.alias, "", "", ""); ok2 && alt > acc {
+				if alt, ok2 := search.AccuracyAlias(q, app.alias); ok2 && alt > acc {
 					acc, ok = alt, true
 				}
 			}
@@ -2360,6 +2367,92 @@ func clampPanelTo(x, y, w, h int, wa mygo.Rectangle) (int, int) {
 // 之所以要这个：用户报的"快速拖动卡死"在合成拖动里复现不出来（实测 750 次/秒
 // 的移动，回调 0.5~1ms），那就得让真机上的下一次卡顿自己把现场留下来 ——
 // 栈里能看出是阻塞在 WaitMessage、D3D 提交，还是我们自己的锁上。
+// startMenuRoots 是开始菜单的两个目录：全机的与当前用户的。
+func startMenuRoots() []string {
+	var roots []string
+	if d := os.Getenv("ProgramData"); d != "" {
+		roots = append(roots, filepath.Join(d, "Microsoft", "Windows", "Start Menu", "Programs"))
+	}
+	if d := os.Getenv("APPDATA"); d != "" {
+		roots = append(roots, filepath.Join(d, "Microsoft", "Windows", "Start Menu", "Programs"))
+	}
+	return roots
+}
+
+// startMenuModTime 返回开始菜单目录树里最新的 mtime，没有目录时为零值。
+// 新装的软件会往开始菜单里放 .lnk（常在子目录里），所以要看整棵树，
+// 只看两个根目录不够——子目录的 mtime 不会冒到父目录。
+func startMenuModTime() time.Time {
+	var newest time.Time
+	for _, root := range startMenuRoots() {
+		_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info, err := d.Info(); err == nil && info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+			return nil
+		})
+	}
+	return newest
+}
+
+// loadApps 读开始菜单，换上新列表并记住这次看到的 mtime。
+// initial 为 false 时，读完若面板正开着就重排一次结果——新装的应用立刻能搜到。
+func (a *application) loadApps(initial bool) {
+	defer a.appsReloading.Store(false)
+	raw, err := mygo.Shell.InstalledApps()
+	if err != nil {
+		log.Printf("读取已安装应用: %v", err)
+		return
+	}
+	entries := make([]appEntry, 0, len(raw))
+	for _, app := range raw {
+		entries = append(entries, appEntry{
+			InstalledApp: app,
+			initials:     pinyin.Initials(app.Name),
+			full:         pinyin.Full(app.Name),
+			alias:        search.AppAlias(app.ID),
+		})
+	}
+	a.apps.Store(&entries)
+	a.appsMTime.Store(startMenuModTime().UnixNano())
+	if debugKeys {
+		log.Printf("应用: %d 个", len(entries))
+	}
+	if initial {
+		return
+	}
+	log.Printf("应用列表已更新: %d 个", len(entries))
+	mygo.RunOnMain(func() {
+		if a.quitting.Load() || a.panel == nil || !a.panelUp.Load() {
+			return
+		}
+		a.refilter()
+		a.panel.Update(func() {})
+	})
+}
+
+// reloadAppsIfStale 是唤出时的轻量检查：开始菜单的 mtime 比上次读列表时新，
+// 就在后台重读一次。检查递归走一遍开始菜单，几毫秒；两秒内重复唤出不再查。
+func (a *application) reloadAppsIfStale() {
+	now := time.Now()
+	if now.Sub(a.appsChecked) < 2*time.Second {
+		return
+	}
+	a.appsChecked = now
+	mt := startMenuModTime()
+	if mt.IsZero() || mt.UnixNano() <= a.appsMTime.Load() {
+		return
+	}
+	if !a.appsReloading.CompareAndSwap(false, true) {
+		return
+	}
+	log.Print("开始菜单有变化，后台重读应用列表")
+	go a.loadApps(false)
+}
+
 func (a *application) startWatchdog() {
 	go func() {
 		// 顺带当外观的定期复查：面板可见时每 5 拍（约 1 秒）验一次"圆角区域还在、
@@ -2426,6 +2519,9 @@ func (a *application) show() {
 	// 没变化时只是两次 stat（微秒级）；有变化才复制快照叠增量（约 15ms），
 	// 而这点时间藏在面板动画里，感知不到。
 	a.refreshIndex(true)
+	// 应用列表也顺手查一次：新装的软件会改开始菜单，变了就后台重读，
+	// 不用重启 Baozi（文件索引是实时的，应用列表没理由滞后）。
+	a.reloadAppsIfStale()
 	a.refilter()
 	// 玻璃要在 Show 之前抓：那一刻窗口还没上屏，抓到的才是它后面的画面。
 	a.refreshGlass()
@@ -2805,26 +2901,8 @@ func (a *application) ready() {
 
 	// 2) 应用列表：读开始菜单，几十毫秒。拼音串在这里一次算好。
 	a.startWatchdog()
-	go func() {
-		raw, err := mygo.Shell.InstalledApps()
-		if err != nil {
-			log.Printf("读取已安装应用: %v", err)
-			return
-		}
-		entries := make([]appEntry, 0, len(raw))
-		for _, app := range raw {
-			entries = append(entries, appEntry{
-				InstalledApp: app,
-				initials:     pinyin.Initials(app.Name),
-				full:         pinyin.Full(app.Name),
-				alias:        search.AppAlias(app.ID),
-			})
-		}
-		a.apps.Store(&entries)
-		if debugKeys {
-			log.Printf("应用: %d 个", len(entries))
-		}
-	}()
+	a.appsReloading.Store(true)
+	go a.loadApps(true)
 
 	// 3) 钩子：双击 Ctrl 走低级键盘钩子，组合键走 RegisterHotKey 兜底
 	a.startHook()

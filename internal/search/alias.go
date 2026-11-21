@@ -40,5 +40,15 @@ func AppAlias(id string) string {
 		}
 		return r
 	}, s)
-	return strings.TrimSpace(s)
+	// AUMID 常把产品名重复一遍（WorkBuddy.WorkBuddy）：重复的段留在别名里
+	// 会让 "kk" 这种查询把它当成散落子序列命中，按段去重。
+	fields := strings.Fields(s)
+	kept := fields[:0]
+	for i, f := range fields {
+		if i > 0 && strings.EqualFold(f, fields[i-1]) {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return strings.Join(kept, " ")
 }

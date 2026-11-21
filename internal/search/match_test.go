@@ -79,3 +79,23 @@ func TestPinyinBeatsWeakAsciiMatch(t *testing.T) {
 		t.Fatalf("拼音(%.2f) 应高于弱命中的 ASCII 名(%.2f, ok=%v)", pinyinAcc, weakAcc, weakOK)
 	}
 }
+
+// TestAliasRejectsScattered 覆盖应用别名的匹配门槛：别名只认前缀、词边界、
+// 子串，字符散落的假命中不算（否则应用段硬置顶会把无关应用排到最前）。
+func TestAliasRejectsScattered(t *testing.T) {
+	cases := []struct {
+		query, alias string
+		wantOK       bool
+	}{
+		{"arke", "quark cloud drive", false}, // a-r-k…e 散落
+		{"kk", "WorkBuddy", false},           // 只有一个 k
+		{"cal", "Microsoft WindowsCalculator", true},
+		{"qq", "QQ", true},
+		{"work", "WorkBuddy", true},
+	}
+	for _, c := range cases {
+		if _, ok := AccuracyAlias(c.query, c.alias); ok != c.wantOK {
+			t.Fatalf("AccuracyAlias(%q, %q)=%v，期望 %v", c.query, c.alias, ok, c.wantOK)
+		}
+	}
+}

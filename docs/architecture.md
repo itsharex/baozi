@@ -261,6 +261,17 @@ Score = (0.5*Freq + 0.3*Type + 0.2*Acc) / (0.5+0.3+0.2)
 `…\nvm\nvm.exe` → `nvm`），取分高的那个；`{GUID}` 这种自动生成的 AUMID 直接返回空，不参与匹配。
 改完搜 `cal`：只有「计算器」，nvm 与 Python 全部消失。
 
+**别名只认"像"，不认"凑"**：产品名走 `search.AccuracyAlias`，门槛是 0.62（前缀 / 词边界 / 子串），
+字符散落的 0.35~0.52 不算命中。别名是英文产品名（`quark cloud drive`），散落子序列几乎只能碰巧：
+搜 `arke` 曾命中 `quark cloud drive`（a-r-k…e），而应用段是硬置顶，无关的夸克网盘直接排到第一。
+`AppAlias` 同时去掉 AUMID 里重复的段（`WorkBuddy.WorkBuddy` → `WorkBuddy`），否则 `kk` 也能靠两个 `k` 凑进去。
+
+**应用列表不是启动后就定死**：启动时读一次开始菜单；之后每次唤出用 `startMenuModTime`（递归看两个
+Start Menu 目录的最新 mtime，几毫秒、两秒内不重复查）比较 `appsMTime`，有变化就在后台重读并在面板
+开着时重排结果——新装的软件不用重启 Baozi。纯 UWP（只进 AppsFolder、不落 .lnk）不产生 mtime 变化，
+仍要重启才能看到。
+
+
 ### 结果构成：应用优先，但不能只剩应用
 
 段 0 挡不住"应用铺满全榜"：输入单个字母 `d`，191 个开始菜单应用里有几十个命中且全在段 0，

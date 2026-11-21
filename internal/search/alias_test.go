@@ -12,7 +12,8 @@ func TestAppAliasStripsNoise(t *testing.T) {
 		{"开始菜单里的磁盘 exe", `C:\Users\Administrator\AppData\Local\nvm\nvm.exe`, "nvm"},
 		{"python.exe", `C:\Users\Administrator\AppData\Local\Python\pythoncore-3.11-64\python.exe`, "python"},
 		{"UWP 的 AUMID", `Microsoft.WindowsCalculator_8wekyb3d8bbwe!App`, "Microsoft WindowsCalculator"},
-		{"带版本号的桌面 AUMID", `Doubao.Office_1.0.0.0_x64!App`, "Doubao Office 1 0 0 0 x64"},
+		{"带版本号的桌面 AUMID", `Doubao.Office_1.0.0.0_x64!App`, "Doubao Office 1 0 x64"},
+		{"重复产品名的 AUMID", `WorkBuddy.WorkBuddy`, "WorkBuddy"},
 		{"空 ID", "", ""},
 	}
 	for _, c := range cases {
