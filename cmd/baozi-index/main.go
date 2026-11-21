@@ -23,8 +23,10 @@ import (
 	"runtime/debug"
 	"runtime/pprof"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -142,10 +144,14 @@ func cmdInstall(dataDir string) {
 	}
 	defer m.Disconnect()
 
+	// ChangeServiceConfig 不吃零值：ServiceType/ErrorControl 必须给实值，
+	// 否则已装过的机器一升级就报 "The parameter is incorrect"（CreateService 容错，更新不容错）。
 	cfg := mgr.Config{
-		DisplayName: "Baozi 索引服务",
-		Description: "直接读取 NTFS USN Journal 维护 Baozi 的文件索引，主程序因此不需要管理员权限。",
-		StartType:   mgr.StartAutomatic,
+		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
+		StartType:    mgr.StartAutomatic,
+		ErrorControl: windows.SERVICE_ERROR_NORMAL,
+		DisplayName:  "Baozi 索引服务",
+		Description:  "直接读取 NTFS USN Journal 维护 Baozi 的文件索引，主程序因此不需要管理员权限。",
 	}
 
 	// 已经装过就更新 binPath（升级后 exe 换了位置也能自愈）。
@@ -168,11 +174,85 @@ func cmdInstall(dataDir string) {
 	}
 	defer s.Close()
 
+	if err := setFailureActions(s); err != nil {
+		// 配不上恢复动作不是致命错误（旧系统/权限怪），但要留痕：
+		// 这正是"服务崩了没人拉起来、索引悄悄停在几天前"的成因。
+		log.Printf("设置失败恢复动作失败（服务崩了不会自动重启）: %v", err)
+	} else {
+		log.Printf("失败恢复动作已设置: 5s/15s/60s/5min/15min 重启，计数器每日清零")
+	}
+
 	if err := s.Start(); err != nil && err != windows.ERROR_SERVICE_ALREADY_RUNNING {
 		fail("启动服务: %v", err)
 	}
 	log.Printf("服务已安装并启动: %s → %s", serviceName, exe)
 	fmt.Println("Baozi 索引服务已安装并启动")
+}
+
+// scAction 对应 Win32 的 SC_ACTION。
+type scAction struct {
+	Type  uint32
+	Delay uint32 // 毫秒
+}
+
+// serviceFailureActions 对应 Win32 的 SERVICE_FAILURE_ACTIONSW。
+// 字段顺序必须和 SDK 一致：ResetPeriod、RebootMsg、Command、cActions、lpsaActions。
+type serviceFailureActions struct {
+	ResetPeriod  uint32
+	RebootMsg    *uint16
+	Command      *uint16
+	ActionsCount uint32
+	Actions      uintptr
+}
+
+const (
+	scActionRestart = 1
+	// ChangeServiceConfig2 的信息级别
+	scConfigFailureActions     = 2
+	scConfigFailureActionsFlag = 4
+)
+
+var procChangeServiceConfig2 = windows.NewLazySystemDLL("advapi32.dll").
+	NewProc("ChangeServiceConfig2W")
+
+// setFailureActions 让 SCM 在服务异常退出后自动把它拉起来。
+//
+// 为什么必须由安装程序写，而不是让用户手敲 sc failure：
+// 默认安装出来的服务 recovery actions 是空的（本机 `sc qfailure` 实测 RESET_PERIOD 0、
+// 无动作），服务一旦意外停止（事件 7034）就永远躺着，主程序只能看到心跳变旧，
+// 索引从此不再更新。用户装完不该还要懂 SCM。
+//
+// 五档 5s / 15s / 60s / 5min / 15min：前两次快速回来，之后放缓，既扛得住
+// 开机时盘没就绪这类短暂故障，又不会在配置本身坏了的时候变成忙重启；
+// 计数器 86400 秒清零，第二天重新给五次机会。
+// 同时置 FailureActionsFlag=TRUE，让"非崩溃的异常退出"（返回非零退出码）也触发恢复——
+// 否则服务自己 return 掉的路径（比如开机时盘还没就绪、打开卷失败）不会重启。
+func setFailureActions(s *mgr.Service) error {
+	acts := []scAction{
+		{Type: scActionRestart, Delay: 5000},
+		{Type: scActionRestart, Delay: 15000},
+		{Type: scActionRestart, Delay: 60000},
+		{Type: scActionRestart, Delay: 300000},
+		{Type: scActionRestart, Delay: 900000},
+	}
+	sa := serviceFailureActions{
+		ResetPeriod:  86400,
+		ActionsCount: uint32(len(acts)),
+		Actions:      uintptr(unsafe.Pointer(&acts[0])),
+	}
+	r1, _, err := procChangeServiceConfig2.Call(uintptr(s.Handle),
+		scConfigFailureActions, uintptr(unsafe.Pointer(&sa)))
+	runtime.KeepAlive(acts)
+	if r1 == 0 {
+		return err
+	}
+	flag := int32(1)
+	r1, _, err = procChangeServiceConfig2.Call(uintptr(s.Handle),
+		scConfigFailureActionsFlag, uintptr(unsafe.Pointer(&flag)))
+	if r1 == 0 {
+		return err
+	}
+	return nil
 }
 
 func cmdUninstall() {
@@ -214,26 +294,46 @@ func (serviceHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes
 	changes <- svc.Status{State: svc.StartPending}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan struct{})
+	var stopRequested atomic.Bool
 	go func() {
 		defer close(done)
 		runIndexLoop(ctx)
 	}()
 
 	changes <- svc.Status{State: svc.Running, Accepts: accepted}
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
-		case svc.Stop, svc.Shutdown:
-			changes <- svc.Status{State: svc.StopPending}
+	for {
+		select {
+		case c, ok := <-r:
+			if !ok {
+				// SCM 那边断了（注销/关机），当成正常停止
+				cancel()
+				<-done
+				return false, 0
+			}
+			switch c.Cmd {
+			case svc.Interrogate:
+				changes <- c.CurrentStatus
+			case svc.Stop, svc.Shutdown:
+				stopRequested.Store(true)
+				changes <- svc.Status{State: svc.StopPending}
+				cancel()
+				<-done
+				return false, 0
+			}
+		case <-done:
+			// 循环自己退了（打开卷失败、读不到配置……）。以前这里会一直挂着
+			// "正在运行"的状态，进程活着但索引再也不动，主程序只看到心跳变旧。
+			// 现在明确报停并以退出码 1 结束，让 SCM 的失败恢复动作把它拉起来。
+			if stopRequested.Load() {
+				return false, 0
+			}
 			cancel()
-			<-done
-			return false, 0
+			changes <- svc.Status{State: svc.StopPending}
+			return false, 1
 		}
 	}
-	cancel()
-	return false, 0
 }
 
 func runService() {

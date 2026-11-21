@@ -928,6 +928,23 @@ BaoziIndex（服务，LocalSystem）                    baozi.exe（用户，普
 `index.bin` 只在整理（墓碑/垃圾攒够）和兜底（6 小时）时重写，
 中间的变化走 `index.delta` 这个几十 KB 的小文件。详见「增量：实时改表」。
 
+### 服务挂了要能自己回来
+
+默认安装出来的服务，SCM 的失败恢复动作是空的（`sc qfailure` 实测 `RESET_PERIOD 0`、
+无动作）。本机就撞上过：`BaoziIndex` 在 11/19 00:18 意外停止（事件 7034），
+因为没人拉它，索引一直停在那一刻，搜索看起来"不实时"，直到手动 `Start-Service`。
+
+因此 `--install` 里做了两件事（用户不需要懂 SCM）：
+
+- 用 `ChangeServiceConfig2(SERVICE_CONFIG_FAILURE_ACTIONS)` 写恢复动作：
+  重启 5s / 15s / 60s / 5min / 15min，`RESET_PERIOD=86400`；并置
+  `FAILURE_ACTIONS_FLAG=TRUE`，让非崩溃的异常退出也触发恢复。
+- 服务循环自己退出的路径（打开卷失败、读配置失败……）不再挂着 `RUNNING`
+  什么都不干，而是报 `StopPending` 并返回退出码 1，交给 SCM 按上面的动作重启。
+  以前这种"进程活着、索引死了"的状态，主程序只能从心跳变旧看出来。
+
+真正崩溃（进程被杀、未处理异常）由 SCM 直接计数，同样按 5s 回来。
+
 ### 三条原语
 
 | FSCTL | 作用 | 实测 |
