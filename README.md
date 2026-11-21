@@ -237,8 +237,8 @@ $env:BAOZI_UNINSTALL=1; .\dist\baozi.exe
 .\baozi.exe --update-now
 ```
 
-`baozi.debug.exe` 不参与自更新（会拒绝，提示用 zip 替换）；开发构建（版本号里带 `-dev`）也照常比较版本，
-只有完全没注入版本号的 `dev` 才不提示。
+`baozi.debug.exe` 不参与自更新（会拒绝，提示用 zip 替换）；本地构建（`tools\build.ps1` 注入的
+`vX.Y.Z-N-g<hash>`）也照常比较版本，只有完全没注入版本号的 `dev` 才不提示。
 
 ## 出问题先看这几处
 
@@ -264,10 +264,24 @@ $env:BAOZI_UNINSTALL=1; .\dist\baozi.exe
 需要 Go 1.27.3 或更新、Windows 10/11。
 
 ```powershell
-# -H=windowsgui 必须带：不带的话 exe 是 console 子系统，双击先弹黑窗
-go build -trimpath -ldflags "-H=windowsgui -s -w" -o dist\baozi.exe       ./cmd\baozi
-go build -trimpath -ldflags "-s -w"              -o dist\baozi-hook.exe  ./cmd\baozi-hook
-go build -trimpath -ldflags "-s -w"              -o dist\baozi-index.exe ./cmd\baozi-index
+pwsh -File tools\build.ps1              # 三个 exe 一起编，参数与 Release 一致
+pwsh -File tools\build.ps1 -Version v0.4.2
+```
+
+`build.ps1` 做三件手工 `go build` 容易漏的事：
+
+- **带 `-H=windowsgui`**：不带的话 PE 子系统是 Console，双击先弹黑窗，看起来就像调试版；
+- **注入 `version.Version`**：不带的话关于页显示"开发版"（源码里默认 `dev`）；
+  默认取 `git describe --tags --long`，例如 `v0.4.1-8-g24630f2`，不会冒充正式版；
+- 编完自检 PE 子系统必须是 GUI(2)，不是就直接报错。
+
+手工编也可以，但这两条都要带上：
+
+```powershell
+$ver = (git describe --tags --long)
+go build -trimpath -ldflags "-H=windowsgui -s -w -X baozi/internal/version.Version=$ver" -o dist\baozi.exe ./cmd\baozi
+go build -trimpath -ldflags "-s -w" -o dist\baozi-hook.exe  ./cmd\baozi-hook
+go build -trimpath -ldflags "-s -w" -o dist\baozi-index.exe ./cmd\baozi-index
 ```
 
 **别用 `Start-Process` 起它**：那样它是终端/编辑器的子进程，宿主一退 Windows 会把整棵进程树收走。
